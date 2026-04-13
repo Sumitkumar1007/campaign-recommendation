@@ -35,29 +35,29 @@ The pipeline is organized into these stages:
 
 ## 3. Repository Structure
 
-- [README.md](/d:/aiml/campaign-recommenadtion/README.md)
+- [README.md](../README.md)
   Short project overview and quick-start commands.
 
-- [config/default_config.json](/d:/aiml/campaign-recommenadtion/config/default_config.json)
+- [config/default_config.json](../config/default_config.json)
   Main configuration file for paths, target definitions, candidate hours, and training settings.
 
-- [src/campaign_recommendation](/d:/aiml/campaign-recommenadtion/src/campaign_recommendation)
+- [src/campaign_recommendation](../src/campaign_recommendation)
   Main application package.
 
-- [training-data](/d:/aiml/campaign-recommenadtion/training-data)
+- [training-data](../training-data)
   Input raw dataset.
 
-- [outputs](/d:/aiml/campaign-recommenadtion/outputs)
+- `outputs/`
   Generated model artifacts, recommendations, summaries, and explanations.
 
-- [reports](/d:/aiml/campaign-recommenadtion/reports)
+- [reports](../reports)
   Benchmark and comparison reports.
 
 ## 4. Input Data Used
 
 Training dataset:
 
-- [mfl_last_6_months_communication_data.csv](/d:/aiml/campaign-recommenadtion/training-data/mfl_last_6_months_communication_data.csv)
+- [mfl_last_6_months_communication_data.csv](../training-data/mfl_last_6_months_communication_data.csv)
 
 Important raw columns used:
 
@@ -79,7 +79,7 @@ Only rows where `emi_date` is the `5th` are used.
 
 This is controlled by:
 
-- `emi_day_filter = 5` in [default_config.json](/d:/aiml/campaign-recommenadtion/config/default_config.json)
+- `emi_day_filter = 5` in [default_config.json](../config/default_config.json)
 
 ### Allowed Strategy Days
 
@@ -108,7 +108,7 @@ Success is defined differently by channel:
 
 This logic is implemented in:
 
-- [labeling.py](/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/labeling.py)
+- [labeling.py](../src/campaign_recommendation/labeling.py)
 
 ### Weighted Success Strength
 
@@ -130,8 +130,8 @@ The classifier still predicts binary success probability, but stronger events in
 
 Feature engineering is implemented in:
 
-- [features.py](/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/features.py)
-- [data.py](/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/data.py)
+- [features.py](../src/campaign_recommendation/features.py)
+- [data.py](../src/campaign_recommendation/data.py)
 
 ### Base Features
 
@@ -223,8 +223,8 @@ Multiple experiments were run:
 
 Benchmark reports:
 
-- [model_benchmark_experiments.csv](/d:/aiml/campaign-recommenadtion/reports/model_benchmark_experiments.csv)
-- [model_benchmark_experiments.md](/d:/aiml/campaign-recommenadtion/reports/model_benchmark_experiments.md)
+- [model_benchmark_experiments.csv](../reports/model_benchmark_experiments.csv)
+- [model_benchmark_experiments.md](../reports/model_benchmark_experiments.md)
 
 ### Final Current Default
 
@@ -236,13 +236,13 @@ This decision was based on stronger benchmark results against the legacy model.
 
 Decision report:
 
-- [legacy_vs_extra_trees.md](/d:/aiml/campaign-recommenadtion/reports/legacy_vs_extra_trees.md)
+- [legacy_vs_extra_trees.md](../reports/legacy_vs_extra_trees.md)
 
 ## 10. Current Production Model Implementation
 
 Main model code:
 
-- [modeling.py](/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/modeling.py)
+- [modeling.py](../src/campaign_recommendation/modeling.py)
 
 Current production training stack:
 
@@ -255,7 +255,7 @@ Current production training stack:
 
 The trained model artifact is stored in:
 
-- [outputs/model/model.joblib](/d:/aiml/campaign-recommenadtion/outputs/model/model.joblib)
+- `outputs/model/model.joblib`
 
 Important:
 
@@ -265,21 +265,21 @@ Important:
 
 Related saved artifacts:
 
-- [outputs/model/metrics.json](/d:/aiml/campaign-recommenadtion/outputs/model/metrics.json)
-- [outputs/model/run_summary.json](/d:/aiml/campaign-recommenadtion/outputs/model/run_summary.json)
-- [outputs/model/evaluation_sample.csv](/d:/aiml/campaign-recommenadtion/outputs/model/evaluation_sample.csv)
-- [outputs/model/validation_slice_report.csv](/d:/aiml/campaign-recommenadtion/outputs/model/validation_slice_report.csv)
-- [outputs/model/calibration_report.csv](/d:/aiml/campaign-recommenadtion/outputs/model/calibration_report.csv)
+- `outputs/model/metrics.json`
+- `outputs/model/run_summary.json`
+- `outputs/model/evaluation_sample.csv`
+- `outputs/model/validation_slice_report.csv`
+- `outputs/model/calibration_report.csv`
 
 ## 12. How Training Works
 
 Training entrypoint:
 
-- [__main__.py](/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/__main__.py)
+- [__main__.py](../src/campaign_recommendation/__main__.py)
 
 Training pipeline:
 
-- [pipelines/train.py](/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/pipelines/train.py)
+- [pipelines/train.py](../src/campaign_recommendation/pipelines/train.py)
 
 Command:
 
@@ -316,8 +316,8 @@ d:\aiml\venv\Scripts\python.exe -m campaign_recommendation recommend --model-dir
 
 Pipeline:
 
-- [pipelines/recommend.py](/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/pipelines/recommend.py)
-- [recommend.py](/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/recommend.py)
+- [pipelines/recommend.py](../src/campaign_recommendation/pipelines/recommend.py)
+- [recommend.py](../src/campaign_recommendation/recommend.py)
 
 What it does:
 
@@ -366,7 +366,7 @@ If current-state features like `POS`, `bucket`, or additional account descriptor
 
 ### Main Strategy Output
 
-- [outputs/recommendations.csv](/d:/aiml/campaign-recommenadtion/outputs/recommendations.csv)
+- `outputs/recommendations.csv`
 
 This contains the day-by-day strategy calendar with:
 
@@ -379,8 +379,8 @@ This contains the day-by-day strategy calendar with:
 
 ### Bucket Summaries
 
-- [outputs/bucket_counts.csv](/d:/aiml/campaign-recommenadtion/outputs/bucket_counts.csv)
-- [outputs/bucket_counts_by_day.csv](/d:/aiml/campaign-recommenadtion/outputs/bucket_counts_by_day.csv)
+- `outputs/bucket_counts.csv`
+- `outputs/bucket_counts_by_day.csv`
 
 These summarize:
 
@@ -391,15 +391,15 @@ These summarize:
 
 Examples:
 
-- [MFLAPDSECUL000005010246_day_scores.csv](/d:/aiml/campaign-recommenadtion/outputs/explanations/MFLAPDSECUL000005010246_day_scores.csv)
-- [MFLAPDSECUL000005010246_final_recommendation.csv](/d:/aiml/campaign-recommenadtion/outputs/explanations/MFLAPDSECUL000005010246_final_recommendation.csv)
-- [MFLAPDSECUL000005010246_strategy_calendar.csv](/d:/aiml/campaign-recommenadtion/outputs/explanations/MFLAPDSECUL000005010246_strategy_calendar.csv)
+- `outputs/explanations/MFLAPDSECUL000005010246_day_scores.csv`
+- `outputs/explanations/MFLAPDSECUL000005010246_final_recommendation.csv`
+- `outputs/explanations/MFLAPDSECUL000005010246_strategy_calendar.csv`
 
 ## 16. How The Final Strategy Is Built
 
 This is implemented in:
 
-- [recommend.py](/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/recommend.py)
+- [recommend.py](../src/campaign_recommendation/recommend.py)
 
 Rule flow:
 
@@ -415,7 +415,7 @@ So the final calendar is not just top-N overall. It is top-N **per day**.
 
 Explainability code:
 
-- [explain.py](/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/explain.py)
+- [explain.py](../src/campaign_recommendation/explain.py)
 
 What is supported:
 
@@ -488,7 +488,7 @@ Repository setup includes:
 
 Large file tracking:
 
-- [training-data/mfl_last_6_months_communication_data.csv](/d:/aiml/campaign-recommenadtion/training-data/mfl_last_6_months_communication_data.csv) is tracked through Git LFS
+- [training-data/mfl_last_6_months_communication_data.csv](../training-data/mfl_last_6_months_communication_data.csv) is tracked through Git LFS
 
 ## 20. How To Reproduce End To End
 
