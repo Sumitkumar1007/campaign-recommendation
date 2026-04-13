@@ -32,8 +32,8 @@ Why it was selected:
 
 Benchmark references:
 
-- [Legacy vs Extra Trees](/d:/aiml/campaign-recommenadtion/reports/legacy_vs_extra_trees.md)
-- [Model Benchmark Experiments](/d:/aiml/campaign-recommenadtion/reports/model_benchmark_experiments.md)
+- [Legacy vs Extra Trees](reports/legacy_vs_extra_trees.md)
+- [Model Benchmark Experiments](reports/model_benchmark_experiments.md)
 
 ## Project Structure
 
@@ -97,12 +97,12 @@ d:\aiml\venv\Scripts\python.exe -m campaign_recommendation benchmark-models --ma
 
 Technical handoff guide:
 
-- [Implementation And Deployment Guide (Markdown)](/d:/aiml/campaign-recommenadtion/docs/implementation_and_deployment_guide.md)
-- [Implementation And Deployment Guide (PDF)](/d:/aiml/campaign-recommenadtion/docs/implementation_and_deployment_guide.pdf)
+- [Implementation And Deployment Guide (Markdown)](docs/implementation_and_deployment_guide.md)
+- [Implementation And Deployment Guide (PDF)](docs/implementation_and_deployment_guide.pdf)
 
 Business summary:
 
-- [Stakeholder Summary](/d:/aiml/campaign-recommenadtion/docs/stakeholder_summary.md)
+- [Stakeholder Summary](docs/stakeholder_summary.md)
 
 ## Notes
 
