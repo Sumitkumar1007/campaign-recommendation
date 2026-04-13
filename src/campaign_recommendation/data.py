@@ -44,6 +44,8 @@ def _prepare_chunk(
     chunk: pd.DataFrame,
     allowed_day_offsets: set[int],
     success_statuses: dict[str, list[str]],
+    success_scores: dict[str, dict[str, float]],
+    positive_boost: float,
     emi_day_filter: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     prepared = chunk.copy()
@@ -69,7 +71,12 @@ def _prepare_chunk(
     prepared["emi_month"] = prepared["emi_date"].dt.to_period("M").astype(str)
     prepared["created_month"] = prepared["created_date"].dt.to_period("M").astype(str)
     prepared["has_payment"] = prepared["payment_unique_id"].notna().astype(int)
-    prepared = apply_success_label(prepared, success_statuses=success_statuses)
+    prepared = apply_success_label(
+        prepared,
+        success_statuses=success_statuses,
+        success_scores=success_scores,
+        positive_boost=positive_boost,
+    )
 
     history = prepared.copy()
     current = prepared[prepared["day_offset"].isin(allowed_day_offsets)].copy()
@@ -198,6 +205,8 @@ def build_modeling_dataset(
     max_rows: int | None,
     allowed_day_offsets: list[int],
     success_statuses: dict[str, list[str]],
+    success_scores: dict[str, dict[str, float]],
+    positive_boost: float,
     emi_day_filter: int,
 ) -> tuple[pd.DataFrame, dict[str, list[str]]]:
     path = Path(csv_path)
@@ -210,6 +219,8 @@ def build_modeling_dataset(
             chunk=chunk,
             allowed_day_offsets=allowed,
             success_statuses=success_statuses,
+            success_scores=success_scores,
+            positive_boost=positive_boost,
             emi_day_filter=emi_day_filter,
         )
         if not history.empty:

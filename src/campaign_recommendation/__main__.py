@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 
+from .pipelines.benchmark_models import run_model_benchmarks
 from .pipelines.recommend import run_account_explanation, run_recommendations
 from .pipelines.train import run_training
 from .settings import load_config
@@ -16,6 +17,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     train_parser = subparsers.add_parser("train", help="Train the baseline recommendation model")
     train_parser.add_argument("--max-rows", type=int, default=None, help="Optional training row cap")
+
+    benchmark_parser = subparsers.add_parser("benchmark-models", help="Benchmark multiple model families")
+    benchmark_parser.add_argument("--max-rows", type=int, default=None, help="Optional training row cap")
 
     recommend_parser = subparsers.add_parser("recommend", help="Generate campaign recommendations")
     recommend_parser.add_argument("--model-dir", default=None, help="Optional model artifact directory")
@@ -43,6 +47,11 @@ def main() -> None:
 
     if args.command == "train":
         summary = run_training(config=config, max_rows=args.max_rows)
+        print(json.dumps(summary, indent=2))
+        return
+
+    if args.command == "benchmark-models":
+        summary = run_model_benchmarks(config=config, max_rows=args.max_rows)
         print(json.dumps(summary, indent=2))
         return
 
