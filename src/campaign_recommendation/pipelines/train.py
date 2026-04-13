@@ -20,6 +20,8 @@ def run_training(config: AppConfig, max_rows: int | None = None) -> dict:
         max_rows=effective_max_rows,
         allowed_day_offsets=config.raw["allowed_day_offsets"],
         success_statuses=config.raw["success_statuses"],
+        success_scores=config.raw["success_scores"],
+        positive_boost=training_cfg["sample_weight_positive_boost"],
         emi_day_filter=config.raw["emi_day_filter"],
     )
 

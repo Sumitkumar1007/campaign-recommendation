@@ -20,6 +20,22 @@
     "WHATSAPP": ["DELIVERED", "READ", "CLICKED"],
     "VOICE": ["CALL_CONNECTED", "CONNECTED"]
   },
+  "success_scores": {
+    "SMS": {
+      "DELIVERED": 0.4,
+      "READ": 0.8,
+      "CLICKED": 1.0
+    },
+    "WHATSAPP": {
+      "DELIVERED": 0.4,
+      "READ": 0.8,
+      "CLICKED": 1.0
+    },
+    "VOICE": {
+      "CONNECTED": 1.0,
+      "CALL_CONNECTED": 1.0
+    }
+  },
   "training": {
     "usecols": [
       "apac_card_number",
@@ -34,6 +50,7 @@
     ],
     "chunk_size": 250000,
     "max_rows": 500000,
-    "random_state": 42
+    "random_state": 42,
+    "sample_weight_positive_boost": 1.0
   }
 }

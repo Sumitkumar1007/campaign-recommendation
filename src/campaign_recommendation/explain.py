@@ -45,6 +45,7 @@ def build_validation_slice_report(evaluation_frame: pd.DataFrame) -> pd.DataFram
         .agg(
             rows=("target_success", "size"),
             actual_success_rate=("target_success", "mean"),
+            actual_success_score=("target_success_score", "mean"),
             predicted_success_rate=("predicted_success_probability", "mean"),
             predicted_positive_rate=("predicted_positive", "mean"),
         )

@@ -8,6 +8,7 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import ExtraTreesClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, average_precision_score, brier_score_loss, roc_auc_score
@@ -73,11 +74,13 @@ def build_model(random_state: int) -> Pipeline:
         ]
     )
 
-    classifier = LogisticRegression(
-        max_iter=500,
-        class_weight="balanced",
+    classifier = ExtraTreesClassifier(
+        n_estimators=300,
+        max_depth=12,
+        min_samples_leaf=10,
         random_state=random_state,
-        n_jobs=None,
+        n_jobs=-1,
+        class_weight="balanced_subsample",
     )
     return Pipeline(steps=[("preprocessor", preprocessor), ("classifier", classifier)])
 
@@ -104,6 +107,7 @@ def _evaluate_split(model: CalibratedCampaignModel, frame: pd.DataFrame) -> tupl
     metrics = {
         "raw": _metrics_from_probabilities(y, raw_probabilities),
         "calibrated": _metrics_from_probabilities(y, probabilities),
+        "average_success_score": float(frame["target_success_score"].mean()),
     }
 
     evaluation_frame = frame[
@@ -117,6 +121,8 @@ def _evaluate_split(model: CalibratedCampaignModel, frame: pd.DataFrame) -> tupl
             "send_hour",
             "dataset_split",
             "target_success",
+            "target_success_score",
+            "target_sample_weight",
         ]
     ].copy()
     evaluation_frame["raw_success_probability"] = raw_probabilities
@@ -144,9 +150,10 @@ def train_model(df: pd.DataFrame, random_state: int) -> tuple[CalibratedCampaign
 
     X_train = get_model_matrix(train_frame)
     y_train = train_frame["target_success"].astype(int)
+    train_weights = train_frame["target_sample_weight"].astype(float).to_numpy()
 
     base_model = build_model(random_state=random_state)
-    base_model.fit(X_train, y_train)
+    base_model.fit(X_train, y_train, classifier__sample_weight=train_weights)
 
     calibrator = _fit_calibrator(base_model=base_model, validation_frame=validation_frame)
     model = CalibratedCampaignModel(base_model=base_model, calibrator=calibrator)
@@ -160,6 +167,7 @@ def train_model(df: pd.DataFrame, random_state: int) -> tuple[CalibratedCampaign
         "validation_rows": int(len(validation_frame)),
         "test_rows": int(len(test_frame)),
         "train_positive_rate": float(y_train.mean()),
+        "train_average_success_score": float(train_frame["target_success_score"].mean()),
         "validation_metrics": validation_metrics,
         "test_metrics": test_metrics,
     }
