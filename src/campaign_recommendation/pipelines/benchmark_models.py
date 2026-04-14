@@ -7,7 +7,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import AdaBoostClassifier, ExtraTreesClassifier, HistGradientBoostingClassifier, RandomForestClassifier
+from sklearn.ensemble import (
+    AdaBoostClassifier,
+    ExtraTreesClassifier,
+    GradientBoostingClassifier,
+    HistGradientBoostingClassifier,
+    RandomForestClassifier,
+)
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, average_precision_score, brier_score_loss, roc_auc_score
@@ -183,6 +189,40 @@ def _candidate_pipelines(random_state: int) -> list[tuple[str, Pipeline]]:
                 ]
             ),
         ),
+        (
+            "gradient_boosting",
+            Pipeline(
+                steps=[
+                    ("preprocessor", dense_preprocessor),
+                    (
+                        "classifier",
+                        GradientBoostingClassifier(
+                            learning_rate=0.05,
+                            n_estimators=250,
+                            max_depth=3,
+                            random_state=random_state,
+                        ),
+                    ),
+                ]
+            ),
+        ),
+        (
+            "decision_tree",
+            Pipeline(
+                steps=[
+                    ("preprocessor", dense_preprocessor),
+                    (
+                        "classifier",
+                        DecisionTreeClassifier(
+                            max_depth=8,
+                            min_samples_leaf=20,
+                            random_state=random_state,
+                            class_weight="balanced",
+                        ),
+                    ),
+                ]
+            ),
+        ),
     ]
 
 
@@ -249,9 +289,15 @@ def run_model_benchmarks(config: AppConfig, max_rows: int | None = None) -> dict
     experiment_details: dict[str, dict] = {}
     for model_name, pipeline in _candidate_pipelines(training_cfg["random_state"]):
         fit_kwargs = {}
-        if model_name in {"logistic_baseline", "random_forest", "extra_trees"}:
-            fit_kwargs["classifier__sample_weight"] = train_weights
-        if model_name == "adaboost":
+        if model_name in {
+            "logistic_baseline",
+            "random_forest",
+            "extra_trees",
+            "hist_gradient_boosting",
+            "adaboost",
+            "gradient_boosting",
+            "decision_tree",
+        }:
             fit_kwargs["classifier__sample_weight"] = train_weights
 
         pipeline.fit(X_train, y_train, **fit_kwargs)
@@ -315,6 +361,8 @@ def run_model_benchmarks(config: AppConfig, max_rows: int | None = None) -> dict
         "- extra_trees",
         "- hist_gradient_boosting",
         "- adaboost",
+        "- gradient_boosting",
+        "- decision_tree",
         "",
         f"Detailed metrics CSV: `{csv_path.name}`",
         f"Detailed metrics JSON: `{json_path.name}`",
