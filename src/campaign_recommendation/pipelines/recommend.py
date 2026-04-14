@@ -134,8 +134,10 @@ def run_account_explanation(
         policy=policy,
     )
 
-    top_choice = final_selection.iloc[[0]].copy()
-    explanation = explain_prediction(model=model, candidate_row=top_choice, top_k=10)
+    explanation = []
+    if not final_selection.empty:
+        top_choice = final_selection.iloc[[0]].copy()
+        explanation = explain_prediction(model=model, candidate_row=top_choice, top_k=10)
 
     output_dir = config.root_dir / "outputs" / "explanations"
     output_dir.mkdir(parents=True, exist_ok=True)
