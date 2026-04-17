@@ -1,12 +1,24 @@
 # Python
 __pycache__/
 *.py[cod]
+*.pyo
+*.pyd
+.Python
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.coverage
 
-# Local environment and secrets
+# Virtual environments
+.venv/
 venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local environment files
 .env
 .env.*
 
@@ -23,11 +35,10 @@ data/schedules/
 next_month_model_benchmark*.json
 next_month_model_benchmark*.csv
 
-# CatBoost scratch output
+# Generated outputs
+outputs/
 catboost_info/
 artifacts/catboost_info/
-
-# Runtime outputs
 artifacts/models/
 artifacts/checkpoints/
 artifacts/logs/
@@ -38,3 +49,7 @@ artifacts/metrics/
 !artifacts/analysis/
 !artifacts/analysis/*.md
 !artifacts/analysis/*.csv
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
