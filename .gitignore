@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environment and secrets
+venv/
+.env
+.env.*
+
+# Raw/processed data and large generated artifacts
+data/communication/
+data/training/
+data/features/
+data/schedules/
+*.joblib
+*.cbm
+*_predictions_*.csv
+*_strategy_predictions_*.csv
+*_metrics.json
+next_month_model_benchmark*.json
+next_month_model_benchmark*.csv
+
+# CatBoost scratch output
+catboost_info/
+artifacts/catboost_info/
+
+# Runtime outputs
+artifacts/models/
+artifacts/checkpoints/
+artifacts/logs/
+artifacts/predictions/
+artifacts/metrics/
+
+# Keep lightweight analysis outputs created for review.
+!artifacts/analysis/
+!artifacts/analysis/*.md
+!artifacts/analysis/*.csv
