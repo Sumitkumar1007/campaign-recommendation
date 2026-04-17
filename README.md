@@ -343,6 +343,14 @@ python scripts/explain_strategy_prediction.py \
   --output-dir artifacts/explanations/single_account
 ```
 
+This creates:
+
+```text
+artifacts/explanations/single_account/MFLKTKSECUL000005349103_prediction_explanation.md
+artifacts/explanations/single_account/prediction_explanation_account_summary.csv
+artifacts/explanations/single_account/prediction_explanation_day_detail.csv
+```
+
 Generate explanation files for all accounts in the prediction file:
 
 ```bash
@@ -351,12 +359,22 @@ python scripts/explain_strategy_prediction.py \
   --output-dir artifacts/explanations/may_2026_all
 ```
 
+This creates:
+
+```text
+artifacts/explanations/may_2026_all/prediction_explanation_summary.md
+artifacts/explanations/may_2026_all/prediction_explanation_account_summary.csv
+artifacts/explanations/may_2026_all/prediction_explanation_day_detail.csv
+```
+
 The explainer writes:
 
 - `prediction_explanation_account_summary.csv`: one row per APAC/account with 3-month feature and schedule history summary.
 - `prediction_explanation_day_detail.csv`: one row per APAC/account/day with prediction, top probability, blank probability, best non-blank alternative, top candidates, and reason.
 - `<loan_number>_prediction_explanation.md`: single-account stakeholder-readable Markdown when `--loan-number` is used.
 - `prediction_explanation_summary.md`: all-account summary when explaining every account.
+
+`artifacts/explanations/` exists in GitHub with a `.gitkeep` placeholder only. Generated explanation files are not committed because they can become large and are environment/data specific.
 
 ## Operational Checks
 

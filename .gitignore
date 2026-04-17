@@ -45,7 +45,8 @@ artifacts/checkpoints/
 artifacts/logs/
 artifacts/predictions/
 artifacts/metrics/
-artifacts/explanations/
+artifacts/explanations/*
+!artifacts/explanations/.gitkeep
 artifacts/mlruns/
 mlruns/
 
