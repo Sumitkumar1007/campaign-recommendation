@@ -44,6 +44,8 @@ artifacts/checkpoints/
 artifacts/logs/
 artifacts/predictions/
 artifacts/metrics/
+artifacts/mlruns/
+mlruns/
 
 # Keep lightweight analysis outputs created for review.
 !artifacts/analysis/
