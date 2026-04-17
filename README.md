@@ -376,6 +376,12 @@ The explainer writes:
 
 `artifacts/explanations/` exists in GitHub with a `.gitkeep` placeholder only. Generated explanation files are not committed because they can become large and are environment/data specific.
 
+One committed sample is available here:
+
+```text
+docs/examples/MFLKTKSECUL000005349103_prediction_explanation.md
+```
+
 ## Operational Checks
 
 Check logs:
