@@ -21,6 +21,7 @@ dist/
 # Local environment files
 .env
 .env.*
+!.env.example
 
 # Raw/processed data and large generated artifacts
 data/communication/

@@ -24,17 +24,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--experiment-name",
-        default="campaign-recommendation",
+        default=os.getenv("MLFLOW_EXPERIMENT_NAME", "campaign-recommendation"),
         help="MLflow experiment name.",
     )
     parser.add_argument(
         "--registered-model-name",
-        default="campaign_next_month_catboost_3m",
+        default=os.getenv("MLFLOW_REGISTERED_MODEL_NAME", "campaign_next_month_catboost_3m"),
         help="MLflow registered model name.",
     )
     parser.add_argument(
         "--run-name",
-        default="catboost-3m-may-2026-v1",
+        default=os.getenv("MLFLOW_RUN_NAME", "catboost-3m-may-2026-v1"),
         help="MLflow run name.",
     )
     parser.add_argument(
