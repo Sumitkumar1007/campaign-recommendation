@@ -73,8 +73,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        choices=["catboost", "logistic"],
-        default="catboost",
+        choices=["catboost", "catboost_3m", "logistic"],
+        default="catboost_3m",
         help="Which next-month model pipeline to run.",
     )
     parser.add_argument(
@@ -166,28 +166,27 @@ def store_feature_snapshots(
             )
         )
 
-    conn.executemany(
-        sql.SQL(
-            """
-            INSERT INTO {table_ref} (
-                apac_card_number,
-                source_month,
-                risk,
-                feature_payload,
-                pipeline_version,
-                created_at
-            )
-            VALUES (%s, %s, %s, %s, %s, %s)
-            ON CONFLICT (apac_card_number, source_month)
-            DO UPDATE SET
-                risk = EXCLUDED.risk,
-                feature_payload = EXCLUDED.feature_payload,
-                pipeline_version = EXCLUDED.pipeline_version,
-                created_at = EXCLUDED.created_at
-            """
-        ).format(table_ref=qualified_identifier(schema, table)),
-        rows,
-    )
+    query = sql.SQL(
+        """
+        INSERT INTO {table_ref} (
+            apac_card_number,
+            source_month,
+            risk,
+            feature_payload,
+            pipeline_version,
+            created_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s)
+        ON CONFLICT (apac_card_number, source_month)
+        DO UPDATE SET
+            risk = EXCLUDED.risk,
+            feature_payload = EXCLUDED.feature_payload,
+            pipeline_version = EXCLUDED.pipeline_version,
+            created_at = EXCLUDED.created_at
+        """
+    ).format(table_ref=qualified_identifier(schema, table))
+    with conn.cursor() as cur:
+        cur.executemany(query, rows)
     return len(rows)
 
 
@@ -227,29 +226,28 @@ def store_prediction_snapshots(
             )
         )
 
-    conn.executemany(
-        sql.SQL(
-            """
-            INSERT INTO {table_ref} (
-                loan_number,
-                source_month_used,
-                prediction_month,
-                model_name,
-                source_risk,
-                prediction_payload,
-                created_at
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (loan_number, prediction_month, model_name)
-            DO UPDATE SET
-                source_month_used = EXCLUDED.source_month_used,
-                source_risk = EXCLUDED.source_risk,
-                prediction_payload = EXCLUDED.prediction_payload,
-                created_at = EXCLUDED.created_at
-            """
-        ).format(table_ref=qualified_identifier(schema, table)),
-        rows,
-    )
+    query = sql.SQL(
+        """
+        INSERT INTO {table_ref} (
+            loan_number,
+            source_month_used,
+            prediction_month,
+            model_name,
+            source_risk,
+            prediction_payload,
+            created_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (loan_number, prediction_month, model_name)
+        DO UPDATE SET
+            source_month_used = EXCLUDED.source_month_used,
+            source_risk = EXCLUDED.source_risk,
+            prediction_payload = EXCLUDED.prediction_payload,
+            created_at = EXCLUDED.created_at
+        """
+    ).format(table_ref=qualified_identifier(schema, table))
+    with conn.cursor() as cur:
+        cur.executemany(query, rows)
     return len(rows)
 
 
@@ -300,10 +298,11 @@ def main() -> None:
         str(FEATURE_DATA_DIR / "strategy_monthly_features.csv"),
     )
 
-    if args.model == "catboost":
-        prediction_file = PREDICTIONS_DIR / f"{args.predict_month.replace('-', '_').lower()}_strategy_predictions_catboost.csv"
-        model_file = MODEL_DIR / "next_month_strategy_catboost.joblib"
-        metrics_file = METRICS_DIR / "next_month_strategy_catboost_metrics.json"
+    if args.model in {"catboost", "catboost_3m"}:
+        model_suffix = "catboost_3m" if args.model == "catboost_3m" else "catboost"
+        prediction_file = PREDICTIONS_DIR / f"{args.predict_month.replace('-', '_').lower()}_strategy_predictions_{model_suffix}.csv"
+        model_file = MODEL_DIR / f"next_month_strategy_{model_suffix}.joblib"
+        metrics_file = METRICS_DIR / f"next_month_strategy_{model_suffix}_metrics.json"
         if not model_file.exists():
             raise FileNotFoundError(
                 f"CatBoost model bundle not found: {model_file}. "
