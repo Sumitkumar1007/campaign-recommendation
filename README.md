@@ -107,6 +107,8 @@ Additional CatBoost 3-month inference utilities are available under `scripts/`:
   Explains the 3-month feature window and model input shape.
 - `docs/application_logging.md`
   Describes application logging and operational checks.
+- `docs/mlflow_model_registry.md`
+  Shows how to log and register large model bundles in MLflow instead of GitHub.
 - `artifacts/analysis/may_2026_all_blank_27_apac_analysis.md`
   Reviews the 27 May 2026 all-blank APAC predictions.
 
