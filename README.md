@@ -1,187 +1,139 @@
-# Recommendation Project Layout
+# Campaign Recommendation
 
-This repository is organized so scripts, input data, generated artifacts, and reports live in separate folders.
-The scripts use `scripts/project_paths.py`, so the default paths stay relative to this project instead of relying on machine-specific locations.
+ML-based EMI campaign recommendation engine for day-wise communication strategy planning.
 
-## Folders
+This project predicts the best communication strategy across the EMI window `D-5` to `D+5`, excluding `D`, and applies business quotas **per day**:
 
-- `scripts/`: training, benchmarking, and dataset-building scripts
-- `data/communication/`: raw monthly communication CSV files
-- `data/training/`: generated training datasets
-- `data/schedules/`: generated schedule-style datasets
-- `data/features/`: aggregated feature tables
-- `artifacts/models/`: saved model files
-- `artifacts/metrics/`: metrics JSON outputs
-- `artifacts/predictions/`: prediction CSV outputs
-- `artifacts/catboost_info/`: CatBoost training scratch/output directories
-- `reports/benchmarks/`: benchmark JSON and CSV summaries
-- `venv/`: local Python virtual environment
+- `low` risk: up to `1` communication per day
+- `medium` risk: up to `2` communications per day
+- `high` risk: up to `3` communications per day
 
-## Main Scripts
+If previous-month signal is unavailable for a given day for a customer, the system returns `-` for that day.
 
-- `scripts/generate_strategy_dataset.py`: builds the day-level training dataset from communication files
-- `scripts/build_monthly_feature_dataset.py`: aggregates day-level data into monthly features
-- `scripts/build_strategy_schedule_dataset.py`: converts training data into schedule-shaped targets
-- `scripts/train_strategy_model.py`: trains the multiclass strategy model
-- `scripts/train_strategy_model_low_ram.py`: trains the low-memory month-level model
-- `scripts/train_next_month_strategy_model.py`: trains the next-month multi-output model
-- `scripts/train_next_month_strategy_model_logistic.py`: logistic next-month baseline
-- `scripts/train_next_month_strategy_model_catboost.py`: trains and saves the CatBoost next-month model bundle
-- `scripts/predict_next_month_strategy_catboost.py`: inference-only CatBoost next-month prediction
-- `scripts/run_monthly_inference_pipeline.py`: fetches one source month, refreshes processed data, runs inference, and stores DB snapshots
-- `scripts/benchmark_next_month_models.py`: benchmarks supported next-month models
+## What This Project Does
 
-## Core Files
+- filters training data to EMI date `5th` only
+- builds channel-aware communication-success targets
+- supports weighted success scoring where `CLICKED` and `READ` are stronger than `DELIVERED`
+- creates previous-month customer history and day-availability features
+- trains and evaluates models using a month-based time split
+- benchmarks multiple model families
+- uses `extra_trees` as the current production default
+- generates day-by-day strategy calendars, bucket summaries, and account-level explanations
 
-- monthly features: `data/features/strategy_monthly_features.csv`
-- all-month training rows: `data/training/strategy_training_dataset_all_months.csv`
-- all-month schedule targets: `data/schedules/strategy_schedule_dataset_all_months.csv`
-- benchmark summary: `reports/benchmarks/next_month_model_benchmark_summary.csv`
-- benchmark detail: `reports/benchmarks/next_month_model_benchmark.json`
+## Current Production Model
 
-## Run Commands
+The current default production model is `ExtraTreesClassifier` with probability calibration.
 
-Activate the local environment:
+Why it was selected:
 
-```bash
-source venv/bin/activate
+- it outperformed the legacy baseline in the benchmark experiments
+- it achieved stronger ranking and calibrated probability quality on the held-out test month
+
+Benchmark references:
+
+- [Legacy vs Extra Trees](reports/legacy_vs_extra_trees.md)
+- [Model Benchmark Experiments](reports/model_benchmark_experiments.md)
+
+## Project Structure
+
+- `src/campaign_recommendation/`
+  Core package for training, recommendation generation, explainability, and benchmarking.
+- `config/`
+  Project configuration.
+- `training-data/`
+  Raw input dataset tracked with Git LFS.
+- `outputs/`
+  Generated model artifacts, recommendations, summaries, and account explanations.
+- `reports/`
+  Benchmark and comparison reports.
+- `docs/`
+  Technical handoff and deployment documentation.
+
+## Key Outputs
+
+- `outputs/model/model.joblib`
+  Serialized trained model artifact.
+- `outputs/model/metrics.json`
+  Validation and test metrics for the current production model.
+- `outputs/recommendations.csv`
+  Day-wise strategy output across the EMI window.
+- `outputs/bucket_counts.csv`
+  Overall count by `risk + strategy label`.
+- `outputs/bucket_counts_by_day.csv`
+  Count by `risk + day + strategy label`.
+
+## Commands
+
+Train the current production model:
+
+```powershell
+$env:PYTHONPATH="src"
+d:\aiml\venv\Scripts\python.exe -m campaign_recommendation train --max-rows 80000
 ```
 
-Run the next-month benchmark:
+Generate recommendations:
 
-```bash
-python scripts/benchmark_next_month_models.py
+```powershell
+$env:PYTHONPATH="src"
+d:\aiml\venv\Scripts\python.exe -m campaign_recommendation recommend --model-dir outputs\model
 ```
 
-Run the next-month logistic model and generate April predictions:
+Explain one account:
 
-```bash
-python scripts/train_next_month_strategy_model_logistic.py
+```powershell
+$env:PYTHONPATH="src"
+d:\aiml\venv\Scripts\python.exe -m campaign_recommendation explain --model-dir outputs\model --account-id MFLAPDSECUL000005010246
 ```
 
-Train and save the next-month CatBoost model bundle:
+Run model benchmarks:
 
-```bash
-python scripts/train_next_month_strategy_model_catboost.py
+```powershell
+$env:PYTHONPATH="src"
+d:\aiml\venv\Scripts\python.exe -m campaign_recommendation benchmark-models --max-rows 80000
 ```
 
-Run inference only with the saved CatBoost bundle:
+## Documentation
 
-```bash
-python scripts/predict_next_month_strategy_catboost.py --prediction-source-months MAR-2026
-```
+Additional CatBoost 3-month inference utilities are available under `scripts/`:
 
-Run the monthly Postgres-backed inference pipeline:
+- `scripts/train_next_month_strategy_model_catboost.py`
+  Trains the next-month CatBoost bundle with rolling 3-month account history.
+- `scripts/predict_next_month_strategy_catboost.py`
+  Runs inference only from a saved CatBoost bundle.
+- `scripts/run_monthly_inference_pipeline.py`
+  Fetches one source month from Postgres, refreshes processed local data, runs inference, and stores snapshots.
+- `docs/three_month_catboost_training_explainer.md`
+  Explains the 3-month feature window and model input shape.
+- `docs/application_logging.md`
+  Describes application logging and operational checks.
+- `artifacts/analysis/may_2026_all_blank_27_apac_analysis.md`
+  Reviews the 27 May 2026 all-blank APAC predictions.
 
-Set credentials with environment variables first:
+For Postgres-backed monthly inference, pass credentials through environment variables or deployment secrets. Do not commit database passwords.
 
-```bash
-export PGHOST=your_postgres_host
-export PGPORT=5432
-export PGDATABASE=postgres
-export PGUSER=postgres
-export PGPASSWORD=your_password_here
-```
+Technical handoff guide:
 
-Then run:
+- [Implementation And Deployment Guide (Markdown)](docs/implementation_and_deployment_guide.md)
+- [Implementation And Deployment Guide (PDF)](docs/implementation_and_deployment_guide.pdf)
 
-```bash
-python scripts/run_monthly_inference_pipeline.py \
-  --host "$PGHOST" \
-  --port "$PGPORT" \
-  --dbname "$PGDATABASE" \
-  --user "$PGUSER" \
-  --password "$PGPASSWORD" \
-  --source-schema digital_collections \
-  --source-table communications \
-  --target-schema digital_collections \
-  --source-month 2026-04 \
-  --predict-month 2026-05 \
-  --model catboost
-```
+Business summary:
 
-The default split used by the next-month scripts is:
+- [Stakeholder Summary](docs/stakeholder_summary.md)
 
-- train source months: `NOV-2025`, `DEC-2025`, `JAN-2026`
-- validation source month: `FEB-2026`
-- prediction source month: `MAR-2026`
-- prediction target month: `APR-2026`
+## Notes
 
-## Typical Workflow
+- the current target is communication success, not direct payment conversion
+- `VOICE` is included as a channel, but payment linkage for IVR is not available in the source data
+- validation and testing are month-based, not random-row based
+- generated outputs are not committed by default
 
-1. Build the day-level training dataset from raw communication files.
+## GitHub Repo Description
 
-```bash
-python scripts/generate_strategy_dataset.py
-```
+Suggested repo description:
 
-2. Convert the day-level dataset into schedule-style targets.
+`ML-based EMI campaign recommendation engine with day-wise strategy generation, benchmarking, explainability, and production-ready batch inference.`
 
-```bash
-python scripts/build_strategy_schedule_dataset.py
-```
+Suggested repo tags:
 
-3. Aggregate the day-level data into monthly features.
-
-```bash
-python scripts/build_monthly_feature_dataset.py
-```
-
-4. Benchmark candidate next-month models.
-
-```bash
-python scripts/benchmark_next_month_models.py
-```
-
-5. Choose the production candidate from the benchmark summary.
-
-Current strongest options from the latest benchmark:
-
-- `CatBoost` for best validation average day accuracy
-- `MLP` for best validation exact match
-
-6. Train the chosen model once and save the production bundle.
-
-For CatBoost:
-
-```bash
-python scripts/train_next_month_strategy_model_catboost.py
-```
-
-For logistic baseline:
-
-```bash
-python scripts/train_next_month_strategy_model_logistic.py
-```
-
-7. Run inference for each new source month without retraining.
-
-For CatBoost inference only:
-
-```bash
-python scripts/predict_next_month_strategy_catboost.py --prediction-source-months MAR-2026
-```
-
-For the incremental Postgres pipeline:
-
-```bash
-python scripts/run_monthly_inference_pipeline.py \
-  --host "$PGHOST" \
-  --port "$PGPORT" \
-  --dbname "$PGDATABASE" \
-  --user "$PGUSER" \
-  --password "$PGPASSWORD" \
-  --source-schema digital_collections \
-  --source-table communications \
-  --target-schema digital_collections \
-  --source-month 2026-04 \
-  --predict-month 2026-05 \
-  --model catboost
-```
-
-## Examples
-
-- Benchmark outputs: `reports/benchmarks/`
-- Saved predictions: `artifacts/predictions/`
-- Saved models: `artifacts/models/`
-- Saved metrics: `artifacts/metrics/`
+`machine-learning`, `recommendation-system`, `campaign-optimization`, `collections`, `python`, `scikit-learn`

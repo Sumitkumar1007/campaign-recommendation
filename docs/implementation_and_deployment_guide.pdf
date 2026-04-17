@@ -1,0 +1,784 @@
+%PDF-1.4
+%âãÏÓ
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 12 /Kids [3 0 R 5 0 R 7 0 R 9 0 R 11 0 R 13 0 R 15 0 R 17 0 R 19 0 R 21 0 R 23 0 R 25 0 R] >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 27 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 2471 >>
+stream
+BT
+/F1 10 Tf
+50 790 Td
+(# Campaign Recommendation Implementation And Deployment Guide) Tj
+0 -14 Td () Tj
+0 -14 Td (## 1. Project Objective) Tj
+0 -14 Td () Tj
+0 -14 Td (This project builds an ML-based campaign recommendation engine for EMI collections) Tj
+0 -14 Td (communication.) Tj
+0 -14 Td () Tj
+0 -14 Td (The system predicts the most suitable communication strategy for each loan account across the) Tj
+0 -14 Td (EMI window:) Tj
+0 -14 Td () Tj
+0 -14 Td (- `D-5` to `D+5`) Tj
+0 -14 Td (- `D` is excluded) Tj
+0 -14 Td () Tj
+0 -14 Td (The business rule is applied **per day**:) Tj
+0 -14 Td () Tj
+0 -14 Td (- `low` risk: up to `1` communication per day) Tj
+0 -14 Td (- `medium` risk: up to `2` communications per day) Tj
+0 -14 Td (- `high` risk: up to `3` communications per day) Tj
+0 -14 Td () Tj
+0 -14 Td (If the previous month has no campaign signal for a given day for a customer, that day is) Tj
+0 -14 Td (returned as `-`.) Tj
+0 -14 Td () Tj
+0 -14 Td (## 2. High-Level Architecture) Tj
+0 -14 Td () Tj
+0 -14 Td (The pipeline is organized into these stages:) Tj
+0 -14 Td () Tj
+0 -14 Td (1. Read raw communication history data) Tj
+0 -14 Td (2. Filter only valid EMI records) Tj
+0 -14 Td (3. Build channel-aware target labels) Tj
+0 -14 Td (4. Build previous-month customer history features) Tj
+0 -14 Td (5. Build previous-month day-availability features) Tj
+0 -14 Td (6. Create time-based train, validation, and test splits) Tj
+0 -14 Td (7. Train the recommendation model) Tj
+0 -14 Td (8. Calibrate probabilities) Tj
+0 -14 Td (9. Score candidate day/channel/hour combinations) Tj
+0 -14 Td (10. Apply daily business quotas by risk) Tj
+0 -14 Td (11. Export strategy outputs and summary reports) Tj
+0 -14 Td () Tj
+0 -14 Td (## 3. Repository Structure) Tj
+0 -14 Td () Tj
+0 -14 Td (- [README.md]\(/d:/aiml/campaign-recommenadtion/README.md\)) Tj
+0 -14 Td (  Short project overview and quick-start commands.) Tj
+0 -14 Td () Tj
+0 -14 Td (- [config/default_config.json]\(/d:/aiml/campaign-recommenadtion/config/default_config.json\)) Tj
+0 -14 Td (  Main configuration file for paths, target definitions, candidate hours, and training) Tj
+0 -14 Td (settings.) Tj
+0 -14 Td () Tj
+0 -14 Td (- [src/campaign_recommendation]\(/d:/aiml/campaign-recommenadtion/src/campaign_recommendation\)) Tj
+0 -14 Td (  Main application package.) Tj
+0 -14 Td () Tj
+0 -14 Td (- [training-data]\(/d:/aiml/campaign-recommenadtion/training-data\)) Tj
+0 -14 Td (  Input raw dataset.) Tj
+0 -14 Td () Tj
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 27 0 R >> >> /Contents 6 0 R >>
+endobj
+6 0 obj
+<< /Length 1979 >>
+stream
+BT
+/F1 10 Tf
+50 790 Td
+(- [outputs]\(/d:/aiml/campaign-recommenadtion/outputs\)) Tj
+0 -14 Td (  Generated model artifacts, recommendations, summaries, and explanations.) Tj
+0 -14 Td () Tj
+0 -14 Td (- [reports]\(/d:/aiml/campaign-recommenadtion/reports\)) Tj
+0 -14 Td (  Benchmark and comparison reports.) Tj
+0 -14 Td () Tj
+0 -14 Td (## 4. Input Data Used) Tj
+0 -14 Td () Tj
+0 -14 Td (Training dataset:) Tj
+0 -14 Td () Tj
+0 -14 Td (-) Tj
+0 -14 Td ([mfl_last_6_months_communication_data.csv]\(/d:/aiml/campaign-recommenadtion/training-data/mfl_l) Tj
+0 -14 Td (ast_6_months_communication_data.csv\)) Tj
+0 -14 Td () Tj
+0 -14 Td (Important raw columns used:) Tj
+0 -14 Td () Tj
+0 -14 Td (- `apac_card_number`) Tj
+0 -14 Td (- `comm_status`) Tj
+0 -14 Td (- `communication_type`) Tj
+0 -14 Td (- `payment_unique_id`) Tj
+0 -14 Td (- `created_date`) Tj
+0 -14 Td (- `risk`) Tj
+0 -14 Td (- `collectable_amount`) Tj
+0 -14 Td (- `campaign_identifier`) Tj
+0 -14 Td (- `emi_date`) Tj
+0 -14 Td () Tj
+0 -14 Td (## 5. Data Filtering Rules) Tj
+0 -14 Td () Tj
+0 -14 Td (### EMI Day Filter) Tj
+0 -14 Td () Tj
+0 -14 Td (Only rows where `emi_date` is the `5th` are used.) Tj
+0 -14 Td () Tj
+0 -14 Td (This is controlled by:) Tj
+0 -14 Td () Tj
+0 -14 Td (- `emi_day_filter = 5` in) Tj
+0 -14 Td ([default_config.json]\(/d:/aiml/campaign-recommenadtion/config/default_config.json\)) Tj
+0 -14 Td () Tj
+0 -14 Td (### Allowed Strategy Days) Tj
+0 -14 Td () Tj
+0 -14 Td (Only the following day offsets are considered:) Tj
+0 -14 Td () Tj
+0 -14 Td (- `-5, -4, -3, -2, -1, 1, 2, 3, 4, 5`) Tj
+0 -14 Td () Tj
+0 -14 Td (`D` or `day_offset = 0` is excluded from campaign generation.) Tj
+0 -14 Td () Tj
+0 -14 Td (## 6. Target Label Design) Tj
+0 -14 Td () Tj
+0 -14 Td (### Binary Success) Tj
+0 -14 Td () Tj
+0 -14 Td (The model still trains as a classifier with binary success target:) Tj
+0 -14 Td () Tj
+0 -14 Td (- `target_success = 1` for positive communication outcome) Tj
+0 -14 Td (- `target_success = 0` otherwise) Tj
+ET
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 27 0 R >> >> /Contents 8 0 R >>
+endobj
+8 0 obj
+<< /Length 1947 >>
+stream
+BT
+/F1 10 Tf
+50 790 Td
+() Tj
+0 -14 Td (### Channel-Aware Success) Tj
+0 -14 Td () Tj
+0 -14 Td (Success is defined differently by channel:) Tj
+0 -14 Td () Tj
+0 -14 Td (- `SMS`: `DELIVERED`, `READ`, `CLICKED`) Tj
+0 -14 Td (- `WHATSAPP`: `DELIVERED`, `READ`, `CLICKED`) Tj
+0 -14 Td (- `VOICE`: `CONNECTED`, `CALL_CONNECTED`) Tj
+0 -14 Td () Tj
+0 -14 Td (This logic is implemented in:) Tj
+0 -14 Td () Tj
+0 -14 Td (- [labeling.py]\(/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/labeling.py\)) Tj
+0 -14 Td () Tj
+0 -14 Td (### Weighted Success Strength) Tj
+0 -14 Td () Tj
+0 -14 Td (To make stronger engagement more important:) Tj
+0 -14 Td () Tj
+0 -14 Td (- `DELIVERED = 0.4`) Tj
+0 -14 Td (- `READ = 0.8`) Tj
+0 -14 Td (- `CLICKED = 1.0`) Tj
+0 -14 Td (- `CONNECTED / CALL_CONNECTED = 1.0`) Tj
+0 -14 Td () Tj
+0 -14 Td (This creates:) Tj
+0 -14 Td () Tj
+0 -14 Td (- `target_success_score`) Tj
+0 -14 Td (- `target_sample_weight`) Tj
+0 -14 Td () Tj
+0 -14 Td (The classifier still predicts binary success probability, but stronger events influence) Tj
+0 -14 Td (training more.) Tj
+0 -14 Td () Tj
+0 -14 Td (## 7. Feature Engineering) Tj
+0 -14 Td () Tj
+0 -14 Td (Feature engineering is implemented in:) Tj
+0 -14 Td () Tj
+0 -14 Td (- [features.py]\(/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/features.py\)) Tj
+0 -14 Td (- [data.py]\(/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/data.py\)) Tj
+0 -14 Td () Tj
+0 -14 Td (### Base Features) Tj
+0 -14 Td () Tj
+0 -14 Td (- `risk`) Tj
+0 -14 Td (- `communication_type`) Tj
+0 -14 Td (- `campaign_identifier`) Tj
+0 -14 Td (- `day_offset`) Tj
+0 -14 Td (- `send_hour`) Tj
+0 -14 Td (- `collectable_amount`) Tj
+0 -14 Td (- `emi_day`) Tj
+0 -14 Td (- `emi_month_number`) Tj
+0 -14 Td (- `is_predue`) Tj
+0 -14 Td (- `is_postdue`) Tj
+0 -14 Td () Tj
+0 -14 Td (### Previous-Month History Features) Tj
+0 -14 Td () Tj
+0 -14 Td (For each customer, previous-month aggregates are created:) Tj
+ET
+endstream
+endobj
+9 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 27 0 R >> >> /Contents 10 0 R >>
+endobj
+10 0 obj
+<< /Length 2158 >>
+stream
+BT
+/F1 10 Tf
+50 790 Td
+() Tj
+0 -14 Td (- `prev_month_total_comms`) Tj
+0 -14 Td (- `prev_month_success_count`) Tj
+0 -14 Td (- `prev_month_payment_count`) Tj
+0 -14 Td (- `prev_month_sms_count`) Tj
+0 -14 Td (- `prev_month_whatsapp_count`) Tj
+0 -14 Td (- `prev_month_voice_count`) Tj
+0 -14 Td (- `prev_month_sms_success_count`) Tj
+0 -14 Td (- `prev_month_whatsapp_success_count`) Tj
+0 -14 Td (- `prev_month_voice_success_count`) Tj
+0 -14 Td (- `prev_month_success_rate`) Tj
+0 -14 Td (- `prev_month_payment_rate`) Tj
+0 -14 Td () Tj
+0 -14 Td (### Previous-Month Day Availability) Tj
+0 -14 Td () Tj
+0 -14 Td (These indicate whether a customer had campaign activity in the previous month for that) Tj
+0 -14 Td (specific EMI-relative day:) Tj
+0 -14 Td () Tj
+0 -14 Td (- `prev_month_day_m5_available`) Tj
+0 -14 Td (- `prev_month_day_m4_available`) Tj
+0 -14 Td (- `prev_month_day_m3_available`) Tj
+0 -14 Td (- `prev_month_day_m2_available`) Tj
+0 -14 Td (- `prev_month_day_m1_available`) Tj
+0 -14 Td (- `prev_month_day_p1_available`) Tj
+0 -14 Td (- `prev_month_day_p2_available`) Tj
+0 -14 Td (- `prev_month_day_p3_available`) Tj
+0 -14 Td (- `prev_month_day_p4_available`) Tj
+0 -14 Td (- `prev_month_day_p5_available`) Tj
+0 -14 Td () Tj
+0 -14 Td (And a runtime helper feature:) Tj
+0 -14 Td () Tj
+0 -14 Td (- `prev_month_same_day_available`) Tj
+0 -14 Td () Tj
+0 -14 Td (This is used to decide whether a day should produce recommendations or `-`.) Tj
+0 -14 Td () Tj
+0 -14 Td (## 8. Train/Validation/Test Split) Tj
+0 -14 Td () Tj
+0 -14 Td (The split is time-based, not random.) Tj
+0 -14 Td () Tj
+0 -14 Td (This is important because recommendation systems for EMI communication must be validated on) Tj
+0 -14 Td (future months, not mixed-row random samples.) Tj
+0 -14 Td () Tj
+0 -14 Td (Current split logic:) Tj
+0 -14 Td () Tj
+0 -14 Td (- train = all older months except last two) Tj
+0 -14 Td (- validation = second latest EMI month) Tj
+0 -14 Td (- test = latest EMI month) Tj
+0 -14 Td () Tj
+0 -14 Td (Example from current runs:) Tj
+0 -14 Td () Tj
+0 -14 Td (- train: `2025-10`, `2025-11`, `2025-12`) Tj
+0 -14 Td (- validation: `2026-01`) Tj
+0 -14 Td (- test: `2026-02`) Tj
+ET
+endstream
+endobj
+11 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 27 0 R >> >> /Contents 12 0 R >>
+endobj
+12 0 obj
+<< /Length 1978 >>
+stream
+BT
+/F1 10 Tf
+50 790 Td
+() Tj
+0 -14 Td (## 9. Model Selection Journey) Tj
+0 -14 Td () Tj
+0 -14 Td (### Initial Legacy Baseline) Tj
+0 -14 Td () Tj
+0 -14 Td (The first production baseline used logistic regression with calibrated probabilities.) Tj
+0 -14 Td () Tj
+0 -14 Td (### Weighted Success Challenger) Tj
+0 -14 Td () Tj
+0 -14 Td (Then channel-aware weighted success was introduced.) Tj
+0 -14 Td () Tj
+0 -14 Td (### Tree-Based Experiment Benchmark) Tj
+0 -14 Td () Tj
+0 -14 Td (Multiple experiments were run:) Tj
+0 -14 Td () Tj
+0 -14 Td (- logistic baseline) Tj
+0 -14 Td (- random forest) Tj
+0 -14 Td (- extra trees) Tj
+0 -14 Td (- histogram gradient boosting) Tj
+0 -14 Td (- adaboost) Tj
+0 -14 Td () Tj
+0 -14 Td (Benchmark reports:) Tj
+0 -14 Td () Tj
+0 -14 Td (-) Tj
+0 -14 Td ([model_benchmark_experiments.csv]\(/d:/aiml/campaign-recommenadtion/reports/model_benchmark_expe) Tj
+0 -14 Td (riments.csv\)) Tj
+0 -14 Td (-) Tj
+0 -14 Td ([model_benchmark_experiments.md]\(/d:/aiml/campaign-recommenadtion/reports/model_benchmark_exper) Tj
+0 -14 Td (iments.md\)) Tj
+0 -14 Td () Tj
+0 -14 Td (### Final Current Default) Tj
+0 -14 Td () Tj
+0 -14 Td (The current default production model is:) Tj
+0 -14 Td () Tj
+0 -14 Td (- `ExtraTreesClassifier`) Tj
+0 -14 Td () Tj
+0 -14 Td (This decision was based on stronger benchmark results against the legacy model.) Tj
+0 -14 Td () Tj
+0 -14 Td (Decision report:) Tj
+0 -14 Td () Tj
+0 -14 Td (- [legacy_vs_extra_trees.md]\(/d:/aiml/campaign-recommenadtion/reports/legacy_vs_extra_trees.md\)) Tj
+0 -14 Td () Tj
+0 -14 Td (## 10. Current Production Model Implementation) Tj
+0 -14 Td () Tj
+0 -14 Td (Main model code:) Tj
+0 -14 Td () Tj
+0 -14 Td (- [modeling.py]\(/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/modeling.py\)) Tj
+0 -14 Td () Tj
+0 -14 Td (Current production training stack:) Tj
+0 -14 Td () Tj
+0 -14 Td (1. Feature engineering) Tj
+0 -14 Td (2. Preprocessing using `ColumnTransformer`) Tj
+0 -14 Td (3. `ExtraTreesClassifier`) Tj
+ET
+endstream
+endobj
+13 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 27 0 R >> >> /Contents 14 0 R >>
+endobj
+14 0 obj
+<< /Length 2255 >>
+stream
+BT
+/F1 10 Tf
+50 790 Td
+(4. Probability calibration using logistic regression on validation predictions) Tj
+0 -14 Td () Tj
+0 -14 Td (## 11. Where The Model Artifact Is Stored) Tj
+0 -14 Td () Tj
+0 -14 Td (The trained model artifact is stored in:) Tj
+0 -14 Td () Tj
+0 -14 Td (- [outputs/model/model.joblib]\(/d:/aiml/campaign-recommenadtion/outputs/model/model.joblib\)) Tj
+0 -14 Td () Tj
+0 -14 Td (Important:) Tj
+0 -14 Td () Tj
+0 -14 Td (- this is the primary serialized model artifact) Tj
+0 -14 Td (- it is a `joblib` file, not a `.pkl`) Tj
+0 -14 Td (- functionally it serves the same deployment purpose as a pickle-style model artifact) Tj
+0 -14 Td () Tj
+0 -14 Td (Related saved artifacts:) Tj
+0 -14 Td () Tj
+0 -14 Td (- [outputs/model/metrics.json]\(/d:/aiml/campaign-recommenadtion/outputs/model/metrics.json\)) Tj
+0 -14 Td (-) Tj
+0 -14 Td ([outputs/model/run_summary.json]\(/d:/aiml/campaign-recommenadtion/outputs/model/run_summary.jso) Tj
+0 -14 Td (n\)) Tj
+0 -14 Td (-) Tj
+0 -14 Td ([outputs/model/evaluation_sample.csv]\(/d:/aiml/campaign-recommenadtion/outputs/model/evaluation) Tj
+0 -14 Td (_sample.csv\)) Tj
+0 -14 Td (-) Tj
+0 -14 Td ([outputs/model/validation_slice_report.csv]\(/d:/aiml/campaign-recommenadtion/outputs/model/vali) Tj
+0 -14 Td (dation_slice_report.csv\)) Tj
+0 -14 Td (-) Tj
+0 -14 Td ([outputs/model/calibration_report.csv]\(/d:/aiml/campaign-recommenadtion/outputs/model/calibrati) Tj
+0 -14 Td (on_report.csv\)) Tj
+0 -14 Td () Tj
+0 -14 Td (## 12. How Training Works) Tj
+0 -14 Td () Tj
+0 -14 Td (Training entrypoint:) Tj
+0 -14 Td () Tj
+0 -14 Td (- [__main__.py]\(/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/__main__.py\)) Tj
+0 -14 Td () Tj
+0 -14 Td (Training pipeline:) Tj
+0 -14 Td () Tj
+0 -14 Td (-) Tj
+0 -14 Td ([pipelines/train.py]\(/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/pipelines/tra) Tj
+0 -14 Td (in.py\)) Tj
+0 -14 Td () Tj
+0 -14 Td (Command:) Tj
+0 -14 Td () Tj
+0 -14 Td (```powershell) Tj
+0 -14 Td ($env:PYTHONPATH="src") Tj
+0 -14 Td (d:\\aiml\\venv\\Scripts\\python.exe -m campaign_recommendation train --max-rows 80000) Tj
+0 -14 Td (```) Tj
+0 -14 Td () Tj
+0 -14 Td (What happens during training:) Tj
+0 -14 Td () Tj
+0 -14 Td (1. Load config) Tj
+0 -14 Td (2. Read CSV in chunks) Tj
+ET
+endstream
+endobj
+15 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 27 0 R >> >> /Contents 16 0 R >>
+endobj
+16 0 obj
+<< /Length 2100 >>
+stream
+BT
+/F1 10 Tf
+50 790 Td
+(3. Filter only EMI day 5 rows) Tj
+0 -14 Td (4. Build target labels and weights) Tj
+0 -14 Td (5. Build previous-month aggregates) Tj
+0 -14 Td (6. Build time-based splits) Tj
+0 -14 Td (7. Train Extra Trees classifier) Tj
+0 -14 Td (8. Fit probability calibrator) Tj
+0 -14 Td (9. Evaluate on validation and test) Tj
+0 -14 Td (10. Save model and metrics) Tj
+0 -14 Td () Tj
+0 -14 Td (## 13. How Inference Works) Tj
+0 -14 Td () Tj
+0 -14 Td (There are two main inference modes.) Tj
+0 -14 Td () Tj
+0 -14 Td (### A. Batch Recommendation Generation) Tj
+0 -14 Td () Tj
+0 -14 Td (Command:) Tj
+0 -14 Td () Tj
+0 -14 Td (```powershell) Tj
+0 -14 Td ($env:PYTHONPATH="src") Tj
+0 -14 Td (d:\\aiml\\venv\\Scripts\\python.exe -m campaign_recommendation recommend --model-dir outputs\\model) Tj
+0 -14 Td (```) Tj
+0 -14 Td () Tj
+0 -14 Td (Pipeline:) Tj
+0 -14 Td () Tj
+0 -14 Td (-) Tj
+0 -14 Td ([pipelines/recommend.py]\(/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/pipelines) Tj
+0 -14 Td (/recommend.py\)) Tj
+0 -14 Td (- [recommend.py]\(/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/recommend.py\)) Tj
+0 -14 Td () Tj
+0 -14 Td (What it does:) Tj
+0 -14 Td () Tj
+0 -14 Td (1. Load `model.joblib`) Tj
+0 -14 Td (2. Build base population) Tj
+0 -14 Td (3. Generate candidate communications for all allowed days, channels, and configured hours) Tj
+0 -14 Td (4. Score every candidate with calibrated model probability) Tj
+0 -14 Td (5. Apply per-day quota by risk) Tj
+0 -14 Td (6. Insert blank `-` rows for unavailable days) Tj
+0 -14 Td (7. Export strategy outputs) Tj
+0 -14 Td () Tj
+0 -14 Td (### B. Single Account Explanation) Tj
+0 -14 Td () Tj
+0 -14 Td (Command:) Tj
+0 -14 Td () Tj
+0 -14 Td (```powershell) Tj
+0 -14 Td ($env:PYTHONPATH="src") Tj
+0 -14 Td (d:\\aiml\\venv\\Scripts\\python.exe -m campaign_recommendation explain --model-dir outputs\\model) Tj
+0 -14 Td (--account-id MFLAPDSECUL000005010246) Tj
+0 -14 Td (```) Tj
+0 -14 Td () Tj
+0 -14 Td (What it exports:) Tj
+0 -14 Td () Tj
+0 -14 Td (- day-level best scores) Tj
+0 -14 Td (- final selected recommendations) Tj
+ET
+endstream
+endobj
+17 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 27 0 R >> >> /Contents 18 0 R >>
+endobj
+18 0 obj
+<< /Length 1996 >>
+stream
+BT
+/F1 10 Tf
+50 790 Td
+(- strategy calendar) Tj
+0 -14 Td (- top contributing features for the top recommendation) Tj
+0 -14 Td () Tj
+0 -14 Td (## 14. What Input Is Needed For Inference) Tj
+0 -14 Td () Tj
+0 -14 Td (If you already have a prepared account file for current-period inference, the expected fields) Tj
+0 -14 Td (are:) Tj
+0 -14 Td () Tj
+0 -14 Td (- `apac_card_number`) Tj
+0 -14 Td (- `risk`) Tj
+0 -14 Td (- `collectable_amount` or `outstanding_balance`) Tj
+0 -14 Td (- `campaign_identifier`) Tj
+0 -14 Td (- `emi_date`) Tj
+0 -14 Td () Tj
+0 -14 Td (Optional but useful if available:) Tj
+0 -14 Td () Tj
+0 -14 Td (- previous-month feature columns) Tj
+0 -14 Td (- day availability columns) Tj
+0 -14 Td () Tj
+0 -14 Td (If current-state features like `POS`, `bucket`, or additional account descriptors are later) Tj
+0 -14 Td (added to training data, they can also be added to inference.) Tj
+0 -14 Td () Tj
+0 -14 Td (## 15. Recommendation Output Files) Tj
+0 -14 Td () Tj
+0 -14 Td (### Main Strategy Output) Tj
+0 -14 Td () Tj
+0 -14 Td (- [outputs/recommendations.csv]\(/d:/aiml/campaign-recommenadtion/outputs/recommendations.csv\)) Tj
+0 -14 Td () Tj
+0 -14 Td (This contains the day-by-day strategy calendar with:) Tj
+0 -14 Td () Tj
+0 -14 Td (- account) Tj
+0 -14 Td (- risk) Tj
+0 -14 Td (- day) Tj
+0 -14 Td (- slot rank) Tj
+0 -14 Td (- strategy label) Tj
+0 -14 Td (- availability flag) Tj
+0 -14 Td () Tj
+0 -14 Td (### Bucket Summaries) Tj
+0 -14 Td () Tj
+0 -14 Td (- [outputs/bucket_counts.csv]\(/d:/aiml/campaign-recommenadtion/outputs/bucket_counts.csv\)) Tj
+0 -14 Td (-) Tj
+0 -14 Td ([outputs/bucket_counts_by_day.csv]\(/d:/aiml/campaign-recommenadtion/outputs/bucket_counts_by_da) Tj
+0 -14 Td (y.csv\)) Tj
+0 -14 Td () Tj
+0 -14 Td (These summarize:) Tj
+0 -14 Td () Tj
+0 -14 Td (- count by `risk + strategy label`) Tj
+0 -14 Td (- count by `risk + day + strategy label`) Tj
+0 -14 Td () Tj
+0 -14 Td (### Account-Level Explanation Outputs) Tj
+0 -14 Td () Tj
+0 -14 Td (Examples:) Tj
+0 -14 Td () Tj
+ET
+endstream
+endobj
+19 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 27 0 R >> >> /Contents 20 0 R >>
+endobj
+20 0 obj
+<< /Length 2252 >>
+stream
+BT
+/F1 10 Tf
+50 790 Td
+(-) Tj
+0 -14 Td ([MFLAPDSECUL000005010246_day_scores.csv]\(/d:/aiml/campaign-recommenadtion/outputs/explanations/) Tj
+0 -14 Td (MFLAPDSECUL000005010246_day_scores.csv\)) Tj
+0 -14 Td (-) Tj
+0 -14 Td ([MFLAPDSECUL000005010246_final_recommendation.csv]\(/d:/aiml/campaign-recommenadtion/outputs/exp) Tj
+0 -14 Td (lanations/MFLAPDSECUL000005010246_final_recommendation.csv\)) Tj
+0 -14 Td (-) Tj
+0 -14 Td ([MFLAPDSECUL000005010246_strategy_calendar.csv]\(/d:/aiml/campaign-recommenadtion/outputs/explan) Tj
+0 -14 Td (ations/MFLAPDSECUL000005010246_strategy_calendar.csv\)) Tj
+0 -14 Td () Tj
+0 -14 Td (## 16. How The Final Strategy Is Built) Tj
+0 -14 Td () Tj
+0 -14 Td (This is implemented in:) Tj
+0 -14 Td () Tj
+0 -14 Td (- [recommend.py]\(/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/recommend.py\)) Tj
+0 -14 Td () Tj
+0 -14 Td (Rule flow:) Tj
+0 -14 Td () Tj
+0 -14 Td (1. Generate candidates for each account and each day) Tj
+0 -14 Td (2. Predict success probability) Tj
+0 -14 Td (3. Rank by probability inside the day) Tj
+0 -14 Td (4. Apply day-wise quota by risk) Tj
+0 -14 Td (5. If the previous month had no activity for that day, return `-`) Tj
+0 -14 Td () Tj
+0 -14 Td (So the final calendar is not just top-N overall. It is top-N **per day**.) Tj
+0 -14 Td () Tj
+0 -14 Td (## 17. Explainability) Tj
+0 -14 Td () Tj
+0 -14 Td (Explainability code:) Tj
+0 -14 Td () Tj
+0 -14 Td (- [explain.py]\(/d:/aiml/campaign-recommenadtion/src/campaign_recommendation/explain.py\)) Tj
+0 -14 Td () Tj
+0 -14 Td (What is supported:) Tj
+0 -14 Td () Tj
+0 -14 Td (- top contributing features for a chosen prediction) Tj
+0 -14 Td (- validation slice reporting by:) Tj
+0 -14 Td (  - split) Tj
+0 -14 Td (  - risk) Tj
+0 -14 Td (  - communication type) Tj
+0 -14 Td (  - day offset) Tj
+0 -14 Td (- calibration report) Tj
+0 -14 Td () Tj
+0 -14 Td (How explanation is calculated:) Tj
+0 -14 Td () Tj
+0 -14 Td (1. Reuse model preprocessor) Tj
+0 -14 Td (2. Transform candidate row) Tj
+0 -14 Td (3. Use underlying model feature contributions) Tj
+0 -14 Td (4. Rank highest absolute contributions) Tj
+0 -14 Td () Tj
+0 -14 Td (## 18. Deployment Notes) Tj
+0 -14 Td () Tj
+0 -14 Td (Current implementation is a CLI-first batch system.) Tj
+0 -14 Td () Tj
+ET
+endstream
+endobj
+21 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 27 0 R >> >> /Contents 22 0 R >>
+endobj
+22 0 obj
+<< /Length 1976 >>
+stream
+BT
+/F1 10 Tf
+50 790 Td
+(### Current Deployable Pattern) Tj
+0 -14 Td () Tj
+0 -14 Td (The simplest deployment pattern is:) Tj
+0 -14 Td () Tj
+0 -14 Td (1. Train offline on historical batch data) Tj
+0 -14 Td (2. Store `model.joblib`) Tj
+0 -14 Td (3. Run batch recommendation inference on current EMI population) Tj
+0 -14 Td (4. Export CSV outputs for campaign operations) Tj
+0 -14 Td () Tj
+0 -14 Td (### If Exposing As An API Later) Tj
+0 -14 Td () Tj
+0 -14 Td (Recommended API flow:) Tj
+0 -14 Td () Tj
+0 -14 Td (1. Load `outputs/model/model.joblib` at service startup) Tj
+0 -14 Td (2. Accept account input payload) Tj
+0 -14 Td (3. Build candidate day/channel/hour rows) Tj
+0 -14 Td (4. Score candidates) Tj
+0 -14 Td (5. Apply per-day quota logic) Tj
+0 -14 Td (6. Return JSON calendar and summaries) Tj
+0 -14 Td () Tj
+0 -14 Td (### Example Inference Service Contract) Tj
+0 -14 Td () Tj
+0 -14 Td (Input:) Tj
+0 -14 Td () Tj
+0 -14 Td (- account id) Tj
+0 -14 Td (- emi date) Tj
+0 -14 Td (- risk) Tj
+0 -14 Td (- outstanding balance) Tj
+0 -14 Td (- campaign identifier) Tj
+0 -14 Td (- previous-month aggregates if externally precomputed) Tj
+0 -14 Td () Tj
+0 -14 Td (Output:) Tj
+0 -14 Td () Tj
+0 -14 Td (- daily strategy calendar) Tj
+0 -14 Td (- selected communications per day) Tj
+0 -14 Td (- optional explanation payload) Tj
+0 -14 Td () Tj
+0 -14 Td (## 19. GitHub And Versioning) Tj
+0 -14 Td () Tj
+0 -14 Td (The project was pushed to:) Tj
+0 -14 Td () Tj
+0 -14 Td (- `https://github.com/Sumitkumar1007/campaign-recommendation.git`) Tj
+0 -14 Td () Tj
+0 -14 Td (Repository setup includes:) Tj
+0 -14 Td () Tj
+0 -14 Td (- Git LFS for the large training CSV) Tj
+0 -14 Td (- main branch push completed) Tj
+0 -14 Td () Tj
+0 -14 Td (Large file tracking:) Tj
+0 -14 Td () Tj
+0 -14 Td (-) Tj
+0 -14 Td ([training-data/mfl_last_6_months_communication_data.csv]\(/d:/aiml/campaign-recommenadtion/train) Tj
+0 -14 Td (ing-data/mfl_last_6_months_communication_data.csv\) is tracked through Git LFS) Tj
+ET
+endstream
+endobj
+23 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 27 0 R >> >> /Contents 24 0 R >>
+endobj
+24 0 obj
+<< /Length 2269 >>
+stream
+BT
+/F1 10 Tf
+50 790 Td
+() Tj
+0 -14 Td (## 20. How To Reproduce End To End) Tj
+0 -14 Td () Tj
+0 -14 Td (### Step 1: Activate environment) Tj
+0 -14 Td () Tj
+0 -14 Td (```powershell) Tj
+0 -14 Td ($env:PYTHONPATH="src") Tj
+0 -14 Td (```) Tj
+0 -14 Td () Tj
+0 -14 Td (### Step 2: Train model) Tj
+0 -14 Td () Tj
+0 -14 Td (```powershell) Tj
+0 -14 Td (d:\\aiml\\venv\\Scripts\\python.exe -m campaign_recommendation train --max-rows 80000) Tj
+0 -14 Td (```) Tj
+0 -14 Td () Tj
+0 -14 Td (### Step 3: Generate recommendations) Tj
+0 -14 Td () Tj
+0 -14 Td (```powershell) Tj
+0 -14 Td (d:\\aiml\\venv\\Scripts\\python.exe -m campaign_recommendation recommend --model-dir outputs\\model) Tj
+0 -14 Td (```) Tj
+0 -14 Td () Tj
+0 -14 Td (### Step 4: Explain single account) Tj
+0 -14 Td () Tj
+0 -14 Td (```powershell) Tj
+0 -14 Td (d:\\aiml\\venv\\Scripts\\python.exe -m campaign_recommendation explain --model-dir outputs\\model) Tj
+0 -14 Td (--account-id MFLAPDSECUL000005010246) Tj
+0 -14 Td (```) Tj
+0 -14 Td () Tj
+0 -14 Td (### Step 5: Benchmark models) Tj
+0 -14 Td () Tj
+0 -14 Td (```powershell) Tj
+0 -14 Td (d:\\aiml\\venv\\Scripts\\python.exe -m campaign_recommendation benchmark-models --max-rows 80000) Tj
+0 -14 Td (```) Tj
+0 -14 Td () Tj
+0 -14 Td (## 21. Current Limitations) Tj
+0 -14 Td () Tj
+0 -14 Td (- current inference mostly relies on communication history and account-level risk/balance) Tj
+0 -14 Td (context) Tj
+0 -14 Td (- richer variables like `POS`, `bucket`, and more loan features are not yet present in the) Tj
+0 -14 Td (training file) Tj
+0 -14 Td (- candidate send hours are currently config-driven) Tj
+0 -14 Td (- recommendation generation is batch-first and can be slow on large volumes) Tj
+0 -14 Td () Tj
+0 -14 Td (## 22. Recommended Next Steps) Tj
+0 -14 Td () Tj
+0 -14 Td (1. Add `POS`, `bucket`, and other current-state loan features if available in training data.) Tj
+0 -14 Td (2. Persist precomputed previous-month aggregates for faster inference.) Tj
+0 -14 Td (3. Add API serving layer for real-time or on-demand scoring.) Tj
+0 -14 Td (4. Add pivoted business report output in Excel-style calendar format.) Tj
+0 -14 Td (5. Add experiment registry for model lineage and approval workflow.) Tj
+0 -14 Td () Tj
+0 -14 Td (## 23. Final Summary) Tj
+0 -14 Td () Tj
+ET
+endstream
+endobj
+25 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 27 0 R >> >> /Contents 26 0 R >>
+endobj
+26 0 obj
+<< /Length 581 >>
+stream
+BT
+/F1 10 Tf
+50 790 Td
+(This project now supports:) Tj
+0 -14 Td () Tj
+0 -14 Td (- EMI-specific campaign recommendation) Tj
+0 -14 Td (- day-wise communication quotas by risk) Tj
+0 -14 Td (- blank-day handling based on previous-month availability) Tj
+0 -14 Td (- channel-aware success logic) Tj
+0 -14 Td (- weighted engagement-aware training) Tj
+0 -14 Td (- benchmarked model selection) Tj
+0 -14 Td (- Extra Trees as the current production default) Tj
+0 -14 Td (- batch inference and account-level explanation) Tj
+0 -14 Td (- saved model artifact and reproducible CLI workflow) Tj
+ET
+endstream
+endobj
+27 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>
+endobj
+xref
+0 28
+0000000000 65535 f 
+0000000019 00000 n 
+0000000068 00000 n 
+0000000200 00000 n 
+0000000327 00000 n 
+0000002850 00000 n 
+0000002977 00000 n 
+0000005008 00000 n 
+0000005135 00000 n 
+0000007134 00000 n 
+0000007262 00000 n 
+0000009473 00000 n 
+0000009602 00000 n 
+0000011633 00000 n 
+0000011762 00000 n 
+0000014070 00000 n 
+0000014199 00000 n 
+0000016352 00000 n 
+0000016481 00000 n 
+0000018530 00000 n 
+0000018659 00000 n 
+0000020964 00000 n 
+0000021093 00000 n 
+0000023122 00000 n 
+0000023251 00000 n 
+0000025573 00000 n 
+0000025702 00000 n 
+0000026335 00000 n 
+trailer
+<< /Size 28 /Root 1 0 R >>
+startxref
+26404
+%%EOF
