@@ -334,6 +334,30 @@ artifacts/analysis/may_2026_all_blank_27_apac_analysis.md
 
 More detail: [Three Month CatBoost Training Explainer](docs/three_month_catboost_training_explainer.md)
 
+Generate model-derived explanation files for one loan account:
+
+```bash
+source venv/bin/activate
+python scripts/explain_strategy_prediction.py \
+  --loan-number MFLKTKSECUL000005349103 \
+  --output-dir artifacts/explanations/single_account
+```
+
+Generate explanation files for all accounts in the prediction file:
+
+```bash
+source venv/bin/activate
+python scripts/explain_strategy_prediction.py \
+  --output-dir artifacts/explanations/may_2026_all
+```
+
+The explainer writes:
+
+- `prediction_explanation_account_summary.csv`: one row per APAC/account with 3-month feature and schedule history summary.
+- `prediction_explanation_day_detail.csv`: one row per APAC/account/day with prediction, top probability, blank probability, best non-blank alternative, top candidates, and reason.
+- `<loan_number>_prediction_explanation.md`: single-account stakeholder-readable Markdown when `--loan-number` is used.
+- `prediction_explanation_summary.md`: all-account summary when explaining every account.
+
 ## Operational Checks
 
 Check logs:
