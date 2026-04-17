@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -31,56 +32,56 @@ def parse_args() -> argparse.Namespace:
             "feature/prediction snapshots back to Postgres."
         )
     )
-    parser.add_argument("--host", required=True)
-    parser.add_argument("--port", type=int, default=5432)
-    parser.add_argument("--dbname", required=True)
-    parser.add_argument("--user", required=True)
-    parser.add_argument("--password", required=True)
+    parser.add_argument("--host", default=os.getenv("PGHOST"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("PGPORT", "5432")))
+    parser.add_argument("--dbname", default=os.getenv("PGDATABASE"))
+    parser.add_argument("--user", default=os.getenv("PGUSER"))
+    parser.add_argument("--password", default=os.getenv("PGPASSWORD"))
     parser.add_argument(
         "--source-schema",
-        default="digital_collections",
+        default=os.getenv("SOURCE_SCHEMA", "digital_collections"),
         help="Schema containing the source communications table.",
     )
     parser.add_argument(
         "--source-table",
-        default="communications",
+        default=os.getenv("SOURCE_TABLE", "communications"),
         help="Source communications table.",
     )
     parser.add_argument(
         "--target-schema",
-        default="digital_collections",
+        default=os.getenv("TARGET_SCHEMA", "digital_collections"),
         help="Schema used for storing processed features and predictions.",
     )
     parser.add_argument(
         "--feature-table",
-        default="recommendation_feature_snapshots",
+        default=os.getenv("FEATURE_TABLE", "recommendation_feature_snapshots"),
         help="Target table for processed source-month feature snapshots.",
     )
     parser.add_argument(
         "--prediction-table",
-        default="recommendation_prediction_snapshots",
+        default=os.getenv("PREDICTION_TABLE", "recommendation_prediction_snapshots"),
         help="Target table for model prediction snapshots.",
     )
     parser.add_argument(
         "--source-month",
-        required=True,
+        default=os.getenv("SOURCE_MONTH"),
         help="Source month to fetch and process in YYYY-MM format.",
     )
     parser.add_argument(
         "--predict-month",
-        required=True,
+        default=os.getenv("PREDICT_MONTH"),
         help="Target month to predict in YYYY-MM format.",
     )
     parser.add_argument(
         "--model",
         choices=["catboost", "catboost_3m", "logistic"],
-        default="catboost_3m",
+        default=os.getenv("MODEL_NAME", "catboost_3m"),
         help="Which next-month model pipeline to run.",
     )
     parser.add_argument(
         "--filter-on",
         choices=["emi_date", "created_date"],
-        default="emi_date",
+        default=os.getenv("FILTER_ON", "emi_date"),
         help="Which date field defines the source month extract window.",
     )
     parser.add_argument(
@@ -88,7 +89,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run the local fetch/process/predict flow without storing snapshots back to Postgres.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    missing = [
+        name
+        for name, value in {
+            "PGHOST/--host": args.host,
+            "PGDATABASE/--dbname": args.dbname,
+            "PGUSER/--user": args.user,
+            "PGPASSWORD/--password": args.password,
+            "SOURCE_MONTH/--source-month": args.source_month,
+            "PREDICT_MONTH/--predict-month": args.predict_month,
+        }.items()
+        if not value
+    ]
+    if missing:
+        parser.error("Missing required environment variables or CLI args: " + ", ".join(missing))
+    return args
 
 
 def month_label(yyyy_mm: str) -> str:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -14,30 +15,30 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Fetch one source month of communication data from Postgres."
     )
-    parser.add_argument("--host", required=True)
-    parser.add_argument("--port", type=int, default=5432)
-    parser.add_argument("--dbname", required=True)
-    parser.add_argument("--user", required=True)
-    parser.add_argument("--password", required=True)
+    parser.add_argument("--host", default=os.getenv("PGHOST"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("PGPORT", "5432")))
+    parser.add_argument("--dbname", default=os.getenv("PGDATABASE"))
+    parser.add_argument("--user", default=os.getenv("PGUSER"))
+    parser.add_argument("--password", default=os.getenv("PGPASSWORD"))
     parser.add_argument(
         "--schema",
-        default="digital_collections",
+        default=os.getenv("SOURCE_SCHEMA", "digital_collections"),
         help="Schema containing the communications source table.",
     )
     parser.add_argument(
         "--table",
-        default="communications",
+        default=os.getenv("SOURCE_TABLE", "communications"),
         help="Source communications table.",
     )
     parser.add_argument(
         "--source-month",
-        required=True,
+        default=os.getenv("SOURCE_MONTH"),
         help="Month to fetch in YYYY-MM format, for example 2026-04.",
     )
     parser.add_argument(
         "--filter-on",
         choices=["emi_date", "created_date"],
-        default="emi_date",
+        default=os.getenv("FILTER_ON", "emi_date"),
         help="Which date field defines the source month window.",
     )
     parser.add_argument(
@@ -45,7 +46,21 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional explicit output CSV path.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    missing = [
+        name
+        for name, value in {
+            "PGHOST/--host": args.host,
+            "PGDATABASE/--dbname": args.dbname,
+            "PGUSER/--user": args.user,
+            "PGPASSWORD/--password": args.password,
+            "SOURCE_MONTH/--source-month": args.source_month,
+        }.items()
+        if not value
+    ]
+    if missing:
+        parser.error("Missing required environment variables or CLI args: " + ", ".join(missing))
+    return args
 
 
 def month_bounds(source_month: str) -> tuple[pd.Timestamp, pd.Timestamp]:
