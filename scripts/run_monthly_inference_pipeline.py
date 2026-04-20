@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-import json
+import logging
 import os
 import subprocess
 import sys
@@ -12,9 +12,11 @@ import pandas as pd
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
+from app_logging import log_step, setup_logging
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
 from project_paths import (
     FEATURE_DATA_DIR,
+    LOG_DIR,
     METRICS_DIR,
     MODEL_DIR,
     PREDICTIONS_DIR,
@@ -89,6 +91,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run the local fetch/process/predict flow without storing snapshots back to Postgres.",
     )
+    parser.add_argument(
+        "--log-file",
+        default=str(LOG_DIR / "monthly_inference_pipeline.log"),
+        help="Application log file.",
+    )
     args = parser.parse_args()
     missing = [
         name
@@ -104,16 +111,51 @@ def parse_args() -> argparse.Namespace:
     ]
     if missing:
         parser.error("Missing required environment variables or CLI args: " + ", ".join(missing))
+    try:
+        validate_month_pair(args.source_month, args.predict_month)
+    except ValueError as exc:
+        parser.error(str(exc))
     return args
 
 
+def parse_month(yyyy_mm: str) -> pd.Period:
+    if len(yyyy_mm) != 7 or yyyy_mm[4] != "-":
+        raise ValueError(f"Invalid month '{yyyy_mm}'. Expected YYYY-MM, for example 2026-05.")
+    try:
+        return pd.Period(yyyy_mm, freq="M")
+    except ValueError as exc:
+        raise ValueError(f"Invalid month '{yyyy_mm}'. Expected YYYY-MM, for example 2026-05.") from exc
+
+
+def validate_month_pair(source_month: str, predict_month: str) -> None:
+    source_period = parse_month(source_month)
+    predict_period = parse_month(predict_month)
+    expected_period = source_period + 1
+    if predict_period != expected_period:
+        raise ValueError(
+            "PREDICT_MONTH/--predict-month must be exactly one month after "
+            f"SOURCE_MONTH/--source-month for the current next-month model. "
+            f"Got source={source_month}, predict={predict_month}, expected={expected_period}."
+        )
+
+
 def month_label(yyyy_mm: str) -> str:
-    return pd.Timestamp(f"{yyyy_mm}-01").strftime("%b-%Y").upper()
+    return parse_month(yyyy_mm).to_timestamp().strftime("%b-%Y").upper()
 
 
-def run_python_script(script_name: str, *script_args: str) -> None:
+def run_python_script(
+    script_name: str,
+    *script_args: str,
+    logger: logging.Logger | None = None,
+    env_updates: dict[str, str] | None = None,
+) -> None:
     cmd = [sys.executable, str(SCRIPTS_DIR / script_name), *script_args]
-    subprocess.run(cmd, check=True, cwd=SCRIPTS_DIR.parent)
+    env = os.environ.copy()
+    if env_updates:
+        env.update(env_updates)
+    if logger:
+        logger.info("Running child script | script=%s args=%s", script_name, list(script_args))
+    subprocess.run(cmd, check=True, cwd=SCRIPTS_DIR.parent, env=env)
 
 
 def ensure_feature_table(conn, schema: str, table: str) -> None:
@@ -269,123 +311,157 @@ def store_prediction_snapshots(
 
 def main() -> None:
     args = parse_args()
+    logger = setup_logging(args.log_file, "monthly_inference_pipeline")
+    logger.info(
+        "Monthly inference args: %s",
+        {
+            key: ("***" if key == "password" else value)
+            for key, value in vars(args).items()
+        },
+    )
     source_month_label = month_label(args.source_month)
     prediction_month_label = month_label(args.predict_month)
 
-    run_python_script(
-        "fetch_month_from_postgres.py",
-        "--host",
-        args.host,
-        "--port",
-        str(args.port),
-        "--dbname",
-        args.dbname,
-        "--user",
-        args.user,
-        "--password",
-        args.password,
-        "--schema",
-        args.source_schema,
-        "--table",
-        args.source_table,
-        "--source-month",
-        args.source_month,
-        "--filter-on",
-        args.filter_on,
-    )
-
-    run_python_script(
-        "generate_strategy_dataset.py",
-        "--output-file",
-        str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
-    )
-    run_python_script(
-        "build_strategy_schedule_dataset.py",
-        "--input-file",
-        str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
-        "--output-file",
-        str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv"),
-    )
-    run_python_script(
-        "build_monthly_feature_dataset.py",
-        "--input-file",
-        str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
-        "--output-file",
-        str(FEATURE_DATA_DIR / "strategy_monthly_features.csv"),
-    )
-
-    if args.model in {"catboost", "catboost_3m"}:
-        model_suffix = "catboost_3m" if args.model == "catboost_3m" else "catboost"
-        prediction_file = PREDICTIONS_DIR / f"{args.predict_month.replace('-', '_').lower()}_strategy_predictions_{model_suffix}.csv"
-        model_file = MODEL_DIR / f"next_month_strategy_{model_suffix}.joblib"
-        metrics_file = METRICS_DIR / f"next_month_strategy_{model_suffix}_metrics.json"
-        if not model_file.exists():
-            raise FileNotFoundError(
-                f"CatBoost model bundle not found: {model_file}. "
-                "Train the CatBoost model once before running monthly inference."
+    try:
+        with log_step(logger, "fetch_source_month", source_month=args.source_month, filter_on=args.filter_on):
+            run_python_script(
+                "fetch_month_from_postgres.py",
+                "--schema",
+                args.source_schema,
+                "--table",
+                args.source_table,
+                "--source-month",
+                args.source_month,
+                "--filter-on",
+                args.filter_on,
+                logger=logger,
+                env_updates={
+                    "PGHOST": args.host,
+                    "PGPORT": str(args.port),
+                    "PGDATABASE": args.dbname,
+                    "PGUSER": args.user,
+                    "PGPASSWORD": args.password,
+                },
             )
-        run_python_script(
-            "predict_next_month_strategy_catboost.py",
-            "--model-file",
-            str(model_file),
-            "--prediction-file",
-            str(prediction_file),
-            "--prediction-source-months",
-            source_month_label,
-        )
-    else:
-        prediction_file = PREDICTIONS_DIR / f"{args.predict_month.replace('-', '_').lower()}_strategy_predictions_logistic.csv"
-        model_file = MODEL_DIR / "next_month_strategy_logistic.joblib"
-        metrics_file = METRICS_DIR / "next_month_strategy_logistic_metrics.json"
-        run_python_script(
-            "train_next_month_strategy_model_logistic.py",
-            "--model-file",
-            str(model_file),
-            "--metrics-file",
-            str(metrics_file),
-            "--prediction-file",
-            str(prediction_file),
-            "--train-source-months",
-            "NOV-2025",
-            "DEC-2025",
-            "JAN-2026",
-            "--validation-source-months",
-            "FEB-2026",
-            "--test-source-months",
-            "--prediction-source-months",
-            source_month_label,
-        )
 
-    if not args.skip_db_store:
-        config = PostgresConfig(
-            host=args.host,
-            port=args.port,
-            dbname=args.dbname,
-            user=args.user,
-            password=args.password,
-        )
-        with connect_db(config) as conn:
-            feature_rows = store_feature_snapshots(
-                conn,
-                args.target_schema,
-                args.feature_table,
-                source_month_label,
-                pipeline_version="v1",
+        with log_step(logger, "build_training_dataset"):
+            run_python_script(
+                "generate_strategy_dataset.py",
+                "--output-file",
+                str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+                logger=logger,
             )
-            prediction_rows = store_prediction_snapshots(
-                conn,
-                args.target_schema,
-                args.prediction_table,
-                prediction_file,
-                prediction_month_label,
-                args.model,
+        with log_step(logger, "build_schedule_dataset"):
+            run_python_script(
+                "build_strategy_schedule_dataset.py",
+                "--input-file",
+                str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+                "--output-file",
+                str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv"),
+                logger=logger,
             )
-            conn.commit()
-        print(f"Stored {feature_rows:,} feature snapshots in Postgres")
-        print(f"Stored {prediction_rows:,} prediction snapshots in Postgres")
+        with log_step(logger, "build_monthly_features"):
+            run_python_script(
+                "build_monthly_feature_dataset.py",
+                "--input-file",
+                str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+                "--output-file",
+                str(FEATURE_DATA_DIR / "strategy_monthly_features.csv"),
+                logger=logger,
+            )
 
-    print(f"Prediction file: {prediction_file}")
-    print(f"Metrics file: {metrics_file}")
+        if args.model in {"catboost", "catboost_3m"}:
+            model_suffix = "catboost_3m" if args.model == "catboost_3m" else "catboost"
+            prediction_file = (
+                PREDICTIONS_DIR
+                / f"{args.predict_month.replace('-', '_').lower()}_strategy_predictions_{model_suffix}.csv"
+            )
+            model_file = MODEL_DIR / f"next_month_strategy_{model_suffix}.joblib"
+            metrics_file = METRICS_DIR / f"next_month_strategy_{model_suffix}_metrics.json"
+            if not model_file.exists():
+                raise FileNotFoundError(
+                    f"CatBoost model bundle not found: {model_file}. "
+                    "Train the CatBoost model once before running monthly inference."
+                )
+            with log_step(
+                logger,
+                "run_catboost_inference",
+                model_file=model_file,
+                prediction_file=prediction_file,
+            ):
+                run_python_script(
+                    "predict_next_month_strategy_catboost.py",
+                    "--model-file",
+                    str(model_file),
+                    "--prediction-file",
+                    str(prediction_file),
+                    "--prediction-source-months",
+                    source_month_label,
+                    logger=logger,
+                )
+        else:
+            prediction_file = (
+                PREDICTIONS_DIR
+                / f"{args.predict_month.replace('-', '_').lower()}_strategy_predictions_logistic.csv"
+            )
+            model_file = MODEL_DIR / "next_month_strategy_logistic.joblib"
+            metrics_file = METRICS_DIR / "next_month_strategy_logistic_metrics.json"
+            with log_step(logger, "run_logistic_training_and_inference", prediction_file=prediction_file):
+                run_python_script(
+                    "train_next_month_strategy_model_logistic.py",
+                    "--model-file",
+                    str(model_file),
+                    "--metrics-file",
+                    str(metrics_file),
+                    "--prediction-file",
+                    str(prediction_file),
+                    "--train-source-months",
+                    "NOV-2025",
+                    "DEC-2025",
+                    "JAN-2026",
+                    "--validation-source-months",
+                    "FEB-2026",
+                    "--test-source-months",
+                    "--prediction-source-months",
+                    source_month_label,
+                    logger=logger,
+                )
+
+        if not args.skip_db_store:
+            with log_step(logger, "store_snapshots", target_schema=args.target_schema):
+                config = PostgresConfig(
+                    host=args.host,
+                    port=args.port,
+                    dbname=args.dbname,
+                    user=args.user,
+                    password=args.password,
+                )
+                with connect_db(config) as conn:
+                    feature_rows = store_feature_snapshots(
+                        conn,
+                        args.target_schema,
+                        args.feature_table,
+                        source_month_label,
+                        pipeline_version="v1",
+                    )
+                    prediction_rows = store_prediction_snapshots(
+                        conn,
+                        args.target_schema,
+                        args.prediction_table,
+                        prediction_file,
+                        prediction_month_label,
+                        args.model,
+                    )
+                    conn.commit()
+                print(f"Stored {feature_rows:,} feature snapshots in Postgres")
+                print(f"Stored {prediction_rows:,} prediction snapshots in Postgres")
+
+        print(f"Prediction file: {prediction_file}")
+        print(f"Metrics file: {metrics_file}")
+        logger.info("Monthly inference completed successfully.")
+    except Exception:
+        logger.exception("Monthly inference failed.")
+        raise
 
 
 if __name__ == "__main__":

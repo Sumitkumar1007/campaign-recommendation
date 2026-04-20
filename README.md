@@ -199,6 +199,12 @@ The pipeline does this:
 9. Stores processed feature snapshots in Postgres.
 10. Stores prediction snapshots in Postgres.
 
+`PREDICT_MONTH` must be exactly one month after `SOURCE_MONTH` for the current next-month model. For example, to predict June 2026, run with `SOURCE_MONTH=2026-05` and `PREDICT_MONTH=2026-06`.
+
+For production, provide database credentials through environment variables or a secrets manager. Avoid passing `--password` on the command line because command arguments may be visible in process listings.
+
+Retraining is not required just because the prediction month changes. Use the existing promoted model for monthly inference, and retrain only when new labeled outcomes are available, model quality drops, drift appears, feature/source schema changes, business rules change, or the model is stale. See [docs/retraining_policy.md](docs/retraining_policy.md).
+
 The command can still be overridden through CLI args:
 
 ```bash
