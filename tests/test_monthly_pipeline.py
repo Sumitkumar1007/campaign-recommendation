@@ -18,7 +18,12 @@ if str(SRC_DIR) not in sys.path:
 
 from fetch_month_from_postgres import emi_cycle_dates, month_bounds, resolve_emi_cycle
 from generate_strategy_dataset import bucket_send_hour, candidate_hours as dataset_candidate_hours, process_chunk
-from run_monthly_inference_pipeline import month_label, selected_history_files, validate_month_pair
+from run_monthly_inference_pipeline import (
+    build_campaign_recommendations,
+    month_label,
+    selected_history_files,
+    validate_month_pair,
+)
 from train_next_month_strategy_model_catboost import (
     build_feature_matrix,
     build_rolling_feature_windows,
@@ -92,7 +97,7 @@ def test_rolling_feature_window_sums_latest_account_history() -> None:
     assert march["RISK"] == "LOW"
 
 
-def test_process_chunk_uses_risk_from_communications_and_created_month() -> None:
+def test_process_chunk_uses_risk_from_communications_and_emi_month() -> None:
     chunk = pd.DataFrame(
         {
             "apac_card_number": ["A1"],
@@ -106,11 +111,11 @@ def test_process_chunk_uses_risk_from_communications_and_created_month() -> None
         }
     )
 
-    feature_counts, strategy_counts, risk_counts = process_chunk(chunk, month_source="created_date")
+    feature_counts, strategy_counts, risk_counts = process_chunk(chunk, month_source="emi_date")
 
     assert risk_counts.loc[0, "RISK"] == "HIGH"
-    assert risk_counts.loc[0, "MONTH"] == "APR-2026"
-    assert feature_counts.loc[0, "MONTH"] == "APR-2026"
+    assert risk_counts.loc[0, "MONTH"] == "MAY-2026"
+    assert feature_counts.loc[0, "MONTH"] == "MAY-2026"
     assert strategy_counts.loc[0, "feature"] == "SMS-9AM-ENGLISH"
 
 
@@ -148,6 +153,55 @@ def test_generate_candidates_uses_hourly_business_window() -> None:
 
     assert candidates["send_hour"].tolist() == list(range(9, 19)) * 2
     assert candidates["communication_type"].tolist() == ["SMS"] * 10 + ["WHATSAPP"] * 10
+
+
+def test_build_campaign_recommendations_groups_unique_scheduler_rows(tmp_path: Path) -> None:
+    prediction_file = tmp_path / "predictions.csv"
+    pd.DataFrame(
+        {
+            "SOURCE_RISK": ["HIGH"],
+            "Loan_number": ["L1"],
+            "SOURCE_MONTH_USED": ["APR-2026"],
+            "MONTH": ["MAY-2026"],
+            "D-5": ["SMS-9AM-HINDI|WH-5PM-HINDI|IVR-2PM-HINDI"],
+            "D-4": ["SMS-10AM-HINDI"],
+            "D-3": ["-"],
+            "D-2": ["-"],
+            "D-1": ["-"],
+            "D": ["-"],
+            "D+1": ["SMS-9AM-HINDI"],
+            "D+2": ["-"],
+            "D+3": ["-"],
+            "D+4": ["-"],
+            "D+5": ["-"],
+        }
+    ).to_csv(prediction_file, index=False)
+
+    output = build_campaign_recommendations(
+        prediction_file,
+        source_month_label="APR-2026",
+        prediction_month_label="MAY-2026",
+        model_name="catboost_3m",
+        emi_cycle=5,
+        vertical="LAP",
+        vendor="prutech-cpass",
+        run_date=pd.Timestamp("2026-04-08").to_pydatetime(),
+    )
+
+    sms_pre = output[
+        (output["name"] == "PRE_AIML_NORMAL_SMS_LAP_HINDI_5TH_PRUTECH_CPASS_HR_080426")
+    ].iloc[0]
+    assert sms_pre["mode"] == "SMS"
+    assert sms_pre["date"] == "D-5,D-4,D-3,D-2,D-1"
+    assert sms_pre["time"] == "09:00:00,10:00:00"
+    assert sms_pre["template_name"] == "PREDUE AIML SMS LAP HINDI"
+    assert sms_pre["dataset_name"] == "PREDUE AIML HINDI HR SMS LAP NORMAL FOR EMI 5TH"
+    assert sms_pre["vendor"] == "prutech-cpass"
+    assert sms_pre["active"] == "T"
+
+    assert "POST_AIML_NORMAL_SMS_LAP_HINDI_5TH_PRUTECH_CPASS_HR_080426" in set(output["name"])
+    assert "PRE_AIML_NORMAL_WA_LAP_HINDI_5TH_PRUTECH_CPASS_HR_080426" in set(output["name"])
+    assert "PRE_AIML_NORMAL_IVR_LAP_HINDI_5TH_PRUTECH_CPASS_HR_080426" in set(output["name"])
 
 
 def test_build_feature_matrix_removes_identifiers_and_one_hot_encodes() -> None:
