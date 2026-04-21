@@ -119,13 +119,16 @@ TARGET_SCHEMA=digital_collections
 FEATURE_TABLE=ai_ml_recommendations_feature
 PREDICTION_TABLE=ai_ml_recommendations_data
 AUDIT_TABLE=ai_ml_audit_table
+CAMPAIGN_TABLE=ai_ml_campaign_recommendations
 ```
 
 Monthly inference variables:
 
 ```bash
 MODEL_NAME=catboost_3m
-FEATURE_MONTH_SOURCE=created_date
+FEATURE_MONTH_SOURCE=emi_date
+CAMPAIGN_VERTICAL=LAP
+CAMPAIGN_VENDOR=prutech-cpass
 ```
 
 MLflow variables:
@@ -170,7 +173,7 @@ The script reads these values from env:
 ```text
 PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD
 SOURCE_SCHEMA, SOURCE_TABLE
-TARGET_SCHEMA, FEATURE_TABLE, PREDICTION_TABLE, AUDIT_TABLE
+TARGET_SCHEMA, FEATURE_TABLE, PREDICTION_TABLE, AUDIT_TABLE, CAMPAIGN_TABLE
 MODEL_NAME, FEATURE_MONTH_SOURCE
 ```
 
@@ -189,6 +192,7 @@ The pipeline does this:
 11. Stores processed feature snapshots in Postgres.
 12. Stores prediction snapshots in Postgres table `ai_ml_recommendations_data`.
 13. Stores a pipeline audit record in Postgres table `ai_ml_audit_table`.
+14. Stores campaign scheduler rows in Postgres table `ai_ml_campaign_recommendations`.
 
 When omitted, `SOURCE_MONTH` defaults to the current month and `PREDICT_MONTH` defaults to the following month. If provided, `PREDICT_MONTH` must be exactly one month after `SOURCE_MONTH` for the current next-month model.
 
@@ -312,6 +316,7 @@ Postgres snapshot tables:
 digital_collections.ai_ml_recommendations_feature
 digital_collections.ai_ml_recommendations_data
 digital_collections.ai_ml_audit_table
+digital_collections.ai_ml_campaign_recommendations
 ```
 
 ## Explainability

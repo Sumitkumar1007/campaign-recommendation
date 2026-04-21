@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
 import subprocess
@@ -26,6 +27,28 @@ from project_paths import (
     SCRIPTS_DIR,
     TRAINING_DATA_DIR,
 )
+
+
+DAY_COLUMNS = ["D-5", "D-4", "D-3", "D-2", "D-1", "D", "D+1", "D+2", "D+3", "D+4", "D+5"]
+PREDUE_DAYS = ["D-5", "D-4", "D-3", "D-2", "D-1"]
+POSTDUE_DAYS = ["D+1", "D+2", "D+3", "D+4", "D+5"]
+RISK_CODES = {
+    "LOW": "LR",
+    "MEDIUM": "MR",
+    "HIGH": "HR",
+}
+MODE_BY_STRATEGY_CHANNEL = {
+    "SMS": "SMS",
+    "WH": "WHATSAPP",
+    "WHATSAPP": "WHATSAPP",
+    "IVR": "VOICE",
+    "VOICE": "VOICE",
+}
+NAME_CHANNEL_BY_MODE = {
+    "SMS": "SMS",
+    "WHATSAPP": "WA",
+    "VOICE": "IVR",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,6 +96,26 @@ def parse_args() -> argparse.Namespace:
         help="Target table for pipeline audit records.",
     )
     parser.add_argument(
+        "--campaign-table",
+        default=os.getenv("CAMPAIGN_TABLE", "ai_ml_campaign_recommendations"),
+        help="Target table for campaign scheduler recommendations.",
+    )
+    parser.add_argument(
+        "--campaign-vertical",
+        default=os.getenv("CAMPAIGN_VERTICAL", "LAP"),
+        help="Campaign vertical used in scheduler naming until a source column is available.",
+    )
+    parser.add_argument(
+        "--campaign-vendor",
+        default=os.getenv("CAMPAIGN_VENDOR", "prutech-cpass"),
+        help="Campaign vendor used in scheduler output.",
+    )
+    parser.add_argument(
+        "--config-file",
+        default=os.getenv("CONFIG_FILE", str(SCRIPTS_DIR.parent / "config" / "default_config.json")),
+        help="JSON config file containing emi_cycle.",
+    )
+    parser.add_argument(
         "--source-month",
         default=os.getenv("SOURCE_MONTH") or current_month(),
         help="Source month to process in YYYY-MM format. Defaults to current month.",
@@ -91,7 +134,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--feature-month-source",
         choices=["emi_date", "created_date"],
-        default=os.getenv("FEATURE_MONTH_SOURCE", "created_date"),
+        default=os.getenv("FEATURE_MONTH_SOURCE", "emi_date"),
         help="Date field used to assign monthly feature labels after fetch.",
     )
     parser.add_argument(
@@ -137,6 +180,22 @@ def parse_month(yyyy_mm: str) -> pd.Period:
 
 def current_month(today: pd.Timestamp | None = None) -> str:
     return (today or pd.Timestamp.today()).strftime("%Y-%m")
+
+
+def resolve_emi_cycle(config_file: str, emi_cycle_override: str = "") -> list[int]:
+    if emi_cycle_override:
+        raw_cycle = [value.strip() for value in emi_cycle_override.split(",") if value.strip()]
+    else:
+        with Path(config_file).open("r", encoding="utf-8") as handle:
+            raw_cycle = json.load(handle).get("emi_cycle", [])
+
+    cycles: list[int] = []
+    for value in raw_cycle:
+        day = int(value)
+        if day < 1 or day > 31:
+            raise ValueError(f"Invalid EMI cycle day {value!r}. Expected a day from 1 to 31.")
+        cycles.append(day)
+    return sorted(set(cycles))
 
 
 def next_month(yyyy_mm: str) -> str:
@@ -274,6 +333,37 @@ def ensure_prediction_table(conn, schema: str, table: str) -> None:
                 prediction_payload JSONB NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY (loan_number, prediction_month, model_name)
+            )
+            """
+        ).format(table_ref=qualified_identifier(schema, table))
+    )
+
+
+def ensure_campaign_table(conn, schema: str, table: str) -> None:
+    conn.execute(
+        sql.SQL(
+            """
+            CREATE TABLE IF NOT EXISTS {table_ref} (
+                name TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                date TEXT NOT NULL,
+                time TEXT NOT NULL,
+                template_name TEXT NOT NULL,
+                dataset_name TEXT NOT NULL,
+                vendor TEXT NOT NULL,
+                active TEXT NOT NULL,
+                source_month TEXT NOT NULL,
+                prediction_month TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                emi_cycle INTEGER NOT NULL,
+                risk TEXT NOT NULL,
+                vertical TEXT NOT NULL,
+                campaign_type TEXT NOT NULL,
+                due_type TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                modified_at TIMESTAMPTZ NOT NULL,
+                created_by TEXT NOT NULL,
+                modified_by TEXT NOT NULL
             )
             """
         ).format(table_ref=qualified_identifier(schema, table))
@@ -580,6 +670,252 @@ def store_prediction_snapshots(
     return len(rows)
 
 
+def _format_scheduler_hour(hour_label: str) -> str:
+    parsed = pd.to_datetime(hour_label.upper(), format="%I%p", errors="coerce")
+    if pd.isna(parsed):
+        raise ValueError(f"Invalid strategy hour label: {hour_label!r}")
+    return parsed.strftime("%H:00:00")
+
+
+def _parse_strategy(strategy: str) -> tuple[str, str, str] | None:
+    if not strategy or strategy == "-" or pd.isna(strategy):
+        return None
+    parts = str(strategy).split("-", 2)
+    if len(parts) != 3:
+        return None
+    channel, hour_label, language = parts
+    mode = MODE_BY_STRATEGY_CHANNEL.get(channel.upper())
+    if mode is None:
+        return None
+    return mode, _format_scheduler_hour(hour_label), language.upper()
+
+
+def _due_bucket(day: str) -> tuple[str, str, str]:
+    if day in PREDUE_DAYS:
+        return "PRE", "PREDUE", ",".join(PREDUE_DAYS)
+    if day in POSTDUE_DAYS:
+        return "POST", "POSTDUE", ",".join(POSTDUE_DAYS)
+    raise ValueError(f"Unsupported campaign day: {day}")
+
+
+def _scheduler_name(
+    *,
+    campaign_type: str,
+    mode: str,
+    vertical: str,
+    language: str,
+    emi_cycle: int,
+    vendor: str,
+    risk_code: str,
+    run_token: str,
+) -> str:
+    channel = NAME_CHANNEL_BY_MODE[mode]
+    vendor_token = vendor.upper().replace("-", "_")
+    return (
+        f"{campaign_type}_AIML_NORMAL_{channel}_{vertical.upper()}_{language}_"
+        f"{emi_cycle}TH_{vendor_token}_{risk_code}_{run_token}"
+    )
+
+
+def build_campaign_recommendations(
+    prediction_file: Path,
+    *,
+    source_month_label: str,
+    prediction_month_label: str,
+    model_name: str,
+    emi_cycle: int,
+    vertical: str,
+    vendor: str,
+    run_date: datetime | None = None,
+) -> pd.DataFrame:
+    df = pd.read_csv(prediction_file)
+    df = df[df["MONTH"] == prediction_month_label].copy()
+    run_token = (run_date or datetime.now(timezone.utc)).strftime("%d%m%y")
+    rows: list[dict] = []
+
+    for _, row in df.iterrows():
+        risk = str(row.get("SOURCE_RISK", row.get("RISK", "LOW"))).upper()
+        risk_code = RISK_CODES.get(risk, "LR")
+        for day in [*PREDUE_DAYS, *POSTDUE_DAYS]:
+            for strategy in str(row.get(day, "")).split("|"):
+                parsed = _parse_strategy(strategy.strip())
+                if parsed is None:
+                    continue
+                mode, send_time, language = parsed
+                campaign_type, due_type, campaign_dates = _due_bucket(day)
+                template_name = f"{due_type} AIML {mode} {vertical.upper()} {language}"
+                dataset_name = (
+                    f"{due_type} AIML {language} {risk_code} {mode} {vertical.upper()} "
+                    f"NORMAL FOR EMI {emi_cycle}TH"
+                )
+                name = _scheduler_name(
+                    campaign_type=campaign_type,
+                    mode=mode,
+                    vertical=vertical,
+                    language=language,
+                    emi_cycle=emi_cycle,
+                    vendor=vendor,
+                    risk_code=risk_code,
+                    run_token=run_token,
+                )
+                rows.append(
+                    {
+                        "name": name,
+                        "mode": mode,
+                        "date": campaign_dates,
+                        "time": send_time,
+                        "template_name": template_name,
+                        "dataset_name": dataset_name,
+                        "vendor": vendor,
+                        "active": "T",
+                        "source_month": source_month_label,
+                        "prediction_month": prediction_month_label,
+                        "model_name": model_name,
+                        "emi_cycle": emi_cycle,
+                        "risk": risk_code,
+                        "vertical": vertical.upper(),
+                        "campaign_type": campaign_type,
+                        "due_type": due_type,
+                    }
+                )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "name",
+                "mode",
+                "date",
+                "time",
+                "template_name",
+                "dataset_name",
+                "vendor",
+                "active",
+                "source_month",
+                "prediction_month",
+                "model_name",
+                "emi_cycle",
+                "risk",
+                "vertical",
+                "campaign_type",
+                "due_type",
+            ]
+        )
+
+    result = pd.DataFrame(rows).drop_duplicates()
+    group_cols = [col for col in result.columns if col != "time"]
+    result = (
+        result.groupby(group_cols, as_index=False)["time"]
+        .agg(lambda values: ",".join(sorted(set(values))))
+        .sort_values(["campaign_type", "risk", "mode", "language" if "language" in result.columns else "name"])
+    )
+    return result
+
+
+def store_campaign_recommendations(
+    conn,
+    schema: str,
+    table: str,
+    campaign_rows: pd.DataFrame,
+    *,
+    source_month_label: str,
+    prediction_month_label: str,
+    model_name: str,
+) -> int:
+    ensure_campaign_table(conn, schema, table)
+    conn.execute(
+        sql.SQL(
+            """
+            DELETE FROM {table_ref}
+            WHERE source_month = %s
+              AND prediction_month = %s
+              AND model_name = %s
+            """
+        ).format(table_ref=qualified_identifier(schema, table)),
+        (source_month_label, prediction_month_label, model_name),
+    )
+    if campaign_rows.empty:
+        return 0
+
+    now = datetime.now(timezone.utc)
+    actor = "campaign-model"
+    rows = []
+    for _, row in campaign_rows.iterrows():
+        rows.append(
+            (
+                row["name"],
+                row["mode"],
+                row["date"],
+                row["time"],
+                row["template_name"],
+                row["dataset_name"],
+                row["vendor"],
+                row["active"],
+                row["source_month"],
+                row["prediction_month"],
+                row["model_name"],
+                int(row["emi_cycle"]),
+                row["risk"],
+                row["vertical"],
+                row["campaign_type"],
+                row["due_type"],
+                now,
+                now,
+                actor,
+                actor,
+            )
+        )
+
+    query = sql.SQL(
+        """
+        INSERT INTO {table_ref} (
+            name,
+            mode,
+            date,
+            time,
+            template_name,
+            dataset_name,
+            vendor,
+            active,
+            source_month,
+            prediction_month,
+            model_name,
+            emi_cycle,
+            risk,
+            vertical,
+            campaign_type,
+            due_type,
+            created_at,
+            modified_at,
+            created_by,
+            modified_by
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (name)
+        DO UPDATE SET
+            mode = EXCLUDED.mode,
+            date = EXCLUDED.date,
+            time = EXCLUDED.time,
+            template_name = EXCLUDED.template_name,
+            dataset_name = EXCLUDED.dataset_name,
+            vendor = EXCLUDED.vendor,
+            active = EXCLUDED.active,
+            source_month = EXCLUDED.source_month,
+            prediction_month = EXCLUDED.prediction_month,
+            model_name = EXCLUDED.model_name,
+            emi_cycle = EXCLUDED.emi_cycle,
+            risk = EXCLUDED.risk,
+            vertical = EXCLUDED.vertical,
+            campaign_type = EXCLUDED.campaign_type,
+            due_type = EXCLUDED.due_type,
+            modified_at = EXCLUDED.modified_at,
+            modified_by = EXCLUDED.modified_by
+        """
+    ).format(table_ref=qualified_identifier(schema, table))
+    with conn.cursor() as cur:
+        cur.executemany(query, rows)
+    return len(rows)
+
+
 def main() -> None:
     args = parse_args()
     run_started_at = datetime.now(timezone.utc)
@@ -743,9 +1079,28 @@ def main() -> None:
                         prediction_month_label,
                         args.model,
                     )
+                    campaign_df = build_campaign_recommendations(
+                        prediction_file,
+                        source_month_label=source_month_label,
+                        prediction_month_label=prediction_month_label,
+                        model_name=args.model,
+                        emi_cycle=resolve_emi_cycle(args.config_file, os.getenv("EMI_CYCLE", ""))[0],
+                        vertical=args.campaign_vertical,
+                        vendor=args.campaign_vendor,
+                    )
+                    campaign_rows = store_campaign_recommendations(
+                        conn,
+                        args.target_schema,
+                        args.campaign_table,
+                        campaign_df,
+                        source_month_label=source_month_label,
+                        prediction_month_label=prediction_month_label,
+                        model_name=args.model,
+                    )
                     conn.commit()
                 print(f"Stored {feature_rows:,} feature snapshots in Postgres")
                 print(f"Stored {prediction_rows:,} prediction snapshots in Postgres")
+                print(f"Stored {campaign_rows:,} campaign recommendation snapshots in Postgres")
 
         print(f"Prediction file: {prediction_file}")
         print(f"Metrics file: {metrics_file}")
