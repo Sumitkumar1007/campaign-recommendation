@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 
 import pandas as pd
 from psycopg import sql
 
+from env_utils import load_dotenv
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
-from project_paths import COMMUNICATION_DATA_DIR, ensure_parent_dir
+from project_paths import COMMUNICATION_DATA_DIR, REPO_ROOT, ensure_parent_dir
 
 
 def parse_args() -> argparse.Namespace:
+    load_dotenv(override=True)
     parser = argparse.ArgumentParser(
         description="Fetch one source month of communication data from Postgres."
     )
@@ -31,22 +34,33 @@ def parse_args() -> argparse.Namespace:
         help="Source communications table.",
     )
     parser.add_argument(
-        "--source-month",
-        default=os.getenv("SOURCE_MONTH"),
-        help="Month to fetch in YYYY-MM format, for example 2026-04.",
+        "--config-file",
+        default=os.getenv("CONFIG_FILE", str(REPO_ROOT / "config" / "default_config.json")),
+        help="JSON config file containing emi_cycle.",
     )
     parser.add_argument(
-        "--filter-on",
-        choices=["emi_date", "created_date"],
-        default=os.getenv("FILTER_ON", "emi_date"),
-        help="Which date field defines the source month window.",
+        "--emi-cycle",
+        default=os.getenv("EMI_CYCLE", ""),
+        help="Comma-separated EMI cycle days. Overrides config emi_cycle when provided.",
+    )
+    parser.add_argument(
+        "--fetch-month",
+        default="",
+        help="Month/year used to build EMI cycle dates in YYYY-MM. Defaults to current month.",
     )
     parser.add_argument(
         "--output-file",
         default="",
         help="Optional explicit output CSV path.",
     )
+    parser.add_argument(
+        "--fetch-size",
+        type=int,
+        default=100_000,
+        help="Rows fetched from Postgres per batch while writing the CSV.",
+    )
     args = parser.parse_args()
+    args.emi_cycle = resolve_emi_cycle(args.config_file, args.emi_cycle)
     missing = [
         name
         for name, value in {
@@ -54,13 +68,31 @@ def parse_args() -> argparse.Namespace:
             "PGDATABASE/--dbname": args.dbname,
             "PGUSER/--user": args.user,
             "PGPASSWORD/--password": args.password,
-            "SOURCE_MONTH/--source-month": args.source_month,
+            "emi_cycle in config/default_config.json or EMI_CYCLE/--emi-cycle": args.emi_cycle,
         }.items()
         if not value
     ]
     if missing:
         parser.error("Missing required environment variables or CLI args: " + ", ".join(missing))
+    if args.fetch_size <= 0:
+        parser.error("--fetch-size must be greater than 0")
     return args
+
+
+def resolve_emi_cycle(config_file: str, emi_cycle_override: str) -> list[int]:
+    if emi_cycle_override:
+        raw_cycle = [value.strip() for value in emi_cycle_override.split(",") if value.strip()]
+    else:
+        with Path(config_file).open("r", encoding="utf-8") as handle:
+            raw_cycle = json.load(handle).get("emi_cycle", [])
+
+    cycles: list[int] = []
+    for value in raw_cycle:
+        day = int(value)
+        if day < 1 or day > 31:
+            raise ValueError(f"Invalid EMI cycle day {value!r}. Expected a day from 1 to 31.")
+        cycles.append(day)
+    return sorted(set(cycles))
 
 
 def month_bounds(source_month: str) -> tuple[pd.Timestamp, pd.Timestamp]:
@@ -74,18 +106,25 @@ def default_output_file(source_month: str) -> Path:
     return COMMUNICATION_DATA_DIR / f"mfl_recomm_model_{month_token}_comm_data.csv"
 
 
-def build_query(schema: str, table: str, filter_on: str) -> sql.Composed:
+def current_month(today: pd.Timestamp | None = None) -> str:
+    return (today or pd.Timestamp.today()).strftime("%Y-%m")
+
+
+def emi_cycle_dates(
+    emi_cycle: list[int],
+    today: pd.Timestamp | None = None,
+    fetch_month: str | None = None,
+) -> list[pd.Timestamp]:
+    base = pd.Timestamp(f"{fetch_month}-01") if fetch_month else (today or pd.Timestamp.today()).normalize()
+    month_start = base.replace(day=1)
+    month_end = month_start + pd.offsets.MonthBegin(1)
+    days_in_month = (month_end - pd.Timedelta(days=1)).day
+    return [month_start.replace(day=day) for day in emi_cycle if day <= days_in_month]
+
+
+def build_query(schema: str, table: str) -> sql.Composed:
     table_ref = qualified_identifier(schema, table)
-    if filter_on == "emi_date":
-        where_sql = sql.SQL(
-            "TO_DATE(c.emi_date, 'DD/MM/YYYY') >= %(start_date)s "
-            "AND TO_DATE(c.emi_date, 'DD/MM/YYYY') < %(end_date)s"
-        )
-    else:
-        where_sql = sql.SQL(
-            "c.created_date >= %(start_date)s "
-            "AND c.created_date < %(end_date)s"
-        )
+    where_sql = sql.SQL("TO_DATE(c.emi_date, 'DD/MM/YYYY') = ANY(%(emi_dates)s)")
 
     return sql.SQL(
         """
@@ -95,6 +134,7 @@ def build_query(schema: str, table: str, filter_on: str) -> sql.Composed:
             c.comm_status,
             c.communication_type,
             c.verbiage_language,
+            c.risk,
             TO_DATE(c.emi_date, 'DD/MM/YYYY') AS emi_date,
             EXTRACT(HOUR FROM date_trunc('hour', c.created_date)) AS hr,
             CAST(c.created_date AS DATE) AS date,
@@ -107,13 +147,40 @@ def build_query(schema: str, table: str, filter_on: str) -> sql.Composed:
     ).format(table_ref=table_ref, where_sql=where_sql)
 
 
+def write_query_to_csv(
+    conn,
+    query: sql.Composed,
+    params: dict,
+    output_file: Path,
+    fetch_size: int,
+) -> int:
+    total_rows = 0
+    wrote_header = False
+    with conn.cursor() as cur:
+        cur.execute(query, params)
+        columns = [desc.name for desc in cur.description]
+        while True:
+            rows = cur.fetchmany(fetch_size)
+            if not rows:
+                break
+            df = pd.DataFrame(rows, columns=columns)
+            df.to_csv(output_file, mode="a" if wrote_header else "w", header=not wrote_header, index=False)
+            wrote_header = True
+            total_rows += len(df)
+
+    if not wrote_header:
+        pd.DataFrame(columns=columns).to_csv(output_file, index=False)
+    return total_rows
+
+
 def main() -> None:
     args = parse_args()
-    start_date, end_date = month_bounds(args.source_month)
+    fetch_month = args.fetch_month or current_month()
+    emi_dates = emi_cycle_dates(args.emi_cycle, fetch_month=fetch_month)
     output_file = (
         ensure_parent_dir(args.output_file)
         if args.output_file
-        else ensure_parent_dir(default_output_file(args.source_month))
+        else ensure_parent_dir(default_output_file(fetch_month))
     )
 
     config = PostgresConfig(
@@ -123,20 +190,20 @@ def main() -> None:
         user=args.user,
         password=args.password,
     )
-    query = build_query(args.schema, args.table, args.filter_on)
+    query = build_query(args.schema, args.table)
+    params = {"emi_dates": [date.date() for date in emi_dates]}
 
     with connect_db(config) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                query,
-                {"start_date": start_date.date(), "end_date": end_date.date()},
-            )
-            rows = cur.fetchall()
-            columns = [desc.name for desc in cur.description]
-        df = pd.DataFrame(rows, columns=columns)
+        row_count = write_query_to_csv(
+            conn,
+            query,
+            params,
+            output_file,
+            args.fetch_size,
+        )
 
-    df.to_csv(output_file, index=False)
-    print(f"Fetched {len(df):,} rows for {args.source_month}")
+    formatted_dates = ", ".join(date.strftime("%d/%m/%Y") for date in emi_dates)
+    print(f"Fetched {row_count:,} rows for EMI dates: {formatted_dates}")
     print(f"Saved raw month extract to {output_file}")
 
 

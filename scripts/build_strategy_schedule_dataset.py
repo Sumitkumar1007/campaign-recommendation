@@ -31,37 +31,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def derive_risk(row: pd.Series) -> str:
-    voice_intensity = float(row.get("VOICE_TOTAL_INTENSITY", 0) or 0)
-    sms_intensity = float(row.get("SMS_TOTAL_INTENSITY", 0) or 0)
-    wh_intensity = float(row.get("WH_TOTAL_INTENSITY", 0) or 0)
-
-    voice_failures = sum(
-        float(row[col] or 0)
-        for col in row.index
-        if col.startswith("VOICE_FAILED_")
+def normalize_risk(series: pd.Series) -> pd.Series:
+    return (
+        series.fillna("UNKNOWN")
+        .astype(str)
+        .str.strip()
+        .replace({"": "UNKNOWN"})
+        .str.upper()
     )
-    digital_success = sum(
-        float(row[col] or 0)
-        for col in row.index
-        if (
-            col.startswith("SMS_SUCCESS_")
-            or col.startswith("WH_SUCCESS_")
-        )
-    )
-
-    total_intensity = sms_intensity + wh_intensity + voice_intensity
-    if total_intensity == 0:
-        return "LOW"
-
-    voice_failure_ratio = voice_failures / voice_intensity if voice_intensity else 0.0
-    digital_success_ratio = digital_success / total_intensity
-
-    if voice_failure_ratio >= 0.7 and digital_success_ratio < 0.35:
-        return "HIGH"
-    if digital_success_ratio >= 0.55:
-        return "LOW"
-    return "MEDIUM"
 
 
 def main() -> None:
@@ -77,8 +54,12 @@ def main() -> None:
     missing = required_columns - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns: {sorted(missing)}")
+    if "RISK" not in df.columns:
+        raise ValueError("Missing required RISK column. Risk must come from communications.")
 
     df = df.copy()
+    df["RISK"] = normalize_risk(df["RISK"])
+    df = df[df["RISK"].ne("UNKNOWN")].copy()
     df["PREDICTED_STRATEGY"] = (
         df["PREDICTED_STRATEGY"]
         .fillna("-")
@@ -86,11 +67,7 @@ def main() -> None:
         .replace({"VOICE": "IVR"}, regex=True)
     )
 
-    risk_df = (
-        df.groupby(["APAC_CARD_NUMBER", "MONTH"], as_index=False)
-        .apply(lambda g: pd.Series({"RISK": derive_risk(g.sum(numeric_only=True))}))
-        .reset_index(drop=True)
-    )
+    risk_df = df.groupby(["APAC_CARD_NUMBER", "MONTH"])["RISK"].last().reset_index()
 
     wide = (
         df.pivot_table(

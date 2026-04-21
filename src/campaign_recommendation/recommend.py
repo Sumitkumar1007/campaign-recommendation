@@ -14,12 +14,11 @@ CHANNEL_LABELS = {
     "VOICE": "IVR",
 }
 
-
 @dataclass(frozen=True)
 class RecommendationPolicy:
     allowed_day_offsets: list[int]
     risk_quota: dict[str, int]
-    candidate_hours: dict[str, list[int]]
+    send_hour_window: dict[str, int]
     channel_priority: list[str]
 
 
@@ -29,6 +28,20 @@ def _format_hour(hour: int) -> str:
     if normalized == 0:
         normalized = 12
     return f"{normalized}{suffix}"
+
+
+def candidate_hours(send_hour_window: dict[str, int]) -> list[int]:
+    start_hour = int(send_hour_window["start_hour"])
+    end_hour = int(send_hour_window["end_hour"])
+    step_hours = int(send_hour_window.get("step_hours", 1))
+    if start_hour < 0 or end_hour > 23 or start_hour > end_hour:
+        raise ValueError("send_hour_window must use 0-23 hours with start_hour <= end_hour")
+    if step_hours <= 0:
+        raise ValueError("send_hour_window.step_hours must be greater than 0")
+    hours = list(range(start_hour, end_hour + 1, step_hours))
+    if hours[-1] != end_hour:
+        hours.append(end_hour)
+    return hours
 
 
 def build_strategy_label(communication_type: str, send_hour: int | float | None) -> str:
@@ -46,7 +59,7 @@ def generate_candidates(base_population: pd.DataFrame, policy: RecommendationPol
             availability_column = get_day_availability_column(day_offset)
             same_day_available = int(record.get(availability_column, 0))
             for channel in policy.channel_priority:
-                for hour in policy.candidate_hours.get(channel, []):
+                for hour in candidate_hours(policy.send_hour_window):
                     candidate = dict(record)
                     candidate.update(
                         {

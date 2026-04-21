@@ -9,11 +9,13 @@ from typing import Any
 import mlflow
 
 from app_logging import log_step, setup_logging
+from env_utils import load_dotenv
 from mlflow_catboost_strategy_model import CatBoostStrategyPyfuncModel
 from project_paths import ARTIFACTS_DIR, METRICS_DIR, MODEL_DIR, REPO_ROOT
 
 
 def parse_args() -> argparse.Namespace:
+    load_dotenv(override=True)
     parser = argparse.ArgumentParser(
         description="Log and register the saved 3-month CatBoost strategy model in MLflow."
     )

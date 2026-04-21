@@ -31,52 +31,28 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def derive_risk_from_row(row: pd.Series) -> str:
-    voice_intensity = float(row.get("VOICE_TOTAL_INTENSITY", 0) or 0)
-    sms_intensity = float(row.get("SMS_TOTAL_INTENSITY", 0) or 0)
-    wh_intensity = float(row.get("WH_TOTAL_INTENSITY", 0) or 0)
-    voice_failures = sum(
-        float(row[col] or 0)
-        for col in row.index
-        if col.startswith("VOICE_FAILED_")
-    )
-    digital_success = sum(
-        float(row[col] or 0)
-        for col in row.index
-        if col.startswith("SMS_SUCCESS_") or col.startswith("WH_SUCCESS_")
-    )
-
-    total_intensity = sms_intensity + wh_intensity + voice_intensity
-    if total_intensity == 0:
-        return "LOW"
-
-    voice_failure_ratio = voice_failures / voice_intensity if voice_intensity else 0.0
-    digital_success_ratio = digital_success / total_intensity
-    if voice_failure_ratio >= 0.7 and digital_success_ratio < 0.35:
-        return "HIGH"
-    if digital_success_ratio >= 0.55:
-        return "LOW"
-    return "MEDIUM"
-
-
 def main() -> None:
     args = parse_args()
     input_file = Path(args.input_file)
     output_file = ensure_parent_dir(args.output_file)
 
     monthly_parts: list[pd.DataFrame] = []
+    risk_parts: list[pd.Series] = []
     for chunk in pd.read_csv(input_file, chunksize=args.chunksize):
         numeric_columns = [
             col
             for col in chunk.columns
-            if col not in {"APAC_CARD_NUMBER", "MONTH", "DAY", "PREDICTED_STRATEGY"}
+            if col not in {"APAC_CARD_NUMBER", "MONTH", "DAY", "RISK", "PREDICTED_STRATEGY"}
         ]
+        if "RISK" not in chunk.columns:
+            raise ValueError("Missing required RISK column. Risk must come from communications.")
         grouped = (
             chunk[["APAC_CARD_NUMBER", "MONTH", *numeric_columns]]
             .groupby(["APAC_CARD_NUMBER", "MONTH"], as_index=False)
             .sum(numeric_only=True)
         )
         monthly_parts.append(grouped)
+        risk_parts.append(chunk.groupby(["APAC_CARD_NUMBER", "MONTH"])["RISK"].first())
 
     if not monthly_parts:
         raise ValueError("No data found while building monthly features.")
@@ -86,7 +62,13 @@ def main() -> None:
         .groupby(["APAC_CARD_NUMBER", "MONTH"], as_index=False)
         .sum(numeric_only=True)
     )
-    monthly["RISK"] = monthly.apply(derive_risk_from_row, axis=1)
+    risk_df = (
+        pd.concat(risk_parts, ignore_index=False)
+        .groupby(level=[0, 1])
+        .first()
+        .reset_index()
+    )
+    monthly = monthly.merge(risk_df, on=["APAC_CARD_NUMBER", "MONTH"], how="left")
     monthly.to_csv(output_file, index=False)
     print(f"Saved {len(monthly):,} rows to {output_file}")
 

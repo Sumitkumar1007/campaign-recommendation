@@ -13,8 +13,10 @@ from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from app_logging import log_step, setup_logging
+from env_utils import load_dotenv
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
 from project_paths import (
+    COMMUNICATION_DATA_DIR,
     FEATURE_DATA_DIR,
     LOG_DIR,
     METRICS_DIR,
@@ -27,6 +29,7 @@ from project_paths import (
 
 
 def parse_args() -> argparse.Namespace:
+    load_dotenv(override=True)
     parser = argparse.ArgumentParser(
         description=(
             "Incremental monthly inference pipeline: fetch one source month from "
@@ -56,23 +59,28 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--feature-table",
-        default=os.getenv("FEATURE_TABLE", "recommendation_feature_snapshots"),
+        default=os.getenv("FEATURE_TABLE", "ai_ml_recommendations_feature"),
         help="Target table for processed source-month feature snapshots.",
     )
     parser.add_argument(
         "--prediction-table",
-        default=os.getenv("PREDICTION_TABLE", "recommendation_prediction_snapshots"),
+        default=os.getenv("PREDICTION_TABLE", "ai_ml_recommendations_data"),
         help="Target table for model prediction snapshots.",
     )
     parser.add_argument(
+        "--audit-table",
+        default=os.getenv("AUDIT_TABLE", "ai_ml_audit_table"),
+        help="Target table for pipeline audit records.",
+    )
+    parser.add_argument(
         "--source-month",
-        default=os.getenv("SOURCE_MONTH"),
-        help="Source month to fetch and process in YYYY-MM format.",
+        default=os.getenv("SOURCE_MONTH") or current_month(),
+        help="Source month to process in YYYY-MM format. Defaults to current month.",
     )
     parser.add_argument(
         "--predict-month",
         default=os.getenv("PREDICT_MONTH"),
-        help="Target month to predict in YYYY-MM format.",
+        help="Target month to predict in YYYY-MM format. Defaults to one month after source month.",
     )
     parser.add_argument(
         "--model",
@@ -81,10 +89,10 @@ def parse_args() -> argparse.Namespace:
         help="Which next-month model pipeline to run.",
     )
     parser.add_argument(
-        "--filter-on",
+        "--feature-month-source",
         choices=["emi_date", "created_date"],
-        default=os.getenv("FILTER_ON", "emi_date"),
-        help="Which date field defines the source month extract window.",
+        default=os.getenv("FEATURE_MONTH_SOURCE", "created_date"),
+        help="Date field used to assign monthly feature labels after fetch.",
     )
     parser.add_argument(
         "--skip-db-store",
@@ -104,13 +112,13 @@ def parse_args() -> argparse.Namespace:
             "PGDATABASE/--dbname": args.dbname,
             "PGUSER/--user": args.user,
             "PGPASSWORD/--password": args.password,
-            "SOURCE_MONTH/--source-month": args.source_month,
-            "PREDICT_MONTH/--predict-month": args.predict_month,
         }.items()
         if not value
     ]
     if missing:
         parser.error("Missing required environment variables or CLI args: " + ", ".join(missing))
+    if not args.predict_month:
+        args.predict_month = next_month(args.source_month)
     try:
         validate_month_pair(args.source_month, args.predict_month)
     except ValueError as exc:
@@ -127,6 +135,14 @@ def parse_month(yyyy_mm: str) -> pd.Period:
         raise ValueError(f"Invalid month '{yyyy_mm}'. Expected YYYY-MM, for example 2026-05.") from exc
 
 
+def current_month(today: pd.Timestamp | None = None) -> str:
+    return (today or pd.Timestamp.today()).strftime("%Y-%m")
+
+
+def next_month(yyyy_mm: str) -> str:
+    return str(parse_month(yyyy_mm) + 1)
+
+
 def validate_month_pair(source_month: str, predict_month: str) -> None:
     source_period = parse_month(source_month)
     predict_period = parse_month(predict_month)
@@ -141,6 +157,75 @@ def validate_month_pair(source_month: str, predict_month: str) -> None:
 
 def month_label(yyyy_mm: str) -> str:
     return parse_month(yyyy_mm).to_timestamp().strftime("%b-%Y").upper()
+
+
+def month_file_token(period: pd.Period) -> str:
+    return period.to_timestamp().strftime("%b%Y").upper()
+
+
+def latest_extract_file(source_month: str) -> Path:
+    token = month_file_token(parse_month(source_month))
+    return COMMUNICATION_DATA_DIR / f"latest_{token}_comm_data.csv"
+
+
+def monthly_extract_file(month: str) -> Path:
+    token = month_file_token(parse_month(month))
+    return COMMUNICATION_DATA_DIR / f"mfl_recomm_model_{token}_comm_data.csv"
+
+
+def selected_history_files(source_month: str, latest_file: Path) -> list[Path]:
+    source_period = parse_month(source_month)
+    previous_periods = [source_period - 2, source_period - 1]
+    files: list[Path] = []
+    for period in previous_periods:
+        token = month_file_token(period)
+        files.extend(sorted(COMMUNICATION_DATA_DIR.glob(f"*{token}*.csv")))
+    if latest_file.exists():
+        files.append(latest_file)
+
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for path in files:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        deduped.append(path)
+    return deduped
+
+
+def csv_has_rows(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    with path.open("r", encoding="utf-8") as handle:
+        return sum(1 for _ in handle) > 1
+
+
+def fetch_communication_extract(
+    args: argparse.Namespace,
+    output_file: Path,
+    fetch_month: str,
+    logger: logging.Logger,
+) -> None:
+    run_python_script(
+        "fetch_month_from_postgres.py",
+        "--schema",
+        args.source_schema,
+        "--table",
+        args.source_table,
+        "--fetch-month",
+        fetch_month,
+        "--output-file",
+        str(output_file),
+        logger=logger,
+        env_updates={
+            "PGHOST": args.host,
+            "PGPORT": str(args.port),
+            "PGDATABASE": args.dbname,
+            "PGUSER": args.user,
+            "PGPASSWORD": args.password,
+        },
+    )
 
 
 def run_python_script(
@@ -193,6 +278,192 @@ def ensure_prediction_table(conn, schema: str, table: str) -> None:
             """
         ).format(table_ref=qualified_identifier(schema, table))
     )
+
+
+def ensure_audit_table(conn, schema: str, table: str) -> None:
+    conn.execute(
+        sql.SQL(
+            """
+            CREATE TABLE IF NOT EXISTS {table_ref} (
+                audit_id BIGSERIAL PRIMARY KEY,
+                audit_key TEXT NOT NULL,
+                audit_value TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                source_month TEXT,
+                prediction_month TEXT,
+                status TEXT NOT NULL,
+                prediction_completed_count INTEGER NOT NULL DEFAULT 0,
+                prediction_failed_count INTEGER NOT NULL DEFAULT 0,
+                failed_reason TEXT,
+                duration_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
+                feature_table TEXT,
+                prediction_table TEXT,
+                prediction_file TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                modified_at TIMESTAMPTZ NOT NULL,
+                created_by TEXT NOT NULL,
+                modified_by TEXT NOT NULL
+            )
+            """
+        ).format(table_ref=qualified_identifier(schema, table))
+    )
+    conn.execute(
+        sql.SQL(
+            """
+            DELETE FROM {table_ref} older
+            USING {table_ref} newer
+            WHERE older.audit_id < newer.audit_id
+              AND older.audit_key = newer.audit_key
+              AND older.audit_value = newer.audit_value
+              AND older.model_name = newer.model_name
+              AND older.source_month = newer.source_month
+              AND older.prediction_month = newer.prediction_month
+            """
+        ).format(table_ref=qualified_identifier(schema, table))
+    )
+    conn.execute(
+        sql.SQL(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS {index_name}
+            ON {table_ref} (
+                audit_key,
+                audit_value,
+                model_name,
+                source_month,
+                prediction_month
+            )
+            """
+        ).format(
+            index_name=sql.Identifier(f"{table}_audit_unique_idx"),
+            table_ref=qualified_identifier(schema, table),
+        )
+    )
+
+
+def store_audit_record(
+    conn,
+    schema: str,
+    table: str,
+    *,
+    model_name: str,
+    source_month: str,
+    prediction_month: str,
+    status: str,
+    prediction_completed_count: int,
+    prediction_failed_count: int,
+    failed_reason: str | None,
+    duration_seconds: float,
+    feature_table: str,
+    prediction_table: str,
+    prediction_file: Path | None,
+) -> None:
+    ensure_audit_table(conn, schema, table)
+    now = datetime.now(timezone.utc)
+    actor = "campaign-model"
+    conn.execute(
+        sql.SQL(
+            """
+            INSERT INTO {table_ref} (
+                audit_key,
+                audit_value,
+                model_name,
+                source_month,
+                prediction_month,
+                status,
+                prediction_completed_count,
+                prediction_failed_count,
+                failed_reason,
+                duration_seconds,
+                feature_table,
+                prediction_table,
+                prediction_file,
+                created_at,
+                modified_at,
+                created_by,
+                modified_by
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (
+                audit_key,
+                audit_value,
+                model_name,
+                source_month,
+                prediction_month
+            )
+            DO UPDATE SET
+                status = EXCLUDED.status,
+                prediction_completed_count = EXCLUDED.prediction_completed_count,
+                prediction_failed_count = EXCLUDED.prediction_failed_count,
+                failed_reason = EXCLUDED.failed_reason,
+                duration_seconds = EXCLUDED.duration_seconds,
+                feature_table = EXCLUDED.feature_table,
+                prediction_table = EXCLUDED.prediction_table,
+                prediction_file = EXCLUDED.prediction_file,
+                modified_at = EXCLUDED.modified_at,
+                modified_by = EXCLUDED.modified_by
+            """
+        ).format(table_ref=qualified_identifier(schema, table)),
+        (
+            "model",
+            "recommendation",
+            model_name,
+            source_month,
+            prediction_month,
+            status,
+            int(prediction_completed_count),
+            int(prediction_failed_count),
+            failed_reason,
+            float(duration_seconds),
+            feature_table,
+            prediction_table,
+            str(prediction_file) if prediction_file else None,
+            now,
+            now,
+            actor,
+            actor,
+        ),
+    )
+
+
+def write_pipeline_audit(
+    args: argparse.Namespace,
+    *,
+    status: str,
+    prediction_completed_count: int,
+    prediction_failed_count: int,
+    failed_reason: str | None,
+    duration_seconds: float,
+    prediction_file: Path | None,
+    logger: logging.Logger,
+) -> None:
+    try:
+        config = PostgresConfig(
+            host=args.host,
+            port=args.port,
+            dbname=args.dbname,
+            user=args.user,
+            password=args.password,
+        )
+        with connect_db(config) as conn:
+            store_audit_record(
+                conn,
+                args.target_schema,
+                args.audit_table,
+                model_name=args.model,
+                source_month=month_label(args.source_month),
+                prediction_month=month_label(args.predict_month),
+                status=status,
+                prediction_completed_count=prediction_completed_count,
+                prediction_failed_count=prediction_failed_count,
+                failed_reason=failed_reason,
+                duration_seconds=duration_seconds,
+                feature_table=args.feature_table,
+                prediction_table=args.prediction_table,
+                prediction_file=prediction_file,
+            )
+            conn.commit()
+    except Exception:
+        logger.exception("Failed to write pipeline audit record.")
 
 
 def store_feature_snapshots(
@@ -311,6 +582,9 @@ def store_prediction_snapshots(
 
 def main() -> None:
     args = parse_args()
+    run_started_at = datetime.now(timezone.utc)
+    prediction_file: Path | None = None
+    prediction_rows = 0
     logger = setup_logging(args.log_file, "monthly_inference_pipeline")
     logger.info(
         "Monthly inference args: %s",
@@ -321,34 +595,51 @@ def main() -> None:
     )
     source_month_label = month_label(args.source_month)
     prediction_month_label = month_label(args.predict_month)
+    source_extract_file = latest_extract_file(args.source_month)
 
     try:
-        with log_step(logger, "fetch_source_month", source_month=args.source_month, filter_on=args.filter_on):
-            run_python_script(
-                "fetch_month_from_postgres.py",
-                "--schema",
-                args.source_schema,
-                "--table",
-                args.source_table,
-                "--source-month",
-                args.source_month,
-                "--filter-on",
-                args.filter_on,
-                logger=logger,
-                env_updates={
-                    "PGHOST": args.host,
-                    "PGPORT": str(args.port),
-                    "PGDATABASE": args.dbname,
-                    "PGUSER": args.user,
-                    "PGPASSWORD": args.password,
-                },
-            )
+        source_period = parse_month(args.source_month)
+        history_fetches = [
+            (str(source_period - 2), monthly_extract_file(str(source_period - 2))),
+            (str(source_period - 1), monthly_extract_file(str(source_period - 1))),
+            (args.source_month, source_extract_file),
+        ]
+        with log_step(logger, "fetch_communication_history", source_month=args.source_month):
+            for fetch_month, output_file in history_fetches:
+                fetch_communication_extract(args, output_file, fetch_month, logger)
 
-        with log_step(logger, "build_training_dataset"):
+        if not csv_has_rows(source_extract_file):
+            logger.warning("No latest communication rows found. Skipping prediction run.")
+            print(f"No latest communication rows found in {source_extract_file}; skipped prediction run.")
+            write_pipeline_audit(
+                args,
+                status="SKIPPED",
+                prediction_completed_count=0,
+                prediction_failed_count=0,
+                failed_reason=f"No latest communication rows found in {source_extract_file}",
+                duration_seconds=(datetime.now(timezone.utc) - run_started_at).total_seconds(),
+                prediction_file=None,
+                logger=logger,
+            )
+            return
+
+        history_files = selected_history_files(args.source_month, source_extract_file)
+        if len(history_files) < 3:
+            raise FileNotFoundError(
+                "Need latest communication file plus previous two month files. "
+                f"Found {len(history_files)} files: {[str(path) for path in history_files]}"
+            )
+        logger.info("Selected communication history files: %s", [str(path) for path in history_files])
+
+        with log_step(logger, "prepare_inference_features"):
             run_python_script(
                 "generate_strategy_dataset.py",
                 "--output-file",
                 str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+                "--month-source",
+                args.feature_month_source,
+                "--input-files",
+                *[str(path) for path in history_files],
                 logger=logger,
             )
         with log_step(logger, "build_schedule_dataset"):
@@ -458,9 +749,29 @@ def main() -> None:
 
         print(f"Prediction file: {prediction_file}")
         print(f"Metrics file: {metrics_file}")
+        write_pipeline_audit(
+            args,
+            status="SUCCESS",
+            prediction_completed_count=prediction_rows,
+            prediction_failed_count=0,
+            failed_reason=None,
+            duration_seconds=(datetime.now(timezone.utc) - run_started_at).total_seconds(),
+            prediction_file=prediction_file,
+            logger=logger,
+        )
         logger.info("Monthly inference completed successfully.")
-    except Exception:
+    except Exception as exc:
         logger.exception("Monthly inference failed.")
+        write_pipeline_audit(
+            args,
+            status="FAILED",
+            prediction_completed_count=prediction_rows,
+            prediction_failed_count=1,
+            failed_reason=str(exc),
+            duration_seconds=(datetime.now(timezone.utc) - run_started_at).total_seconds(),
+            prediction_file=prediction_file,
+            logger=logger,
+        )
         raise
 
 

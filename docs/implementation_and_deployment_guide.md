@@ -39,7 +39,7 @@ The pipeline is organized into these stages:
   Short project overview and quick-start commands.
 
 - [config/default_config.json](../config/default_config.json)
-  Main configuration file for paths, target definitions, candidate hours, and training settings.
+  Main configuration file for paths, target definitions, EMI cycle, and training settings.
 
 - [src/campaign_recommendation](../src/campaign_recommendation)
   Main application package.
@@ -323,7 +323,7 @@ What it does:
 
 1. Load `model.joblib`
 2. Build base population
-3. Generate candidate communications for all allowed days, channels, and configured hours
+3. Generate candidate communications for all allowed days, channels, and hourly send times from 9 AM through 6 PM
 4. Score every candidate with calibrated model probability
 5. Apply per-day quota by risk
 6. Insert blank `-` rows for unavailable days
@@ -526,7 +526,7 @@ d:\aiml\venv\Scripts\python.exe -m campaign_recommendation benchmark-models --ma
 
 - current inference mostly relies on communication history and account-level risk/balance context
 - richer variables like `POS`, `bucket`, and more loan features are not yet present in the training file
-- candidate send hours are currently config-driven
+- candidate send hours are generated hourly from 9 AM through 6 PM
 - recommendation generation is batch-first and can be slow on large volumes
 
 ## 22. Recommended Next Steps

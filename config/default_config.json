@@ -3,6 +3,7 @@
   "model_output_dir": "outputs/model",
   "recommendation_output_path": "outputs/recommendations.csv",
   "emi_day_filter": 5,
+  "emi_cycle": ["5"],
   "allowed_day_offsets": [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5],
   "risk_quota": {
     "low": 1,
@@ -10,10 +11,10 @@
     "high": 3
   },
   "channel_priority": ["SMS", "WHATSAPP", "VOICE"],
-  "candidate_hours": {
-    "SMS": [10, 14, 15, 16],
-    "WHATSAPP": [10, 11, 17],
-    "VOICE": [14, 17]
+  "send_hour_window": {
+    "start_hour": 9,
+    "end_hour": 18,
+    "step_hours": 1
   },
   "success_statuses": {
     "SMS": ["DELIVERED", "READ", "CLICKED"],

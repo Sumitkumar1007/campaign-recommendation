@@ -88,7 +88,7 @@ It does this:
 2. Sort by `APAC_CARD_NUMBER` and month.
 3. For each account, take the latest `N` observed months, where `N = 3`.
 4. Sum the numeric features across that rolling window.
-5. Recompute `RISK` from the rolled totals.
+5. Use the provided `RISK`.
 6. Keep the end month as the `SOURCE_MONTH`.
 
 So for `APR-2026`, the feature row used for prediction is:
