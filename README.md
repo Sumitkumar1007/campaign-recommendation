@@ -98,14 +98,7 @@ cp .env.example .env
 ```
 
 Edit `.env` on the server and fill real values. Do not commit `.env`.
-
-Load the environment before running commands:
-
-```bash
-set -a
-source .env
-set +a
-```
+The scripts load `.env` automatically, so DB credentials do not need to be passed as command arguments.
 
 Required database variables:
 
@@ -123,17 +116,16 @@ Source and target table variables:
 SOURCE_SCHEMA=digital_collections
 SOURCE_TABLE=communications
 TARGET_SCHEMA=digital_collections
-FEATURE_TABLE=recommendation_feature_snapshots
-PREDICTION_TABLE=recommendation_prediction_snapshots
+FEATURE_TABLE=ai_ml_recommendations_feature
+PREDICTION_TABLE=ai_ml_recommendations_data
+AUDIT_TABLE=ai_ml_audit_table
 ```
 
 Monthly inference variables:
 
 ```bash
-SOURCE_MONTH=2026-04
-PREDICT_MONTH=2026-05
 MODEL_NAME=catboost_3m
-FILTER_ON=emi_date
+FEATURE_MONTH_SOURCE=created_date
 ```
 
 MLflow variables:
@@ -145,7 +137,7 @@ MLFLOW_REGISTERED_MODEL_NAME=campaign_next_month_catboost_3m
 MLFLOW_RUN_NAME=catboost-3m-may-2026-v1
 ```
 
-All DB credentials and deployment-specific values should come from `.env`, shell environment variables, a secrets manager, or the deployment platform. They should not be hardcoded in scripts or committed to Git.
+All DB credentials and deployment-specific values should come from `.env`, a secrets manager, or the deployment platform. They should not be hardcoded in scripts or committed to Git.
 
 ## Python Setup
 
@@ -169,10 +161,6 @@ Use this when predicting a new target month from the latest source month.
 Example: predict May 2026 using April 2026 communication data.
 
 ```bash
-set -a
-source .env
-set +a
-
 source venv/bin/activate
 python scripts/run_monthly_inference_pipeline.py
 ```
@@ -182,24 +170,27 @@ The script reads these values from env:
 ```text
 PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD
 SOURCE_SCHEMA, SOURCE_TABLE
-TARGET_SCHEMA, FEATURE_TABLE, PREDICTION_TABLE
-SOURCE_MONTH, PREDICT_MONTH, MODEL_NAME, FILTER_ON
+TARGET_SCHEMA, FEATURE_TABLE, PREDICTION_TABLE, AUDIT_TABLE
+MODEL_NAME, FEATURE_MONTH_SOURCE
 ```
 
 The pipeline does this:
 
-1. Fetches only `SOURCE_MONTH` communication data from Postgres.
-2. Saves raw extract under `data/communication/MFL_COMMUNICATION_DATA/`.
-3. Rebuilds the day-level training-style dataset.
-4. Rebuilds schedule targets.
-5. Rebuilds monthly features.
-6. Loads the saved model bundle.
-7. Predicts schedules for `PREDICT_MONTH`.
-8. Saves prediction CSV under `artifacts/predictions/`.
-9. Stores processed feature snapshots in Postgres.
-10. Stores prediction snapshots in Postgres.
+1. Fetches latest communication rows from Postgres for the configured `emi_cycle` dates in the current month/year.
+2. Saves raw latest extract under `data/communication/MFL_COMMUNICATION_DATA/`.
+3. Selects previous two month extract files plus the latest extract.
+4. Rebuilds the day-level training-style dataset.
+5. Rebuilds schedule targets.
+6. Rebuilds monthly features with source `risk` from communications.
+7. Rolls the latest three months of features per APAC/account.
+8. Loads the saved model bundle.
+9. Predicts schedules for `PREDICT_MONTH`.
+10. Saves prediction CSV under `artifacts/predictions/`.
+11. Stores processed feature snapshots in Postgres.
+12. Stores prediction snapshots in Postgres table `ai_ml_recommendations_data`.
+13. Stores a pipeline audit record in Postgres table `ai_ml_audit_table`.
 
-`PREDICT_MONTH` must be exactly one month after `SOURCE_MONTH` for the current next-month model. For example, to predict June 2026, run with `SOURCE_MONTH=2026-05` and `PREDICT_MONTH=2026-06`.
+When omitted, `SOURCE_MONTH` defaults to the current month and `PREDICT_MONTH` defaults to the following month. If provided, `PREDICT_MONTH` must be exactly one month after `SOURCE_MONTH` for the current next-month model.
 
 For production, provide database credentials through environment variables or a secrets manager. Avoid passing `--password` on the command line because command arguments may be visible in process listings.
 
@@ -318,8 +309,9 @@ artifacts/logs/
 Postgres snapshot tables:
 
 ```text
-digital_collections.recommendation_feature_snapshots
-digital_collections.recommendation_prediction_snapshots
+digital_collections.ai_ml_recommendations_feature
+digital_collections.ai_ml_recommendations_data
+digital_collections.ai_ml_audit_table
 ```
 
 ## Explainability
@@ -425,6 +417,7 @@ Exact all-blank rows: 27
 - MLflow stores large model artifacts and versions.
 - `VOICE` is mapped to `IVR` in strategy output.
 - `VOICE_BOT` and `WHATSAPP_BUTTON` are excluded from strategy dataset creation.
+- Risk is read from `communications.risk`; it is not derived from channel counts.
 - The model predicts communication strategy, not direct payment conversion.
 - Validation/testing are month-based, not random-row based.
 

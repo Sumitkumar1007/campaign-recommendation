@@ -64,7 +64,7 @@ def run_recommendations(config: AppConfig, model_dir: str | None = None, input_c
     policy = RecommendationPolicy(
         allowed_day_offsets=config.raw["allowed_day_offsets"],
         risk_quota=config.raw["risk_quota"],
-        candidate_hours=config.raw["candidate_hours"],
+        send_hour_window=config.raw["send_hour_window"],
         channel_priority=config.raw["channel_priority"],
     )
 
@@ -120,7 +120,7 @@ def run_account_explanation(
     policy = RecommendationPolicy(
         allowed_day_offsets=config.raw["allowed_day_offsets"],
         risk_quota=config.raw["risk_quota"],
-        candidate_hours=config.raw["candidate_hours"],
+        send_hour_window=config.raw["send_hour_window"],
         channel_priority=config.raw["channel_priority"],
     )
 

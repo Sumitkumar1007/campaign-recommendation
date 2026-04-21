@@ -18,6 +18,14 @@ dependencies = [
   "psycopg[binary]>=3.2,<4"
 ]
 
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<9"
+]
+
+[project.scripts]
+campaign-recommendation = "campaign_recommendation.__main__:main"
+
 [tool.setuptools]
 package-dir = {"" = "src"}
 

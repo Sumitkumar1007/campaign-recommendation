@@ -143,34 +143,6 @@ def month_to_period(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, format="%b-%Y", errors="coerce").dt.to_period("M")
 
 
-def derive_risk_from_row(row: pd.Series) -> str:
-    voice_intensity = float(row.get("VOICE_TOTAL_INTENSITY", 0) or 0)
-    sms_intensity = float(row.get("SMS_TOTAL_INTENSITY", 0) or 0)
-    wh_intensity = float(row.get("WH_TOTAL_INTENSITY", 0) or 0)
-    voice_failures = sum(
-        float(row[col] or 0)
-        for col in row.index
-        if col.startswith("VOICE_FAILED_")
-    )
-    digital_success = sum(
-        float(row[col] or 0)
-        for col in row.index
-        if col.startswith("SMS_SUCCESS_") or col.startswith("WH_SUCCESS_")
-    )
-
-    total_intensity = sms_intensity + wh_intensity + voice_intensity
-    if total_intensity == 0:
-        return "LOW"
-
-    voice_failure_ratio = voice_failures / voice_intensity if voice_intensity else 0.0
-    digital_success_ratio = digital_success / total_intensity
-    if voice_failure_ratio >= 0.7 and digital_success_ratio < 0.35:
-        return "HIGH"
-    if digital_success_ratio >= 0.55:
-        return "LOW"
-    return "MEDIUM"
-
-
 def build_rolling_feature_windows(
     features: pd.DataFrame,
     history_window_months: int,
@@ -204,7 +176,7 @@ def build_rolling_feature_windows(
     rolled["MONTH"] = (
         rolled["MONTH_PERIOD"].dt.to_timestamp().dt.strftime("%b-%Y").str.upper()
     )
-    rolled["RISK"] = rolled[numeric_columns].apply(derive_risk_from_row, axis=1)
+    rolled["RISK"] = features["RISK"].fillna("UNKNOWN").astype(str).str.upper().values
     return rolled[["APAC_CARD_NUMBER", "MONTH", *numeric_columns, "RISK"]]
 
 
@@ -279,13 +251,25 @@ def fit_day_model(
     learning_rate: float,
     depth: int,
     checkpoint_dir: Path,
+    checkpoint_metadata: dict,
 ) -> tuple[str, CatBoostClassifier, LabelEncoder]:
     logger = logging.getLogger("catboost_training")
     checkpoint_file = checkpoint_dir / f"{day.replace('+', 'plus').replace('-', 'minus')}.joblib"
     if checkpoint_file.exists():
-        logger.info("LOAD fit_day_model checkpoint | day=%s path=%s", day, checkpoint_file)
         checkpoint = joblib.load(checkpoint_file)
-        return day, checkpoint["model"], checkpoint["label_encoder"]
+        expected_metadata = {
+            **checkpoint_metadata,
+            "day": day,
+            "iterations": iterations,
+            "learning_rate": learning_rate,
+            "depth": depth,
+            "feature_columns": X_train.columns.tolist(),
+            "target_value_counts": y_train[day].astype(str).value_counts().sort_index().to_dict(),
+        }
+        if checkpoint.get("metadata") == expected_metadata:
+            logger.info("LOAD fit_day_model checkpoint | day=%s path=%s", day, checkpoint_file)
+            return day, checkpoint["model"], checkpoint["label_encoder"]
+        logger.info("SKIP stale fit_day_model checkpoint | day=%s path=%s", day, checkpoint_file)
 
     start = time.perf_counter()
     logger.info(
@@ -318,9 +302,15 @@ def fit_day_model(
             "day": day,
             "model": model,
             "label_encoder": encoder,
-            "iterations": iterations,
-            "learning_rate": learning_rate,
-            "depth": depth,
+            "metadata": {
+                **checkpoint_metadata,
+                "day": day,
+                "iterations": iterations,
+                "learning_rate": learning_rate,
+                "depth": depth,
+                "feature_columns": X_train.columns.tolist(),
+                "target_value_counts": y_train[day].astype(str).value_counts().sort_index().to_dict(),
+            },
             "classes": encoder.classes_.tolist(),
         },
         checkpoint_file,
@@ -433,6 +423,12 @@ def main() -> None:
 
         with log_step(logger, "fit_all_day_models", n_jobs=args.n_jobs, days=",".join(DAY_COLUMNS)):
             completed_checkpoints = sorted(path.name for path in checkpoint_dir.glob("*.joblib"))
+            checkpoint_metadata = {
+                "target_offset_months": args.target_offset_months,
+                "history_window_months": args.history_window_months,
+                "train_source_months": args.train_source_months,
+                "train_rows": int(len(train_df)),
+            }
             logger.info(
                 "Checkpoint directory | path=%s existing_checkpoints=%s",
                 checkpoint_dir,
@@ -447,6 +443,7 @@ def main() -> None:
                     args.learning_rate,
                     args.depth,
                     checkpoint_dir,
+                    checkpoint_metadata,
                 )
                 for day in DAY_COLUMNS
             )

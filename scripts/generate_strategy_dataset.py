@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import pandas as pd
 
-from project_paths import COMMUNICATION_DATA_DIR, TRAINING_DATA_DIR, ensure_parent_dir
+from project_paths import COMMUNICATION_DATA_DIR, REPO_ROOT, TRAINING_DATA_DIR, ensure_parent_dir
 
 
 TIME_BUCKETS = {
-    8: "8AM",
     9: "9AM",
     10: "10AM",
     11: "11AM",
@@ -39,6 +39,7 @@ USECOLS = [
     "comm_status",
     "communication_type",
     "verbiage_language",
+    "risk",
     "emi_date",
     "date",
     "created_date",
@@ -83,6 +84,23 @@ def parse_args() -> argparse.Namespace:
             "MAR2026 FEB2026."
         ),
     )
+    parser.add_argument(
+        "--input-files",
+        nargs="*",
+        default=[],
+        help="Optional explicit CSV files. When set, --input-dir and --exclude-months are ignored.",
+    )
+    parser.add_argument(
+        "--month-source",
+        choices=["emi_date", "created_date"],
+        default="emi_date",
+        help="Date field used to assign the MONTH feature label.",
+    )
+    parser.add_argument(
+        "--config-file",
+        default=str(REPO_ROOT / "config" / "default_config.json"),
+        help="JSON config file containing send_hour_window.",
+    )
     return parser.parse_args()
 
 
@@ -117,26 +135,83 @@ def normalize_comm_type(series: pd.Series) -> pd.Series:
     )
 
 
+def normalize_risk(series: pd.Series) -> pd.Series:
+    return (
+        series.fillna("UNKNOWN")
+        .astype(str)
+        .str.strip()
+        .replace({"": "UNKNOWN"})
+        .str.upper()
+    )
+
+
+def load_send_hour_window(config_file: str | Path) -> dict[str, int]:
+    with Path(config_file).open("r", encoding="utf-8") as handle:
+        raw_window = json.load(handle).get("send_hour_window", {})
+    return {
+        "start_hour": int(raw_window.get("start_hour", 9)),
+        "end_hour": int(raw_window.get("end_hour", 18)),
+        "step_hours": int(raw_window.get("step_hours", 1)),
+    }
+
+
+def candidate_hours(send_hour_window: dict[str, int]) -> list[int]:
+    start_hour = int(send_hour_window["start_hour"])
+    end_hour = int(send_hour_window["end_hour"])
+    step_hours = int(send_hour_window.get("step_hours", 1))
+    if start_hour < 0 or end_hour > 23 or start_hour > end_hour:
+        raise ValueError("send_hour_window must use 0-23 hours with start_hour <= end_hour")
+    if step_hours <= 0:
+        raise ValueError("send_hour_window.step_hours must be greater than 0")
+    hours = list(range(start_hour, end_hour + 1, step_hours))
+    if hours[-1] != end_hour:
+        hours.append(end_hour)
+    return hours
+
+
+def bucket_send_hour(hour: object, send_hour_window: dict[str, int] | None = None) -> int | pd.NA:
+    if pd.isna(hour):
+        return pd.NA
+    window = send_hour_window or {"start_hour": 9, "end_hour": 18, "step_hours": 1}
+    start_hour = int(window["start_hour"])
+    end_hour = int(window["end_hour"])
+    hour_int = int(hour)
+    if hour_int < start_hour:
+        return start_hour
+    if hour_int >= end_hour:
+        return end_hour
+    allowed_hours = candidate_hours(window)
+    return max(allowed_hour for allowed_hour in allowed_hours if allowed_hour <= hour_int)
+
+
 def process_chunk(
     chunk: pd.DataFrame,
     sample_cards: set[str] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    month_source: str = "emi_date",
+    send_hour_window: dict[str, int] | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df = chunk.copy()
+    if "risk" not in df.columns:
+        raise ValueError("Missing required risk column in communication data.")
     df["APAC_CARD_NUMBER"] = df["apac_card_number"].astype(str).str.strip()
     if sample_cards is not None:
         df = df[df["APAC_CARD_NUMBER"].isin(sample_cards)].copy()
         if df.empty:
-            return pd.DataFrame(), pd.DataFrame()
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     df["COMM_TYPE"] = normalize_comm_type(df["communication_type"])
     df["STATUS"] = normalize_status(df["comm_status"])
     df["LANGUAGE"] = normalize_language(df["verbiage_language"])
+    df["RISK"] = normalize_risk(df["risk"])
     df["emi_date"] = pd.to_datetime(df["emi_date"], errors="coerce").dt.normalize()
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
     created_ts = pd.to_datetime(df["created_date"], errors="coerce")
-    df["hr"] = created_ts.dt.hour.astype("Int64")
+    df["hr"] = created_ts.dt.hour.astype("Int64").map(
+        lambda hour: bucket_send_hour(hour, send_hour_window)
+    ).astype("Int64")
 
     df = df[
         df["APAC_CARD_NUMBER"].ne("")
+        & df["RISK"].ne("UNKNOWN")
         & df["COMM_TYPE"].notna()
         & df["emi_date"].notna()
         & df["date"].notna()
@@ -146,9 +221,10 @@ def process_chunk(
     df["offset"] = (df["date"] - df["emi_date"]).dt.days
     df = df[df["offset"].between(-5, 5) & df["offset"].ne(0)].copy()
     if df.empty:
-        return pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    df["MONTH"] = df["emi_date"].dt.strftime("%b-%Y").str.upper()
+    month_dates = df["emi_date"] if month_source == "emi_date" else created_ts.dt.normalize()
+    df["MONTH"] = month_dates.dt.strftime("%b-%Y").str.upper()
     df["DAY"] = df["offset"].map(day_label)
     df["IS_SUCCESS"] = df.apply(
         lambda row: row["STATUS"] in SUCCESS_STATUS_MAP[row["COMM_TYPE"]],
@@ -227,7 +303,12 @@ def process_chunk(
         )
 
     feature_counts = pd.concat(feature_frames, ignore_index=True)
-    return feature_counts, strategy_counts
+    risk_counts = (
+        df.groupby(["APAC_CARD_NUMBER", "MONTH", "DAY"], sort=False)["RISK"]
+        .last()
+        .reset_index()
+    )
+    return feature_counts, strategy_counts, risk_counts
 
 
 def collect_sample_cards(
@@ -262,19 +343,26 @@ def build_dataset(
     chunksize: int,
     sample_size: int = 0,
     exclude_months: list[str] | None = None,
+    input_files: list[Path] | None = None,
+    month_source: str = "emi_date",
+    send_hour_window: dict[str, int] | None = None,
 ) -> None:
     output_file = ensure_parent_dir(output_file)
     exclude_tokens = {token.upper() for token in (exclude_months or [])}
-    csv_files = sorted(
-        csv_file
-        for csv_file in input_dir.glob("*.csv")
-        if not any(token in csv_file.name.upper() for token in exclude_tokens)
-    )
+    if input_files:
+        csv_files = [Path(csv_file) for csv_file in input_files]
+    else:
+        csv_files = sorted(
+            csv_file
+            for csv_file in input_dir.glob("*.csv")
+            if not any(token in csv_file.name.upper() for token in exclude_tokens)
+        )
     if not csv_files:
         raise FileNotFoundError(f"No CSV files found in {input_dir}")
 
     feature_parts: list[pd.DataFrame] = []
     strategy_parts: list[pd.DataFrame] = []
+    risk_parts: list[pd.DataFrame] = []
     sample_cards = (
         collect_sample_cards(csv_files, chunksize, sample_size)
         if sample_size > 0
@@ -284,14 +372,23 @@ def build_dataset(
     for csv_file in csv_files:
         print(f"Processing {csv_file.name} ...")
         for chunk in pd.read_csv(csv_file, usecols=USECOLS, chunksize=chunksize):
-            feature_counts, strategy_counts = process_chunk(chunk, sample_cards=sample_cards)
+            feature_counts, strategy_counts, risk_counts = process_chunk(
+                chunk,
+                sample_cards=sample_cards,
+                month_source=month_source,
+                send_hour_window=send_hour_window,
+            )
             if not feature_counts.empty:
                 feature_parts.append(feature_counts)
             if not strategy_counts.empty:
                 strategy_parts.append(strategy_counts)
+            if not risk_counts.empty:
+                risk_parts.append(risk_counts)
 
     if not feature_parts:
         raise ValueError("No rows matched the D-5 to D+5 window.")
+    if not risk_parts:
+        raise ValueError("No risk rows found in communication data.")
 
     features = (
         pd.concat(feature_parts, ignore_index=True)
@@ -341,6 +438,12 @@ def build_dataset(
             }
         )
     )
+    risk_df = (
+        pd.concat(risk_parts, ignore_index=True)
+        .groupby(["APAC_CARD_NUMBER", "MONTH", "DAY"], as_index=False)["RISK"]
+        .last()
+    )
+    wide = wide.merge(risk_df, on=["APAC_CARD_NUMBER", "MONTH", "DAY"], how="left")
 
     if not strategies.empty:
         strategies = strategies.sort_values(
@@ -369,10 +472,10 @@ def build_dataset(
     feature_columns = sorted(
         column
         for column in wide.columns
-        if column not in {"APAC_CARD_NUMBER", "MONTH", "DAY", "PREDICTED_STRATEGY"}
+        if column not in {"APAC_CARD_NUMBER", "MONTH", "DAY", "RISK", "PREDICTED_STRATEGY"}
     )
     wide = wide[
-        ["APAC_CARD_NUMBER", "MONTH", "DAY", *feature_columns, "PREDICTED_STRATEGY"]
+        ["APAC_CARD_NUMBER", "MONTH", "DAY", "RISK", *feature_columns, "PREDICTED_STRATEGY"]
     ]
     wide.to_csv(output_file, index=False)
     print(f"Saved {len(wide):,} rows to {output_file}")
@@ -380,12 +483,16 @@ def build_dataset(
 
 def main() -> None:
     args = parse_args()
+    send_hour_window = load_send_hour_window(args.config_file)
     build_dataset(
         input_dir=Path(args.input_dir),
         output_file=Path(args.output_file),
         chunksize=args.chunksize,
         sample_size=args.sample_cards,
         exclude_months=args.exclude_months,
+        input_files=[Path(path) for path in args.input_files],
+        month_source=args.month_source,
+        send_hour_window=send_hour_window,
     )
 
 

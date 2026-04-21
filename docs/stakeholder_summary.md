@@ -20,25 +20,32 @@ If a customer does not have prior signal for a particular day, that day is retur
 
 The model uses:
 
-- EMI date
-- risk
-- collectable amount / outstanding balance proxy
-- campaign type
-- previous-month customer communication history
-- previous-month day-level activity availability
+- latest 3 months of account-level communication history
+- channel intensity by SMS, WhatsApp, and IVR/VOICE
+- channel/time/language success and failure signals
+- source risk bucket (provided)
+- source month, used to predict exactly the next month
 
 ## What “Success” Means
 
-The current target is **communication success**, not direct payment conversion.
+The current target is a **next-month communication schedule**, not direct payment conversion.
 
-It is channel-aware:
+Targets are built from prior successful communication patterns:
 
-- `SMS` and `WhatsApp` treat `READ` and `CLICKED` as stronger signals than `DELIVERED`
-- `VOICE` uses connection-based positive outcomes
+- `SMS` and `WhatsApp` use delivered/read/clicked signals
+- `VOICE` is exposed as `IVR` in recommendation output and uses connection-based signals
 
 ## Current Best Model
 
-The project benchmarked multiple approaches and selected `Extra Trees` as the current production default because it performed better than the legacy baseline.
+The current production model is the 3-month CatBoost next-month strategy model:
+
+```text
+campaign_next_month_catboost_3m
+```
+
+It produces one schedule row per loan account for `D-5` through `D+5`, with `D` forced to `-`.
+
+Current validation metrics should be read as schedule guidance quality, not payment-lift measurement. The latest saved CatBoost 3-month metrics use November 2025 through January 2026 as training source months and February 2026 as validation source month; no separate held-out test month is saved in the current metrics artifact.
 
 ## Main Deliverables
 
