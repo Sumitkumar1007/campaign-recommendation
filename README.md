@@ -131,6 +131,14 @@ CAMPAIGN_VERTICAL=LAP
 CAMPAIGN_VENDOR=prutech-cpass
 ```
 
+`FEATURE_MONTH_SOURCE=emi_date` is the recommended production setting. It assigns communication activity to the EMI month, so pre-due communication for a 5th EMI does not get counted under the previous calendar month just because it was sent before month-end.
+
+Campaign scheduler defaults:
+
+- `CAMPAIGN_VERTICAL=LAP` is a temporary fixed value until the real vertical source column is available.
+- `CAMPAIGN_VENDOR=prutech-cpass` is the current fixed vendor default.
+- `CAMPAIGN_TABLE=ai_ml_campaign_recommendations` stores campaign-level scheduler rows, not customer-level rows.
+
 MLflow variables:
 
 ```bash
@@ -179,10 +187,10 @@ MODEL_NAME, FEATURE_MONTH_SOURCE
 
 The pipeline does this:
 
-1. Fetches latest communication rows from Postgres for the configured `emi_cycle` dates in the current month/year.
-2. Saves raw latest extract under `data/communication/MFL_COMMUNICATION_DATA/`.
-3. Selects previous two month extract files plus the latest extract.
-4. Rebuilds the day-level training-style dataset.
+1. Fetches communication rows from Postgres for the configured `emi_cycle` dates for the source month and previous two months.
+2. Saves raw extracts under `data/communication/MFL_COMMUNICATION_DATA/`.
+3. Selects previous two month extract files plus the latest source-month extract.
+4. Prepares the day-level inference feature dataset.
 5. Rebuilds schedule targets.
 6. Rebuilds monthly features with source `risk` from communications.
 7. Rolls the latest three months of features per APAC/account.
@@ -199,6 +207,93 @@ When omitted, `SOURCE_MONTH` defaults to the current month and `PREDICT_MONTH` d
 For production, provide database credentials through environment variables or a secrets manager. Avoid passing `--password` on the command line because command arguments may be visible in process listings.
 
 Retraining is not required just because the prediction month changes. Use the existing promoted model for monthly inference, and retrain only when new labeled outcomes are available, model quality drops, drift appears, feature/source schema changes, business rules change, or the model is stale. See [docs/retraining_policy.md](docs/retraining_policy.md).
+
+## Configuration Rules
+
+EMI cycles are configured in [config/default_config.json](config/default_config.json):
+
+```json
+"emi_cycle": ["5"]
+```
+
+For the default `["5"]`, the fetcher queries exact EMI dates such as `05/04/2026`. Multiple cycles can be configured, for example:
+
+```json
+"emi_cycle": ["5", "10"]
+```
+
+Send-hour candidates are configured as a window, not as hardcoded channel-specific lists:
+
+```json
+"send_hour_window": {
+  "start_hour": 9,
+  "end_hour": 18,
+  "step_hours": 1
+}
+```
+
+This generates hourly candidates from `09:00:00` through `18:00:00`. In feature preparation, communication sent before `start_hour` is bucketed into `start_hour`, and communication sent at or after `end_hour` is bucketed into `end_hour`. If future operations require every two hours, set `step_hours` to `2`.
+
+## Campaign Scheduler Output
+
+The pipeline creates campaign-level scheduler rows in `digital_collections.ai_ml_campaign_recommendations`. This table is separate from account-level recommendations in `digital_collections.ai_ml_recommendations_data`.
+
+Current campaign scheduler rules:
+
+- `D-5,D-4,D-3,D-2,D-1` become `PRE` / `PREDUE`.
+- `D+1,D+2,D+3,D+4,D+5` become `POST` / `POSTDUE`.
+- Channel mapping is `SMS -> SMS`, `WH -> WHATSAPP`, and `IVR -> VOICE`.
+- Risk mapping is `LOW -> LR`, `MEDIUM -> MR`, and `HIGH -> HR`.
+- Campaign type is currently `NORMAL` only.
+- Scheduler rows are unique campaign definitions, not per-customer rows.
+- If the same campaign definition has multiple model-selected hours, the `time` field stores comma-separated values such as `09:00:00,10:00:00`.
+- Metadata columns include `source_month`, `prediction_month`, `model_name`, `emi_cycle`, `risk`, `vertical`, `campaign_type`, `due_type`, `created_at`, `modified_at`, `created_by`, and `modified_by`.
+
+Scheduler naming pattern:
+
+```text
+{PRE/POST}_AIML_NORMAL_{IVR/SMS/WA}_{VERTICAL}_{LANGUAGE}_{EMI_DATE}TH_{VENDOR}_{LR/MR/HR}_{DDMMYY}
+```
+
+Example:
+
+```text
+PRE_AIML_NORMAL_IVR_LAP_HINDI_5TH_PRUTECH_CPASS_HR_210426
+```
+
+Template name pattern:
+
+```text
+{PREDUE/POSTDUE} AIML {SMS/WHATSAPP/VOICE} {VERTICAL} {LANGUAGE}
+```
+
+Dataset name pattern:
+
+```text
+{PREDUE/POSTDUE} AIML {LANGUAGE} {LR/MR/HR} {SMS/WHATSAPP/VOICE} {VERTICAL} NORMAL FOR EMI {EMI_DATE}TH
+```
+
+## Audit Output
+
+Every monthly inference run writes one audit row to `digital_collections.ai_ml_audit_table`.
+
+Audit rows use:
+
+```text
+audit_key=model
+audit_value=recommendation
+```
+
+The audit table is upserted by `audit_key`, `audit_value`, `model_name`, `source_month`, and `prediction_month`. Re-running the same model/month updates the existing audit record instead of inserting a duplicate.
+
+The audit record stores:
+
+- Run status: `SUCCESS` or `FAILED`.
+- Prediction completed and failed counts.
+- Failure reason when the pipeline fails.
+- Duration in seconds.
+- Feature table, prediction table, and prediction file path.
+- `created_by` and `modified_by` as `campaign-model`.
 
 The command can still be overridden through CLI args:
 
