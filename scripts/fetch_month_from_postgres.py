@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from pathlib import Path
 
@@ -9,6 +8,7 @@ import pandas as pd
 from psycopg import sql
 
 from env_utils import load_dotenv
+from pipeline_common import resolve_emi_cycle
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
 from project_paths import COMMUNICATION_DATA_DIR, REPO_ROOT, ensure_parent_dir
 
@@ -77,22 +77,6 @@ def parse_args() -> argparse.Namespace:
     if args.fetch_size <= 0:
         parser.error("--fetch-size must be greater than 0")
     return args
-
-
-def resolve_emi_cycle(config_file: str, emi_cycle_override: str) -> list[int]:
-    if emi_cycle_override:
-        raw_cycle = [value.strip() for value in emi_cycle_override.split(",") if value.strip()]
-    else:
-        with Path(config_file).open("r", encoding="utf-8") as handle:
-            raw_cycle = json.load(handle).get("emi_cycle", [])
-
-    cycles: list[int] = []
-    for value in raw_cycle:
-        day = int(value)
-        if day < 1 or day > 31:
-            raise ValueError(f"Invalid EMI cycle day {value!r}. Expected a day from 1 to 31.")
-        cycles.append(day)
-    return sorted(set(cycles))
 
 
 def month_bounds(source_month: str) -> tuple[pd.Timestamp, pd.Timestamp]:

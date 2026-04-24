@@ -8,6 +8,12 @@ import warnings
 
 import pandas as pd
 from joblib import Parallel, delayed
+from pipeline_common import (
+    DAY_COLUMNS,
+    build_feature_matrix,
+    prepare_next_month_dataset,
+    split_by_source_month,
+)
 from sklearn.ensemble import (
     ExtraTreesClassifier,
     GradientBoostingClassifier,
@@ -43,11 +49,6 @@ try:
     from xgboost import XGBClassifier
 except ImportError:  # pragma: no cover
     XGBClassifier = None
-
-
-DAY_COLUMNS = ["D-5", "D-4", "D-3", "D-2", "D-1", "D+1", "D+2", "D+3", "D+4", "D+5"]
-NON_FEATURE_COLUMNS = DAY_COLUMNS + ["TARGET_MONTH", "TARGET_MONTH_PERIOD", "TARGET_RISK"]
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -188,64 +189,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def month_to_period(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, format="%b-%Y", errors="coerce").dt.to_period("M")
-
-
 def prepare_dataset(
     feature_file: Path,
     schedule_file: Path,
     target_offset_months: int,
 ) -> pd.DataFrame:
-    features = pd.read_csv(feature_file).copy()
-    schedule = pd.read_csv(schedule_file).copy()
-
-    features["SOURCE_MONTH"] = features["MONTH"]
-    features["SOURCE_MONTH_PERIOD"] = month_to_period(features["SOURCE_MONTH"])
-    features["TARGET_MONTH_PERIOD"] = features["SOURCE_MONTH_PERIOD"] + target_offset_months
-    features = features.drop(columns=["MONTH"])
-
-    schedule["TARGET_MONTH"] = schedule["MONTH"]
-    schedule["TARGET_MONTH_PERIOD"] = month_to_period(schedule["TARGET_MONTH"])
-    schedule = schedule.rename(
-        columns={
-            "Loan_number": "APAC_CARD_NUMBER",
-            "RISK": "TARGET_RISK",
-        }
+    return prepare_next_month_dataset(
+        feature_file=feature_file,
+        schedule_file=schedule_file,
+        target_offset_months=target_offset_months,
     )
-    schedule = schedule.drop(columns=["MONTH"])
-
-    return features.merge(
-        schedule[
-            ["APAC_CARD_NUMBER", "TARGET_MONTH", "TARGET_MONTH_PERIOD", "TARGET_RISK", *DAY_COLUMNS]
-        ],
-        on=["APAC_CARD_NUMBER", "TARGET_MONTH_PERIOD"],
-        how="left",
-    )
-
-
-def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
-    feature_df = df.drop(columns=NON_FEATURE_COLUMNS, errors="ignore").copy()
-    feature_df["RISK"] = feature_df["RISK"].fillna("UNKNOWN")
-    feature_df["SOURCE_MONTH"] = feature_df["SOURCE_MONTH"].fillna("UNKNOWN")
-    feature_df = pd.get_dummies(
-        feature_df,
-        columns=["SOURCE_MONTH", "RISK"],
-        dummy_na=False,
-    )
-    feature_df = feature_df.drop(columns=["APAC_CARD_NUMBER", "SOURCE_MONTH_PERIOD"], errors="ignore")
-    return feature_df.fillna(0)
-
-
-def split_by_source_month(
-    dataset: pd.DataFrame,
-    months: list[str],
-    require_target: bool,
-) -> pd.DataFrame:
-    selected = dataset[dataset["SOURCE_MONTH"].isin(months)].copy()
-    if require_target:
-        selected = selected.dropna(subset=["TARGET_MONTH"])
-    return selected
 
 
 def build_model_factory(model_name: str, args: argparse.Namespace):

@@ -7,20 +7,20 @@ import joblib
 import pandas as pd
 
 from app_logging import log_step, setup_logging
+from pipeline_common import (
+    DAY_COLUMNS,
+    build_feature_matrix,
+    month_to_period,
+    predict_top_k_by_risk,
+    prepare_next_month_dataset,
+    split_by_source_month,
+)
 from project_paths import (
     FEATURE_DATA_DIR,
     MODEL_DIR,
     PREDICTIONS_DIR,
     SCHEDULE_DATA_DIR,
     ensure_parent_dir,
-)
-from train_next_month_strategy_model_catboost import (
-    DAY_COLUMNS,
-    build_feature_matrix,
-    month_to_period,
-    prepare_dataset,
-    predict_top_k_by_risk,
-    split_by_source_month,
 )
 
 
@@ -91,11 +91,11 @@ def main() -> None:
             )
 
         with log_step(logger, "prepare_dataset", feature_file=args.feature_file, schedule_file=args.schedule_file):
-            dataset = prepare_dataset(
-                Path(args.feature_file),
-                Path(args.schedule_file),
-                target_offset_months,
-                history_window_months,
+            dataset = prepare_next_month_dataset(
+                feature_file=Path(args.feature_file),
+                schedule_file=Path(args.schedule_file),
+                target_offset_months=target_offset_months,
+                history_window_months=history_window_months,
             )
             logger.info("Prepared inference dataset | rows=%s columns=%s", len(dataset), len(dataset.columns))
 

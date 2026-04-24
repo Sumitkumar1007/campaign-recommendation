@@ -75,6 +75,21 @@ def test_selected_history_files_uses_previous_two_months_plus_latest(tmp_path: P
     assert selected_history_files("2026-04", latest) == [feb, mar, latest]
 
 
+def test_selected_history_files_ignores_noncanonical_matches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    communication_dir = tmp_path / "data" / "communication" / "MFL_COMMUNICATION_DATA"
+    communication_dir.mkdir(parents=True)
+    feb = communication_dir / "mfl_recomm_model_FEB2026_comm_data.csv"
+    mar = communication_dir / "mfl_recomm_model_MAR2026_comm_data.csv"
+    latest = communication_dir / "latest_APR2026_comm_data.csv"
+    noisy = communication_dir / "backup_MAR2026_comm_data.csv"
+    for path in [feb, mar, latest, noisy]:
+        path.write_text("id\n1\n", encoding="utf-8")
+
+    monkeypatch.setattr("run_monthly_inference_pipeline.COMMUNICATION_DATA_DIR", communication_dir)
+
+    assert selected_history_files("2026-04", latest) == [feb, mar, latest]
+
+
 def test_rolling_feature_window_sums_latest_account_history() -> None:
     features = pd.DataFrame(
         {
