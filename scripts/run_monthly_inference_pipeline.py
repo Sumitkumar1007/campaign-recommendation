@@ -15,6 +15,7 @@ from psycopg.types.json import Jsonb
 
 from app_logging import log_step, setup_logging
 from env_utils import load_dotenv
+from pipeline_common import resolve_emi_cycle
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
 from project_paths import (
     COMMUNICATION_DATA_DIR,
@@ -182,22 +183,6 @@ def current_month(today: pd.Timestamp | None = None) -> str:
     return (today or pd.Timestamp.today()).strftime("%Y-%m")
 
 
-def resolve_emi_cycle(config_file: str, emi_cycle_override: str = "") -> list[int]:
-    if emi_cycle_override:
-        raw_cycle = [value.strip() for value in emi_cycle_override.split(",") if value.strip()]
-    else:
-        with Path(config_file).open("r", encoding="utf-8") as handle:
-            raw_cycle = json.load(handle).get("emi_cycle", [])
-
-    cycles: list[int] = []
-    for value in raw_cycle:
-        day = int(value)
-        if day < 1 or day > 31:
-            raise ValueError(f"Invalid EMI cycle day {value!r}. Expected a day from 1 to 31.")
-        cycles.append(day)
-    return sorted(set(cycles))
-
-
 def next_month(yyyy_mm: str) -> str:
     return str(parse_month(yyyy_mm) + 1)
 
@@ -237,8 +222,9 @@ def selected_history_files(source_month: str, latest_file: Path) -> list[Path]:
     previous_periods = [source_period - 2, source_period - 1]
     files: list[Path] = []
     for period in previous_periods:
-        token = month_file_token(period)
-        files.extend(sorted(COMMUNICATION_DATA_DIR.glob(f"*{token}*.csv")))
+        monthly_file = monthly_extract_file(str(period))
+        if monthly_file.exists():
+            files.append(monthly_file)
     if latest_file.exists():
         files.append(latest_file)
 

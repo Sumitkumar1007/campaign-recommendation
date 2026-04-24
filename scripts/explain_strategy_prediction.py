@@ -9,13 +9,13 @@ import joblib
 import pandas as pd
 
 from app_logging import log_step, setup_logging
-from project_paths import FEATURE_DATA_DIR, MODEL_DIR, PREDICTIONS_DIR, SCHEDULE_DATA_DIR, ensure_parent_dir
-from train_next_month_strategy_model_catboost import (
+from pipeline_common import (
     DAY_COLUMNS,
     build_feature_matrix,
     build_rolling_feature_windows,
     month_to_period,
 )
+from project_paths import FEATURE_DATA_DIR, MODEL_DIR, PREDICTIONS_DIR, SCHEDULE_DATA_DIR, ensure_parent_dir
 
 
 def parse_args() -> argparse.Namespace:

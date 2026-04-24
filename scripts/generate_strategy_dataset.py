@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from pipeline_common import candidate_hours
 from project_paths import COMMUNICATION_DATA_DIR, REPO_ROOT, TRAINING_DATA_DIR, ensure_parent_dir
 
 
@@ -153,20 +154,6 @@ def load_send_hour_window(config_file: str | Path) -> dict[str, int]:
         "end_hour": int(raw_window.get("end_hour", 18)),
         "step_hours": int(raw_window.get("step_hours", 1)),
     }
-
-
-def candidate_hours(send_hour_window: dict[str, int]) -> list[int]:
-    start_hour = int(send_hour_window["start_hour"])
-    end_hour = int(send_hour_window["end_hour"])
-    step_hours = int(send_hour_window.get("step_hours", 1))
-    if start_hour < 0 or end_hour > 23 or start_hour > end_hour:
-        raise ValueError("send_hour_window must use 0-23 hours with start_hour <= end_hour")
-    if step_hours <= 0:
-        raise ValueError("send_hour_window.step_hours must be greater than 0")
-    hours = list(range(start_hour, end_hour + 1, step_hours))
-    if hours[-1] != end_hour:
-        hours.append(end_hour)
-    return hours
 
 
 def bucket_send_hour(hour: object, send_hour_window: dict[str, int] | None = None) -> int | pd.NA:

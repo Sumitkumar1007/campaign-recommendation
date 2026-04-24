@@ -14,6 +14,15 @@ from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import LabelEncoder
 
 from app_logging import log_step, setup_logging
+from pipeline_common import (
+    DAY_COLUMNS,
+    build_feature_matrix,
+    build_rolling_feature_windows,
+    month_to_period,
+    predict_top_k_by_risk,
+    prepare_next_month_dataset,
+    split_by_source_month,
+)
 from project_paths import (
     CATBOOST_INFO_DIR,
     CHECKPOINT_DIR,
@@ -24,15 +33,6 @@ from project_paths import (
     SCHEDULE_DATA_DIR,
     ensure_parent_dir,
 )
-
-DAY_COLUMNS = ["D-5", "D-4", "D-3", "D-2", "D-1", "D+1", "D+2", "D+3", "D+4", "D+5"]
-NON_FEATURE_COLUMNS = DAY_COLUMNS + ["TARGET_MONTH", "TARGET_MONTH_PERIOD", "TARGET_RISK"]
-RISK_TOP_K = {
-    "LOW": 1,
-    "MEDIUM": 2,
-    "HIGH": 3,
-}
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -139,108 +139,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def month_to_period(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, format="%b-%Y", errors="coerce").dt.to_period("M")
-
-
-def build_rolling_feature_windows(
-    features: pd.DataFrame,
-    history_window_months: int,
-) -> pd.DataFrame:
-    features = features.copy()
-    features["MONTH_PERIOD"] = month_to_period(features["MONTH"])
-    features = features.dropna(subset=["MONTH_PERIOD"])
-    features = (
-        features.sort_values(["APAC_CARD_NUMBER", "MONTH_PERIOD"])
-        .drop_duplicates(subset=["APAC_CARD_NUMBER", "MONTH_PERIOD"], keep="last")
-        .reset_index(drop=True)
-    )
-
-    numeric_columns = [
-        col
-        for col in features.columns
-        if col not in {"APAC_CARD_NUMBER", "MONTH", "RISK", "MONTH_PERIOD"}
-    ]
-    if features.empty:
-        return features[["APAC_CARD_NUMBER", "MONTH", *numeric_columns, "RISK"]].copy()
-
-    features[numeric_columns] = features[numeric_columns].fillna(0)
-    rolled_numeric = (
-        features.groupby("APAC_CARD_NUMBER", sort=False)[numeric_columns]
-        .rolling(window=history_window_months, min_periods=1)
-        .sum()
-        .reset_index(level=0, drop=True)
-    )
-    rolled = features[["APAC_CARD_NUMBER", "MONTH_PERIOD"]].copy()
-    rolled[numeric_columns] = rolled_numeric[numeric_columns]
-    rolled["MONTH"] = (
-        rolled["MONTH_PERIOD"].dt.to_timestamp().dt.strftime("%b-%Y").str.upper()
-    )
-    rolled["RISK"] = features["RISK"].fillna("UNKNOWN").astype(str).str.upper().values
-    return rolled[["APAC_CARD_NUMBER", "MONTH", *numeric_columns, "RISK"]]
-
-
 def prepare_dataset(
     feature_file: Path,
     schedule_file: Path,
     target_offset_months: int,
     history_window_months: int,
 ) -> pd.DataFrame:
-    features = pd.read_csv(feature_file).copy()
-    schedule = pd.read_csv(schedule_file).copy()
-    features = build_rolling_feature_windows(features, history_window_months)
-
-    features["SOURCE_MONTH"] = features["MONTH"]
-    features["SOURCE_MONTH_PERIOD"] = month_to_period(features["SOURCE_MONTH"])
-    features["TARGET_MONTH_PERIOD"] = features["SOURCE_MONTH_PERIOD"] + target_offset_months
-    features = features.drop(columns=["MONTH"])
-
-    schedule["TARGET_MONTH"] = schedule["MONTH"]
-    schedule["TARGET_MONTH_PERIOD"] = month_to_period(schedule["TARGET_MONTH"])
-    schedule = schedule.rename(
-        columns={
-            "Loan_number": "APAC_CARD_NUMBER",
-            "RISK": "TARGET_RISK",
-        }
+    return prepare_next_month_dataset(
+        feature_file=feature_file,
+        schedule_file=schedule_file,
+        target_offset_months=target_offset_months,
+        history_window_months=history_window_months,
     )
-    schedule = schedule.drop(columns=["MONTH"])
-
-    return features.merge(
-        schedule[
-            ["APAC_CARD_NUMBER", "TARGET_MONTH", "TARGET_MONTH_PERIOD", "TARGET_RISK", *DAY_COLUMNS]
-        ],
-        on=["APAC_CARD_NUMBER", "TARGET_MONTH_PERIOD"],
-        how="left",
-    )
-
-
-def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
-    feature_df = df.drop(columns=NON_FEATURE_COLUMNS, errors="ignore").copy()
-    feature_df["RISK"] = feature_df["RISK"].fillna("UNKNOWN")
-    feature_df["SOURCE_MONTH"] = feature_df["SOURCE_MONTH"].fillna("UNKNOWN")
-    feature_df = pd.get_dummies(
-        feature_df,
-        columns=["SOURCE_MONTH", "RISK"],
-        dummy_na=False,
-    )
-    feature_df = feature_df.drop(columns=["APAC_CARD_NUMBER", "SOURCE_MONTH_PERIOD"], errors="ignore")
-    return feature_df.fillna(0)
-
-
-def predict_top_k_by_risk(
-    model: CatBoostClassifier,
-    encoder: LabelEncoder,
-    X: pd.DataFrame,
-    risks: pd.Series,
-) -> pd.Series:
-    probabilities = model.predict_proba(X)
-    output: list[str] = []
-    for row_probs, risk in zip(probabilities, risks.fillna("LOW").astype(str), strict=False):
-        k = RISK_TOP_K.get(risk.upper(), 1)
-        top_indices = row_probs.argsort()[-k:][::-1]
-        labels = [str(encoder.classes_[index]) for index in top_indices]
-        output.append("|".join(labels))
-    return pd.Series(output, index=X.index)
 
 
 def fit_day_model(
@@ -349,17 +259,6 @@ def evaluate_models(models: dict, label_encoders: dict, X: pd.DataFrame, y: pd.D
         "average_day_accuracy": average_day_accuracy,
         "per_day_accuracy": per_day_accuracy,
     }
-
-
-def split_by_source_month(
-    dataset: pd.DataFrame,
-    months: list[str],
-    require_target: bool,
-) -> pd.DataFrame:
-    selected = dataset[dataset["SOURCE_MONTH"].isin(months)].copy()
-    if require_target:
-        selected = selected.dropna(subset=["TARGET_MONTH"])
-    return selected
 
 
 def main() -> None:
