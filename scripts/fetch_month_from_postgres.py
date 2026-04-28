@@ -118,6 +118,7 @@ def build_query(schema: str, table: str) -> sql.Composed:
             c.comm_status,
             c.communication_type,
             c.verbiage_language,
+            c.vertical,
             c.risk,
             TO_DATE(c.emi_date, 'DD/MM/YYYY') AS emi_date,
             EXTRACT(HOUR FROM date_trunc('hour', c.created_date)) AS hr,

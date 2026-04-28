@@ -136,7 +136,8 @@ CAMPAIGN_VENDOR=prutech-cpass
 Campaign scheduler defaults:
 
 - `CAMPAIGN_VERTICAL=LAP` is a temporary fixed value until the real vertical source column is available.
-- `CAMPAIGN_VENDOR=prutech-cpass` is the current fixed vendor default.
+- Scheduler vendor is read from `data_config.value` where `key_name='voice.service.vendor-list'`.
+- `CAMPAIGN_VENDOR=prutech-cpass` is fallback only when `data_config` is missing or has no usable vendor value.
 - `CAMPAIGN_TABLE=ai_ml_campaign_recommendations` stores campaign-level scheduler rows, not customer-level rows.
 
 MLflow variables:

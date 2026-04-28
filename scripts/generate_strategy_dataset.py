@@ -40,6 +40,7 @@ USECOLS = [
     "comm_status",
     "communication_type",
     "verbiage_language",
+    "vertical",
     "risk",
     "emi_date",
     "date",
@@ -146,6 +147,16 @@ def normalize_risk(series: pd.Series) -> pd.Series:
     )
 
 
+def normalize_vertical(series: pd.Series) -> pd.Series:
+    return (
+        series.fillna("UNKNOWN")
+        .astype(str)
+        .str.strip()
+        .replace({"": "UNKNOWN"})
+        .str.upper()
+    )
+
+
 def load_send_hour_window(config_file: str | Path) -> dict[str, int]:
     with Path(config_file).open("r", encoding="utf-8") as handle:
         raw_window = json.load(handle).get("send_hour_window", {})
@@ -188,6 +199,7 @@ def process_chunk(
     df["COMM_TYPE"] = normalize_comm_type(df["communication_type"])
     df["STATUS"] = normalize_status(df["comm_status"])
     df["LANGUAGE"] = normalize_language(df["verbiage_language"])
+    df["VERTICAL"] = normalize_vertical(df["vertical"]) if "vertical" in df.columns else "UNKNOWN"
     df["RISK"] = normalize_risk(df["risk"])
     df["emi_date"] = pd.to_datetime(df["emi_date"], errors="coerce").dt.normalize()
     df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
@@ -291,7 +303,7 @@ def process_chunk(
 
     feature_counts = pd.concat(feature_frames, ignore_index=True)
     risk_counts = (
-        df.groupby(["APAC_CARD_NUMBER", "MONTH", "DAY"], sort=False)["RISK"]
+        df.groupby(["APAC_CARD_NUMBER", "MONTH", "DAY"], sort=False)[["RISK", "VERTICAL"]]
         .last()
         .reset_index()
     )
@@ -427,7 +439,7 @@ def build_dataset(
     )
     risk_df = (
         pd.concat(risk_parts, ignore_index=True)
-        .groupby(["APAC_CARD_NUMBER", "MONTH", "DAY"], as_index=False)["RISK"]
+        .groupby(["APAC_CARD_NUMBER", "MONTH", "DAY"], as_index=False)[["RISK", "VERTICAL"]]
         .last()
     )
     wide = wide.merge(risk_df, on=["APAC_CARD_NUMBER", "MONTH", "DAY"], how="left")
@@ -459,10 +471,10 @@ def build_dataset(
     feature_columns = sorted(
         column
         for column in wide.columns
-        if column not in {"APAC_CARD_NUMBER", "MONTH", "DAY", "RISK", "PREDICTED_STRATEGY"}
+        if column not in {"APAC_CARD_NUMBER", "MONTH", "DAY", "RISK", "VERTICAL", "PREDICTED_STRATEGY"}
     )
     wide = wide[
-        ["APAC_CARD_NUMBER", "MONTH", "DAY", "RISK", *feature_columns, "PREDICTED_STRATEGY"]
+        ["APAC_CARD_NUMBER", "MONTH", "DAY", "RISK", "VERTICAL", *feature_columns, "PREDICTED_STRATEGY"]
     ]
     wide.to_csv(output_file, index=False)
     print(f"Saved {len(wide):,} rows to {output_file}")
