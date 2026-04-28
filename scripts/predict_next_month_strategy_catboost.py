@@ -16,6 +16,7 @@ from pipeline_common import (
     split_by_source_month,
 )
 from project_paths import (
+    CASE_DATA_DIR,
     FEATURE_DATA_DIR,
     MODEL_DIR,
     PREDICTIONS_DIR,
@@ -58,11 +59,68 @@ def parse_args() -> argparse.Namespace:
         help="Source months to score for next-month prediction.",
     )
     parser.add_argument(
+        "--base-population-file",
+        default=str(CASE_DATA_DIR / "digital_cases_APR2026.csv"),
+        help="Current-month digital cases CSV used as full prediction base population.",
+    )
+    parser.add_argument(
         "--log-file",
         default=None,
         help="Application log file. Defaults to artifacts/logs/catboost_inference.log.",
     )
     return parser.parse_args()
+
+
+def _normalize_text(series: pd.Series, default: str = "UNKNOWN") -> pd.Series:
+    return (
+        series.fillna(default)
+        .astype(str)
+        .str.strip()
+        .replace({"": default})
+    )
+
+
+def load_base_population(base_population_file: Path, source_month_label: str) -> pd.DataFrame:
+    base = pd.read_csv(base_population_file).copy()
+    required = {"apac_card_number", "risk", "vertical", "collectable_amount", "emi_date"}
+    missing = required.difference(base.columns)
+    if missing:
+        raise ValueError(f"Base population file is missing required columns: {sorted(missing)}")
+
+    base["APAC_CARD_NUMBER"] = _normalize_text(base["apac_card_number"], default="")
+    base["RISK"] = _normalize_text(base["risk"]).str.upper()
+    base["VERTICAL"] = _normalize_text(base["vertical"]).str.upper()
+    base["SOURCE_MONTH"] = source_month_label
+    base["collectable_amount"] = pd.to_numeric(base["collectable_amount"], errors="coerce").fillna(0.0)
+    base["emi_date"] = _normalize_text(base["emi_date"], default="")
+    base = base[base["APAC_CARD_NUMBER"].ne("")].copy()
+    base = base.drop_duplicates(subset=["APAC_CARD_NUMBER"], keep="first").reset_index(drop=True)
+    return base[["APAC_CARD_NUMBER", "SOURCE_MONTH", "RISK", "VERTICAL", "collectable_amount", "emi_date"]]
+
+
+def build_prediction_population(
+    *,
+    dataset: pd.DataFrame,
+    base_population: pd.DataFrame,
+    prediction_source_month: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    prediction_df = split_by_source_month(dataset, [prediction_source_month], require_target=False)
+    feature_rows = prediction_df[prediction_df["TARGET_MONTH"].isna()].copy()
+    feature_rows = feature_rows.drop(
+        columns=["RISK", "VERTICAL", "TARGET_MONTH", "TARGET_MONTH_PERIOD", "TARGET_RISK"],
+        errors="ignore",
+    )
+
+    merged = base_population.merge(
+        feature_rows,
+        on=["APAC_CARD_NUMBER", "SOURCE_MONTH"],
+        how="left",
+        indicator=True,
+    )
+    merged["SOURCE_MONTH_PERIOD"] = month_to_period(merged["SOURCE_MONTH"])
+    with_history = merged[merged["_merge"] == "both"].drop(columns=["_merge"]).copy()
+    without_history = merged[merged["_merge"] == "left_only"].drop(columns=["_merge"]).copy()
+    return with_history, without_history
 
 
 def main() -> None:
@@ -99,57 +157,67 @@ def main() -> None:
             )
             logger.info("Prepared inference dataset | rows=%s columns=%s", len(dataset), len(dataset.columns))
 
-        with log_step(logger, "select_prediction_rows", source_months=args.prediction_source_months):
-            prediction_df = split_by_source_month(
-                dataset,
-                args.prediction_source_months,
-                require_target=False,
+        if len(args.prediction_source_months) != 1:
+            raise ValueError("Inference with digital_cases base population requires exactly one prediction source month.")
+        prediction_source_month = args.prediction_source_months[0]
+
+        with log_step(logger, "load_base_population", base_population_file=args.base_population_file):
+            base_population = load_base_population(Path(args.base_population_file), prediction_source_month)
+            logger.info("Loaded base population | rows=%s", len(base_population))
+
+        with log_step(logger, "select_prediction_rows", source_month=prediction_source_month):
+            prediction_rows, blank_rows = build_prediction_population(
+                dataset=dataset,
+                base_population=base_population,
+                prediction_source_month=prediction_source_month,
             )
-            prediction_rows = prediction_df[prediction_df["TARGET_MONTH"].isna()].copy()
             logger.info(
-                "Selected prediction rows | candidates=%s future_rows=%s",
-                len(prediction_df),
+                "Selected prediction rows | with_history=%s without_history=%s",
                 len(prediction_rows),
+                len(blank_rows),
             )
 
-        if prediction_rows.empty:
-            pd.DataFrame(
-                columns=[
-                    "SOURCE_RISK",
-                    "Loan_number",
-                    "SOURCE_MONTH_USED",
-                    "MONTH",
-                    "D-5",
-                    "D-4",
-                    "D-3",
-                    "D-2",
-                    "D-1",
-                    "D",
-                    "D+1",
-                    "D+2",
-                    "D+3",
-                    "D+4",
-                    "D+5",
-                ]
-            ).to_csv(prediction_file, index=False)
-            logger.warning("No rows found for inference. Saved empty prediction file to %s", prediction_file)
-            print("No rows found for inference.")
-            print(f"Saved empty prediction file to {prediction_file}")
-            return
+        prediction_outputs: list[pd.DataFrame] = []
 
-        with log_step(logger, "build_prediction_matrix"):
-            X_pred = build_feature_matrix(prediction_rows).reindex(
-                columns=bundle["feature_columns"],
-                fill_value=0,
-            )
-            logger.info("Prediction matrix | shape=%s", X_pred.shape)
+        if not prediction_rows.empty:
+            with log_step(logger, "build_prediction_matrix"):
+                X_pred = build_feature_matrix(prediction_rows).reindex(
+                    columns=bundle["feature_columns"],
+                    fill_value=0,
+                )
+                logger.info("Prediction matrix | shape=%s", X_pred.shape)
 
-        with log_step(logger, "predict_day_columns", rows=len(X_pred)):
-            base_columns = ["APAC_CARD_NUMBER", "SOURCE_MONTH", "RISK"]
-            if "VERTICAL" in prediction_rows.columns:
-                base_columns.append("VERTICAL")
-            prediction_output = prediction_rows[base_columns].copy()
-            prediction_output = prediction_output.rename(
+            with log_step(logger, "predict_day_columns", rows=len(X_pred)):
+                prediction_output = prediction_rows[["APAC_CARD_NUMBER", "SOURCE_MONTH", "RISK", "VERTICAL"]].copy()
+                prediction_output = prediction_output.rename(
+                    columns={
+                        "APAC_CARD_NUMBER": "Loan_number",
+                        "SOURCE_MONTH": "SOURCE_MONTH_USED",
+                        "RISK": "SOURCE_RISK",
+                        "VERTICAL": "SOURCE_VERTICAL",
+                    }
+                )
+
+                source_period = month_to_period(prediction_output["SOURCE_MONTH_USED"])
+                prediction_output["MONTH"] = (
+                    source_period + target_offset_months
+                ).dt.to_timestamp().dt.strftime("%b-%Y").str.upper()
+
+                for day in DAY_COLUMNS:
+                    logger.info("Predicting day column | day=%s", day)
+                    encoder = bundle["label_encoders"][day]
+                    model = bundle["models"][day]
+                    prediction_output[day] = predict_top_k_by_risk(
+                        model,
+                        encoder,
+                        X_pred,
+                        prediction_rows["RISK"],
+                    )
+                prediction_outputs.append(prediction_output)
+
+        if not blank_rows.empty:
+            blank_output = blank_rows[["APAC_CARD_NUMBER", "SOURCE_MONTH", "RISK", "VERTICAL"]].copy()
+            blank_output = blank_output.rename(
                 columns={
                     "APAC_CARD_NUMBER": "Loan_number",
                     "SOURCE_MONTH": "SOURCE_MONTH_USED",
@@ -157,22 +225,27 @@ def main() -> None:
                     "VERTICAL": "SOURCE_VERTICAL",
                 }
             )
-
-            source_period = month_to_period(prediction_output["SOURCE_MONTH_USED"])
-            prediction_output["MONTH"] = (
+            source_period = month_to_period(blank_output["SOURCE_MONTH_USED"])
+            blank_output["MONTH"] = (
                 source_period + target_offset_months
             ).dt.to_timestamp().dt.strftime("%b-%Y").str.upper()
-
             for day in DAY_COLUMNS:
-                logger.info("Predicting day column | day=%s", day)
-                encoder = bundle["label_encoders"][day]
-                model = bundle["models"][day]
-                prediction_output[day] = predict_top_k_by_risk(
-                    model,
-                    encoder,
-                    X_pred,
-                    prediction_rows["RISK"],
-                )
+                blank_output[day] = "-"
+            prediction_outputs.append(blank_output)
+
+        if prediction_outputs:
+            prediction_output = pd.concat(prediction_outputs, ignore_index=True)
+        else:
+            prediction_output = pd.DataFrame(
+                columns=[
+                    "SOURCE_RISK",
+                    "SOURCE_VERTICAL",
+                    "Loan_number",
+                    "SOURCE_MONTH_USED",
+                    "MONTH",
+                    *DAY_COLUMNS,
+                ]
+            )
 
         with log_step(logger, "write_predictions", prediction_file=prediction_file):
             prediction_output["D"] = "-"
