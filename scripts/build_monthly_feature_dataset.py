@@ -38,11 +38,12 @@ def main() -> None:
 
     monthly_parts: list[pd.DataFrame] = []
     risk_parts: list[pd.Series] = []
+    vertical_parts: list[pd.Series] = []
     for chunk in pd.read_csv(input_file, chunksize=args.chunksize):
         numeric_columns = [
             col
             for col in chunk.columns
-            if col not in {"APAC_CARD_NUMBER", "MONTH", "DAY", "RISK", "PREDICTED_STRATEGY"}
+            if col not in {"APAC_CARD_NUMBER", "MONTH", "DAY", "RISK", "VERTICAL", "PREDICTED_STRATEGY"}
         ]
         if "RISK" not in chunk.columns:
             raise ValueError("Missing required RISK column. Risk must come from communications.")
@@ -53,6 +54,8 @@ def main() -> None:
         )
         monthly_parts.append(grouped)
         risk_parts.append(chunk.groupby(["APAC_CARD_NUMBER", "MONTH"])["RISK"].first())
+        if "VERTICAL" in chunk.columns:
+            vertical_parts.append(chunk.groupby(["APAC_CARD_NUMBER", "MONTH"])["VERTICAL"].first())
 
     if not monthly_parts:
         raise ValueError("No data found while building monthly features.")
@@ -69,6 +72,14 @@ def main() -> None:
         .reset_index()
     )
     monthly = monthly.merge(risk_df, on=["APAC_CARD_NUMBER", "MONTH"], how="left")
+    if vertical_parts:
+        vertical_df = (
+            pd.concat(vertical_parts, ignore_index=False)
+            .groupby(level=[0, 1])
+            .first()
+            .reset_index()
+        )
+        monthly = monthly.merge(vertical_df, on=["APAC_CARD_NUMBER", "MONTH"], how="left")
     monthly.to_csv(output_file, index=False)
     print(f"Saved {len(monthly):,} rows to {output_file}")
 

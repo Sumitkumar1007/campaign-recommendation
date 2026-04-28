@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
-from psycopg import sql
+from psycopg import errors, sql
 from psycopg.types.json import Jsonb
 
 from app_logging import log_step, setup_logging
@@ -33,6 +33,7 @@ from project_paths import (
 DAY_COLUMNS = ["D-5", "D-4", "D-3", "D-2", "D-1", "D", "D+1", "D+2", "D+3", "D+4", "D+5"]
 PREDUE_DAYS = ["D-5", "D-4", "D-3", "D-2", "D-1"]
 POSTDUE_DAYS = ["D+1", "D+2", "D+3", "D+4", "D+5"]
+CAMPAIGN_DAY_ORDER = {day: index for index, day in enumerate([*PREDUE_DAYS, *POSTDUE_DAYS])}
 RISK_CODES = {
     "LOW": "LR",
     "MEDIUM": "MR",
@@ -50,6 +51,7 @@ NAME_CHANNEL_BY_MODE = {
     "WHATSAPP": "WA",
     "VOICE": "IVR",
 }
+VENDOR_CONFIG_KEY = "voice.service.vendor-list"
 
 
 def parse_args() -> argparse.Namespace:
@@ -102,6 +104,11 @@ def parse_args() -> argparse.Namespace:
         help="Target table for campaign scheduler recommendations.",
     )
     parser.add_argument(
+        "--campaign-mapping-table",
+        default=os.getenv("CAMPAIGN_MAPPING_TABLE", "ai_ml_campaign_mapping"),
+        help="Target table for campaign-to-account mapping rows.",
+    )
+    parser.add_argument(
         "--campaign-vertical",
         default=os.getenv("CAMPAIGN_VERTICAL", "LAP"),
         help="Campaign vertical used in scheduler naming until a source column is available.",
@@ -109,7 +116,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--campaign-vendor",
         default=os.getenv("CAMPAIGN_VENDOR", "prutech-cpass"),
-        help="Campaign vendor used in scheduler output.",
+        help="Fallback campaign vendor when data_config vendor lookup is unavailable.",
     )
     parser.add_argument(
         "--config-file",
@@ -246,6 +253,138 @@ def csv_has_rows(path: Path) -> bool:
         return sum(1 for _ in handle) > 1
 
 
+def prediction_summary_path(predict_month: str) -> Path:
+    return LOG_DIR / f"{predict_month.replace('-', '_').lower()}_prediction_summary.json"
+
+
+def _count_top_labels(df: pd.DataFrame, day_columns: list[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for day in day_columns:
+        if day not in df.columns:
+            continue
+        for value in df[day].fillna("-").astype(str):
+            for label in value.split("|"):
+                label = label.strip()
+                if not label or label == "-":
+                    continue
+                counts[label] = counts.get(label, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
+def _count_daywise_labels(df: pd.DataFrame, day_columns: list[str]) -> dict[str, dict[str, int]]:
+    output: dict[str, dict[str, int]] = {}
+    for day in day_columns:
+        if day not in df.columns:
+            continue
+        counts: dict[str, int] = {}
+        for value in df[day].fillna("-").astype(str):
+            for label in value.split("|"):
+                label = label.strip()
+                if not label or label == "-":
+                    continue
+                counts[label] = counts.get(label, 0) + 1
+        output[day] = dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+    return output
+
+
+def _count_blank_predictions(df: pd.DataFrame, day_columns: list[str]) -> dict[str, object]:
+    normalized = df[day_columns].fillna("-").astype(str).apply(lambda col: col.str.strip())
+    blank_counts = {
+        day: int((normalized[day] == "-").sum())
+        for day in day_columns
+        if day in normalized.columns
+    }
+    all_blank_rows = int(normalized.apply(lambda row: all(value == "-" for value in row), axis=1).sum())
+    return {
+        "blank_counts_by_day": blank_counts,
+        "all_blank_rows": all_blank_rows,
+    }
+
+
+def build_prediction_summary(
+    *,
+    prediction_file: Path,
+    source_month_label: str,
+    prediction_month_label: str,
+    model_name: str,
+    campaign_df: pd.DataFrame,
+    mapping_df: pd.DataFrame,
+) -> dict[str, object]:
+    predictions = pd.read_csv(prediction_file)
+    predictions = predictions[predictions["MONTH"] == prediction_month_label].copy()
+    day_columns = ["D-5", "D-4", "D-3", "D-2", "D-1", "D+1", "D+2", "D+3", "D+4", "D+5"]
+
+    source_risk_counts = (
+        predictions["SOURCE_RISK"].fillna("UNKNOWN").astype(str).value_counts().sort_index().to_dict()
+        if "SOURCE_RISK" in predictions.columns
+        else {}
+    )
+    source_vertical_counts = (
+        predictions["SOURCE_VERTICAL"].fillna("UNKNOWN").astype(str).value_counts().sort_index().to_dict()
+        if "SOURCE_VERTICAL" in predictions.columns
+        else {}
+    )
+    campaign_mode_counts = (
+        campaign_df["mode"].fillna("UNKNOWN").astype(str).value_counts().sort_index().to_dict()
+        if not campaign_df.empty
+        else {}
+    )
+    campaign_vendor_counts = (
+        campaign_df["vendor"].fillna("UNKNOWN").astype(str).value_counts().sort_index().to_dict()
+        if not campaign_df.empty
+        else {}
+    )
+    campaign_vertical_counts = (
+        campaign_df["vertical"].fillna("UNKNOWN").astype(str).value_counts().sort_index().to_dict()
+        if not campaign_df.empty
+        else {}
+    )
+    mapping_counts_by_campaign = (
+        mapping_df["campaign_name"].fillna("UNKNOWN").astype(str).value_counts().head(20).to_dict()
+        if not mapping_df.empty
+        else {}
+    )
+
+    blank_prediction_counts = _count_blank_predictions(predictions, day_columns)
+
+    return {
+        "source_month": source_month_label,
+        "prediction_month": prediction_month_label,
+        "model_name": model_name,
+        "prediction_rows": int(len(predictions)),
+        "campaign_rows": int(len(campaign_df)),
+        "mapping_rows": int(len(mapping_df)),
+        "source_risk_counts": source_risk_counts,
+        "source_vertical_counts": source_vertical_counts,
+        "predicted_label_counts": _count_top_labels(predictions, day_columns),
+        "predicted_label_counts_by_day": _count_daywise_labels(predictions, day_columns),
+        "blank_prediction_counts": blank_prediction_counts,
+        "campaign_mode_counts": campaign_mode_counts,
+        "campaign_vendor_counts": campaign_vendor_counts,
+        "campaign_vertical_counts": campaign_vertical_counts,
+        "top_campaign_mapping_counts": mapping_counts_by_campaign,
+    }
+
+
+def write_prediction_summary(
+    *,
+    summary: dict[str, object],
+    output_path: Path,
+    logger: logging.Logger,
+) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+    logger.info("Saved prediction summary | path=%s", output_path)
+    logger.info(
+        "Prediction summary counts | prediction_rows=%s campaign_rows=%s mapping_rows=%s",
+        summary["prediction_rows"],
+        summary["campaign_rows"],
+        summary["mapping_rows"],
+    )
+    return output_path
+
+
 def fetch_communication_extract(
     args: argparse.Namespace,
     output_file: Path,
@@ -350,6 +489,36 @@ def ensure_campaign_table(conn, schema: str, table: str) -> None:
                 modified_at TIMESTAMPTZ NOT NULL,
                 created_by TEXT NOT NULL,
                 modified_by TEXT NOT NULL
+            )
+            """
+        ).format(table_ref=qualified_identifier(schema, table))
+    )
+
+
+def ensure_campaign_mapping_table(conn, schema: str, table: str) -> None:
+    conn.execute(
+        sql.SQL(
+            """
+            CREATE TABLE IF NOT EXISTS {table_ref} (
+                campaign_name TEXT NOT NULL,
+                loan_number TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                date TEXT NOT NULL,
+                time TEXT NOT NULL,
+                vendor TEXT NOT NULL,
+                source_month TEXT NOT NULL,
+                prediction_month TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                emi_cycle INTEGER NOT NULL,
+                risk TEXT NOT NULL,
+                vertical TEXT NOT NULL,
+                campaign_type TEXT NOT NULL,
+                due_type TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                modified_at TIMESTAMPTZ NOT NULL,
+                created_by TEXT NOT NULL,
+                modified_by TEXT NOT NULL,
+                PRIMARY KEY (campaign_name, loan_number)
             )
             """
         ).format(table_ref=qualified_identifier(schema, table))
@@ -673,14 +842,17 @@ def _parse_strategy(strategy: str) -> tuple[str, str, str] | None:
     mode = MODE_BY_STRATEGY_CHANNEL.get(channel.upper())
     if mode is None:
         return None
-    return mode, _format_scheduler_hour(hour_label), language.upper()
+    normalized_language = language.upper().strip()
+    if normalized_language == "REGIONAL":
+        return None
+    return mode, _format_scheduler_hour(hour_label), normalized_language
 
 
 def _due_bucket(day: str) -> tuple[str, str, str]:
     if day in PREDUE_DAYS:
-        return "PRE", "PREDUE", ",".join(PREDUE_DAYS)
+        return "PRE", "PREDUE", day
     if day in POSTDUE_DAYS:
-        return "POST", "POSTDUE", ",".join(POSTDUE_DAYS)
+        return "POST", "POSTDUE", day
     raise ValueError(f"Unsupported campaign day: {day}")
 
 
@@ -703,7 +875,147 @@ def _scheduler_name(
     )
 
 
-def build_campaign_recommendations(
+def _normalize_vendor_token(raw_value: object) -> str | None:
+    if raw_value is None or pd.isna(raw_value):
+        return None
+
+    text = str(raw_value).strip()
+    if not text:
+        return None
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = text
+
+    vendor = str(parsed).strip()
+    if not vendor:
+        return None
+
+    token = vendor.replace("_", "-").split("-", 1)[0].strip().lower()
+    if not token:
+        return None
+
+    alias_map = {
+        "prutech": "prutech",
+        "kaleyra": "kaleyra",
+        "kaylera": "kaleyra",
+    }
+    return alias_map.get(token, token)
+
+
+def _extract_campaign_vendors(raw_value: object) -> list[str]:
+    if raw_value is None:
+        return []
+
+    if isinstance(raw_value, list):
+        items = raw_value
+    elif isinstance(raw_value, dict):
+        items = []
+        for key in ("vendor", "vendors", "name", "value"):
+            if key in raw_value:
+                items.append(raw_value[key])
+    else:
+        if pd.isna(raw_value):
+            return []
+        text = str(raw_value).strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = text
+
+        if isinstance(parsed, (list, dict)):
+            return _extract_campaign_vendors(parsed)
+        items = [part.strip() for part in str(parsed).split(",") if part.strip()]
+
+    vendors: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if isinstance(item, (list, dict)):
+            nested = _extract_campaign_vendors(item)
+            for vendor in nested:
+                if vendor not in seen:
+                    seen.add(vendor)
+                    vendors.append(vendor)
+            continue
+
+        normalized = _normalize_vendor_token(item)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            vendors.append(normalized)
+    return vendors
+
+
+def resolve_campaign_vendors(
+    conn,
+    *,
+    source_schema: str,
+    target_schema: str,
+    fallback_vendor: str,
+    logger: logging.Logger,
+) -> list[str]:
+    candidate_refs: list[sql.Composable] = [sql.Identifier("data_config")]
+    seen = {"data_config"}
+    for schema_name in (source_schema, target_schema):
+        key = f"{schema_name}.data_config"
+        if schema_name and key not in seen:
+            seen.add(key)
+            candidate_refs.append(sql.SQL("{}.{}").format(sql.Identifier(schema_name), sql.Identifier("data_config")))
+
+    for table_ref in candidate_refs:
+        try:
+            row = conn.execute(
+                sql.SQL("SELECT value FROM {} WHERE key_name = %s LIMIT 1").format(table_ref),
+                (VENDOR_CONFIG_KEY,),
+            ).fetchone()
+        except errors.UndefinedTable:
+            conn.rollback()
+            continue
+        except Exception:
+            logger.exception("Vendor lookup failed. Using fallback vendor.")
+            conn.rollback()
+            break
+
+        if not row:
+            continue
+
+        vendors = _extract_campaign_vendors(row[0])
+        if vendors:
+            logger.info("Resolved campaign vendors from data_config | key=%s vendors=%s", VENDOR_CONFIG_KEY, vendors)
+            return vendors
+
+    fallback_vendors = _extract_campaign_vendors(fallback_vendor)
+    if fallback_vendors:
+        logger.warning(
+            "Using fallback campaign vendors | fallback_vendors=%s key=%s",
+            fallback_vendors,
+            VENDOR_CONFIG_KEY,
+        )
+        return fallback_vendors
+    logger.warning(
+        "Using raw fallback campaign vendor | fallback_vendor=%s key=%s",
+        fallback_vendor,
+        VENDOR_CONFIG_KEY,
+    )
+    return [fallback_vendor]
+
+
+def _join_campaign_days(values: pd.Series) -> str:
+    return ",".join(
+        sorted(
+            set(values),
+            key=lambda day: CAMPAIGN_DAY_ORDER.get(day, len(CAMPAIGN_DAY_ORDER)),
+        )
+    )
+
+
+def _join_campaign_times(values: pd.Series) -> str:
+    return ",".join(sorted(set(values)))
+
+
+def _build_campaign_assignment_groups(
     prediction_file: Path,
     *,
     source_month_label: str,
@@ -711,15 +1023,15 @@ def build_campaign_recommendations(
     model_name: str,
     emi_cycle: int,
     vertical: str,
-    vendor: str,
-    run_date: datetime | None = None,
+    vendors: list[str],
+    run_token: str,
 ) -> pd.DataFrame:
     df = pd.read_csv(prediction_file)
     df = df[df["MONTH"] == prediction_month_label].copy()
-    run_token = (run_date or datetime.now(timezone.utc)).strftime("%d%m%y")
     rows: list[dict] = []
 
     for _, row in df.iterrows():
+        loan_number = str(row["Loan_number"])
         risk = str(row.get("SOURCE_RISK", row.get("RISK", "LOW"))).upper()
         risk_code = RISK_CODES.get(risk, "LR")
         for day in [*PREDUE_DAYS, *POSTDUE_DAYS]:
@@ -729,46 +1041,52 @@ def build_campaign_recommendations(
                     continue
                 mode, send_time, language = parsed
                 campaign_type, due_type, campaign_dates = _due_bucket(day)
-                template_name = f"{due_type} AIML {mode} {vertical.upper()} {language}"
+                vertical_value = str(row.get("SOURCE_VERTICAL", row.get("VERTICAL", vertical))).strip().upper()
+                if not vertical_value or vertical_value == "UNKNOWN":
+                    vertical_value = vertical.upper()
+                template_name = f"{due_type} AIML {mode} {vertical_value} {language}"
                 dataset_name = (
-                    f"{due_type} AIML {language} {risk_code} {mode} {vertical.upper()} "
+                    f"{due_type} AIML {language} {risk_code} {mode} {vertical_value} "
                     f"NORMAL FOR EMI {emi_cycle}TH"
                 )
-                name = _scheduler_name(
-                    campaign_type=campaign_type,
-                    mode=mode,
-                    vertical=vertical,
-                    language=language,
-                    emi_cycle=emi_cycle,
-                    vendor=vendor,
-                    risk_code=risk_code,
-                    run_token=run_token,
-                )
-                rows.append(
-                    {
-                        "name": name,
-                        "mode": mode,
-                        "date": campaign_dates,
-                        "time": send_time,
-                        "template_name": template_name,
-                        "dataset_name": dataset_name,
-                        "vendor": vendor,
-                        "active": "T",
-                        "source_month": source_month_label,
-                        "prediction_month": prediction_month_label,
-                        "model_name": model_name,
-                        "emi_cycle": emi_cycle,
-                        "risk": risk_code,
-                        "vertical": vertical.upper(),
-                        "campaign_type": campaign_type,
-                        "due_type": due_type,
-                    }
-                )
+                for vendor in vendors:
+                    base_name = _scheduler_name(
+                        campaign_type=campaign_type,
+                        mode=mode,
+                        vertical=vertical_value,
+                        language=language,
+                        emi_cycle=emi_cycle,
+                        vendor=vendor,
+                        risk_code=risk_code,
+                        run_token=run_token,
+                    )
+                    rows.append(
+                        {
+                            "loan_number": loan_number,
+                            "base_name": base_name,
+                            "mode": mode,
+                            "date": campaign_dates,
+                            "time": send_time,
+                            "template_name": template_name,
+                            "dataset_name": dataset_name,
+                            "vendor": vendor,
+                            "active": "T",
+                            "source_month": source_month_label,
+                            "prediction_month": prediction_month_label,
+                            "model_name": model_name,
+                            "emi_cycle": emi_cycle,
+                            "risk": risk_code,
+                            "vertical": vertical_value,
+                            "campaign_type": campaign_type,
+                            "due_type": due_type,
+                        }
+                    )
 
     if not rows:
         return pd.DataFrame(
             columns=[
-                "name",
+                "loan_number",
+                "base_name",
                 "mode",
                 "date",
                 "time",
@@ -788,13 +1106,199 @@ def build_campaign_recommendations(
         )
 
     result = pd.DataFrame(rows).drop_duplicates()
-    group_cols = [col for col in result.columns if col != "time"]
-    result = (
-        result.groupby(group_cols, as_index=False)["time"]
-        .agg(lambda values: ",".join(sorted(set(values))))
-        .sort_values(["campaign_type", "risk", "mode", "language" if "language" in result.columns else "name"])
+    group_cols = [col for col in result.columns if col != "date"]
+    result = result.groupby(group_cols, as_index=False)["date"].agg(_join_campaign_days)
+
+    group_cols = [col for col in result.columns if col not in {"base_name", "name", "time"}]
+    result = result.groupby(group_cols, as_index=False).agg(
+        {
+            "base_name": "first",
+            "time": _join_campaign_times,
+        }
     )
     return result
+
+
+def _prepare_campaign_outputs(
+    prediction_file: Path,
+    *,
+    source_month_label: str,
+    prediction_month_label: str,
+    model_name: str,
+    emi_cycle: int,
+    vertical: str,
+    vendors: list[str],
+    run_date: datetime | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    run_token = (run_date or datetime.now(timezone.utc)).strftime("%d%m%y")
+    assignment_groups = _build_campaign_assignment_groups(
+        prediction_file,
+        source_month_label=source_month_label,
+        prediction_month_label=prediction_month_label,
+        model_name=model_name,
+        emi_cycle=emi_cycle,
+        vertical=vertical,
+        vendors=vendors,
+        run_token=run_token,
+    )
+    if assignment_groups.empty:
+        empty_campaigns = pd.DataFrame(
+            columns=[
+                "name",
+                "mode",
+                "date",
+                "time",
+                "template_name",
+                "dataset_name",
+                "vendor",
+                "active",
+                "source_month",
+                "prediction_month",
+                "model_name",
+                "emi_cycle",
+                "risk",
+                "vertical",
+                "campaign_type",
+                "due_type",
+            ]
+        )
+        empty_mappings = pd.DataFrame(
+            columns=[
+                "campaign_name",
+                "loan_number",
+                "mode",
+                "date",
+                "time",
+                "vendor",
+                "source_month",
+                "prediction_month",
+                "model_name",
+                "emi_cycle",
+                "risk",
+                "vertical",
+                "campaign_type",
+                "due_type",
+            ]
+        )
+        return empty_campaigns, empty_mappings
+
+    campaigns = assignment_groups.drop(columns=["loan_number"]).drop_duplicates()
+    campaigns = campaigns.sort_values(["base_name", "time", "date"]).reset_index(drop=True)
+    duplicate_index = campaigns.groupby("base_name").cumcount() + 1
+    duplicate_count = campaigns.groupby("base_name")["base_name"].transform("size")
+    campaigns["name"] = campaigns["base_name"]
+    campaigns.loc[duplicate_count > 1, "name"] = (
+        campaigns.loc[duplicate_count > 1, "base_name"] + "_" + duplicate_index.loc[duplicate_count > 1].astype(str)
+    )
+
+    join_cols = [
+        "base_name",
+        "mode",
+        "date",
+        "time",
+        "template_name",
+        "dataset_name",
+        "vendor",
+        "active",
+        "source_month",
+        "prediction_month",
+        "model_name",
+        "emi_cycle",
+        "risk",
+        "vertical",
+        "campaign_type",
+        "due_type",
+    ]
+    mappings = assignment_groups.merge(campaigns[["name", *join_cols]], on=join_cols, how="left")
+    mappings = mappings.rename(columns={"name": "campaign_name"})
+    mappings = mappings[
+        [
+            "campaign_name",
+            "loan_number",
+            "mode",
+            "date",
+            "time",
+            "vendor",
+            "source_month",
+            "prediction_month",
+            "model_name",
+            "emi_cycle",
+            "risk",
+            "vertical",
+            "campaign_type",
+            "due_type",
+        ]
+    ].drop_duplicates()
+
+    campaign_output = campaigns[
+        [
+            "name",
+            "mode",
+            "date",
+            "time",
+            "template_name",
+            "dataset_name",
+            "vendor",
+            "active",
+            "source_month",
+            "prediction_month",
+            "model_name",
+            "emi_cycle",
+            "risk",
+            "vertical",
+            "campaign_type",
+            "due_type",
+        ]
+    ]
+    return campaign_output, mappings
+
+
+def build_campaign_recommendations(
+    prediction_file: Path,
+    *,
+    source_month_label: str,
+    prediction_month_label: str,
+    model_name: str,
+    emi_cycle: int,
+    vertical: str,
+    vendors: list[str],
+    run_date: datetime | None = None,
+) -> pd.DataFrame:
+    campaign_rows, _ = _prepare_campaign_outputs(
+        prediction_file,
+        source_month_label=source_month_label,
+        prediction_month_label=prediction_month_label,
+        model_name=model_name,
+        emi_cycle=emi_cycle,
+        vertical=vertical,
+        vendors=vendors,
+        run_date=run_date,
+    )
+    return campaign_rows
+
+
+def build_campaign_mappings(
+    prediction_file: Path,
+    *,
+    source_month_label: str,
+    prediction_month_label: str,
+    model_name: str,
+    emi_cycle: int,
+    vertical: str,
+    vendors: list[str],
+    run_date: datetime | None = None,
+) -> pd.DataFrame:
+    _, mapping_rows = _prepare_campaign_outputs(
+        prediction_file,
+        source_month_label=source_month_label,
+        prediction_month_label=prediction_month_label,
+        model_name=model_name,
+        emi_cycle=emi_cycle,
+        vertical=vertical,
+        vendors=vendors,
+        run_date=run_date,
+    )
+    return mapping_rows
 
 
 def store_campaign_recommendations(
@@ -885,6 +1389,104 @@ def store_campaign_recommendations(
             dataset_name = EXCLUDED.dataset_name,
             vendor = EXCLUDED.vendor,
             active = EXCLUDED.active,
+            source_month = EXCLUDED.source_month,
+            prediction_month = EXCLUDED.prediction_month,
+            model_name = EXCLUDED.model_name,
+            emi_cycle = EXCLUDED.emi_cycle,
+            risk = EXCLUDED.risk,
+            vertical = EXCLUDED.vertical,
+            campaign_type = EXCLUDED.campaign_type,
+            due_type = EXCLUDED.due_type,
+            modified_at = EXCLUDED.modified_at,
+            modified_by = EXCLUDED.modified_by
+        """
+    ).format(table_ref=qualified_identifier(schema, table))
+    with conn.cursor() as cur:
+        cur.executemany(query, rows)
+    return len(rows)
+
+
+def store_campaign_mappings(
+    conn,
+    schema: str,
+    table: str,
+    mapping_rows: pd.DataFrame,
+    *,
+    source_month_label: str,
+    prediction_month_label: str,
+    model_name: str,
+) -> int:
+    ensure_campaign_mapping_table(conn, schema, table)
+    conn.execute(
+        sql.SQL(
+            """
+            DELETE FROM {table_ref}
+            WHERE source_month = %s
+              AND prediction_month = %s
+              AND model_name = %s
+            """
+        ).format(table_ref=qualified_identifier(schema, table)),
+        (source_month_label, prediction_month_label, model_name),
+    )
+    if mapping_rows.empty:
+        return 0
+
+    now = datetime.now(timezone.utc)
+    actor = "campaign-model"
+    rows = []
+    for _, row in mapping_rows.iterrows():
+        rows.append(
+            (
+                row["campaign_name"],
+                row["loan_number"],
+                row["mode"],
+                row["date"],
+                row["time"],
+                row["vendor"],
+                row["source_month"],
+                row["prediction_month"],
+                row["model_name"],
+                int(row["emi_cycle"]),
+                row["risk"],
+                row["vertical"],
+                row["campaign_type"],
+                row["due_type"],
+                now,
+                now,
+                actor,
+                actor,
+            )
+        )
+
+    query = sql.SQL(
+        """
+        INSERT INTO {table_ref} (
+            campaign_name,
+            loan_number,
+            mode,
+            date,
+            time,
+            vendor,
+            source_month,
+            prediction_month,
+            model_name,
+            emi_cycle,
+            risk,
+            vertical,
+            campaign_type,
+            due_type,
+            created_at,
+            modified_at,
+            created_by,
+            modified_by
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (campaign_name, loan_number)
+        DO UPDATE SET
+            mode = EXCLUDED.mode,
+            date = EXCLUDED.date,
+            time = EXCLUDED.time,
+            vendor = EXCLUDED.vendor,
             source_month = EXCLUDED.source_month,
             prediction_month = EXCLUDED.prediction_month,
             model_name = EXCLUDED.model_name,
@@ -1050,6 +1652,13 @@ def main() -> None:
                     password=args.password,
                 )
                 with connect_db(config) as conn:
+                    campaign_vendors = resolve_campaign_vendors(
+                        conn,
+                        source_schema=args.source_schema,
+                        target_schema=args.target_schema,
+                        fallback_vendor=args.campaign_vendor,
+                        logger=logger,
+                    )
                     feature_rows = store_feature_snapshots(
                         conn,
                         args.target_schema,
@@ -1065,14 +1674,14 @@ def main() -> None:
                         prediction_month_label,
                         args.model,
                     )
-                    campaign_df = build_campaign_recommendations(
+                    campaign_df, mapping_df = _prepare_campaign_outputs(
                         prediction_file,
                         source_month_label=source_month_label,
                         prediction_month_label=prediction_month_label,
                         model_name=args.model,
                         emi_cycle=resolve_emi_cycle(args.config_file, os.getenv("EMI_CYCLE", ""))[0],
                         vertical=args.campaign_vertical,
-                        vendor=args.campaign_vendor,
+                        vendors=campaign_vendors,
                     )
                     campaign_rows = store_campaign_recommendations(
                         conn,
@@ -1083,13 +1692,49 @@ def main() -> None:
                         prediction_month_label=prediction_month_label,
                         model_name=args.model,
                     )
+                    mapping_rows = store_campaign_mappings(
+                        conn,
+                        args.target_schema,
+                        args.campaign_mapping_table,
+                        mapping_df,
+                        source_month_label=source_month_label,
+                        prediction_month_label=prediction_month_label,
+                        model_name=args.model,
+                    )
                     conn.commit()
                 print(f"Stored {feature_rows:,} feature snapshots in Postgres")
                 print(f"Stored {prediction_rows:,} prediction snapshots in Postgres")
                 print(f"Stored {campaign_rows:,} campaign recommendation snapshots in Postgres")
+                print(f"Stored {mapping_rows:,} campaign mapping snapshots in Postgres")
+        else:
+            campaign_vendors = []
+            campaign_df, mapping_df = _prepare_campaign_outputs(
+                prediction_file,
+                source_month_label=source_month_label,
+                prediction_month_label=prediction_month_label,
+                model_name=args.model,
+                emi_cycle=resolve_emi_cycle(args.config_file, os.getenv("EMI_CYCLE", ""))[0],
+                vertical=args.campaign_vertical,
+                vendors=_extract_campaign_vendors(args.campaign_vendor) or [args.campaign_vendor],
+            )
+
+        summary = build_prediction_summary(
+            prediction_file=prediction_file,
+            source_month_label=source_month_label,
+            prediction_month_label=prediction_month_label,
+            model_name=args.model,
+            campaign_df=campaign_df,
+            mapping_df=mapping_df,
+        )
+        summary_path = write_prediction_summary(
+            summary=summary,
+            output_path=prediction_summary_path(args.predict_month),
+            logger=logger,
+        )
 
         print(f"Prediction file: {prediction_file}")
         print(f"Metrics file: {metrics_file}")
+        print(f"Prediction summary: {summary_path}")
         write_pipeline_audit(
             args,
             status="SUCCESS",

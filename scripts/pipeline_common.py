@@ -7,7 +7,7 @@ import pandas as pd
 
 
 DAY_COLUMNS = ["D-5", "D-4", "D-3", "D-2", "D-1", "D+1", "D+2", "D+3", "D+4", "D+5"]
-NON_FEATURE_COLUMNS = DAY_COLUMNS + ["TARGET_MONTH", "TARGET_MONTH_PERIOD", "TARGET_RISK"]
+NON_FEATURE_COLUMNS = DAY_COLUMNS + ["TARGET_MONTH", "TARGET_MONTH_PERIOD", "TARGET_RISK", "VERTICAL"]
 RISK_TOP_K = {
     "LOW": 1,
     "MEDIUM": 2,
@@ -65,7 +65,7 @@ def build_rolling_feature_windows(
     numeric_columns = [
         col
         for col in features.columns
-        if col not in {"APAC_CARD_NUMBER", "MONTH", "RISK", "MONTH_PERIOD"}
+        if col not in {"APAC_CARD_NUMBER", "MONTH", "RISK", "VERTICAL", "MONTH_PERIOD"}
     ]
     if features.empty:
         return features[["APAC_CARD_NUMBER", "MONTH", *numeric_columns, "RISK"]].copy()
@@ -83,6 +83,9 @@ def build_rolling_feature_windows(
         rolled["MONTH_PERIOD"].dt.to_timestamp().dt.strftime("%b-%Y").str.upper()
     )
     rolled["RISK"] = features["RISK"].fillna("UNKNOWN").astype(str).str.upper().values
+    if "VERTICAL" in features.columns:
+        rolled["VERTICAL"] = features["VERTICAL"].fillna("UNKNOWN").astype(str).str.upper().values
+        return rolled[["APAC_CARD_NUMBER", "MONTH", *numeric_columns, "RISK", "VERTICAL"]]
     return rolled[["APAC_CARD_NUMBER", "MONTH", *numeric_columns, "RISK"]]
 
 
@@ -130,7 +133,7 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
         columns=["SOURCE_MONTH", "RISK"],
         dummy_na=False,
     )
-    feature_df = feature_df.drop(columns=["APAC_CARD_NUMBER", "SOURCE_MONTH_PERIOD"], errors="ignore")
+    feature_df = feature_df.drop(columns=["APAC_CARD_NUMBER", "SOURCE_MONTH_PERIOD", "VERTICAL"], errors="ignore")
     return feature_df.fillna(0)
 
 

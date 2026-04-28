@@ -19,8 +19,10 @@ if str(SRC_DIR) not in sys.path:
 from fetch_month_from_postgres import emi_cycle_dates, month_bounds, resolve_emi_cycle
 from generate_strategy_dataset import bucket_send_hour, candidate_hours as dataset_candidate_hours, process_chunk
 from run_monthly_inference_pipeline import (
+    build_campaign_mappings,
     build_campaign_recommendations,
     month_label,
+    resolve_campaign_vendors,
     selected_history_files,
     validate_month_pair,
 )
@@ -199,24 +201,190 @@ def test_build_campaign_recommendations_groups_unique_scheduler_rows(tmp_path: P
         model_name="catboost_3m",
         emi_cycle=5,
         vertical="LAP",
-        vendor="prutech-cpass",
+        vendors=["prutech", "kaleyra"],
         run_date=pd.Timestamp("2026-04-08").to_pydatetime(),
     )
 
-    sms_pre = output[
-        (output["name"] == "PRE_AIML_NORMAL_SMS_LAP_HINDI_5TH_PRUTECH_CPASS_HR_080426")
+    sms_pre_one = output[
+        (output["name"] == "PRE_AIML_NORMAL_SMS_LAP_HINDI_5TH_PRUTECH_HR_080426_1")
     ].iloc[0]
-    assert sms_pre["mode"] == "SMS"
-    assert sms_pre["date"] == "D-5,D-4,D-3,D-2,D-1"
-    assert sms_pre["time"] == "09:00:00,10:00:00"
-    assert sms_pre["template_name"] == "PREDUE AIML SMS LAP HINDI"
-    assert sms_pre["dataset_name"] == "PREDUE AIML HINDI HR SMS LAP NORMAL FOR EMI 5TH"
-    assert sms_pre["vendor"] == "prutech-cpass"
-    assert sms_pre["active"] == "T"
+    assert sms_pre_one["mode"] == "SMS"
+    assert sms_pre_one["date"] == "D-5"
+    assert sms_pre_one["time"] == "09:00:00"
+    assert sms_pre_one["template_name"] == "PREDUE AIML SMS LAP HINDI"
+    assert sms_pre_one["dataset_name"] == "PREDUE AIML HINDI HR SMS LAP NORMAL FOR EMI 5TH"
+    assert sms_pre_one["vendor"] == "prutech"
+    assert sms_pre_one["active"] == "T"
 
-    assert "POST_AIML_NORMAL_SMS_LAP_HINDI_5TH_PRUTECH_CPASS_HR_080426" in set(output["name"])
-    assert "PRE_AIML_NORMAL_WA_LAP_HINDI_5TH_PRUTECH_CPASS_HR_080426" in set(output["name"])
-    assert "PRE_AIML_NORMAL_IVR_LAP_HINDI_5TH_PRUTECH_CPASS_HR_080426" in set(output["name"])
+    sms_pre_two = output[
+        (output["name"] == "PRE_AIML_NORMAL_SMS_LAP_HINDI_5TH_PRUTECH_HR_080426_2")
+    ].iloc[0]
+    assert sms_pre_two["date"] == "D-4"
+    assert sms_pre_two["time"] == "10:00:00"
+
+    assert "POST_AIML_NORMAL_SMS_LAP_HINDI_5TH_PRUTECH_HR_080426" in set(output["name"])
+    assert "PRE_AIML_NORMAL_WA_LAP_HINDI_5TH_PRUTECH_HR_080426" in set(output["name"])
+    assert "PRE_AIML_NORMAL_IVR_LAP_HINDI_5TH_PRUTECH_HR_080426" in set(output["name"])
+    assert "PRE_AIML_NORMAL_SMS_LAP_HINDI_5TH_KALEYRA_HR_080426_1" in set(output["name"])
+
+
+def test_build_campaign_recommendations_groups_same_time_across_days(tmp_path: Path) -> None:
+    prediction_file = tmp_path / "predictions_same_time.csv"
+    pd.DataFrame(
+        {
+            "SOURCE_RISK": ["HIGH"],
+            "Loan_number": ["L1"],
+            "SOURCE_MONTH_USED": ["APR-2026"],
+            "MONTH": ["MAY-2026"],
+            "D-5": ["SMS-9AM-HINDI"],
+            "D-4": ["-"],
+            "D-3": ["SMS-9AM-HINDI"],
+            "D-2": ["-"],
+            "D-1": ["-"],
+            "D": ["-"],
+            "D+1": ["-"],
+            "D+2": ["-"],
+            "D+3": ["-"],
+            "D+4": ["-"],
+            "D+5": ["-"],
+        }
+    ).to_csv(prediction_file, index=False)
+
+    output = build_campaign_recommendations(
+        prediction_file,
+        source_month_label="APR-2026",
+        prediction_month_label="MAY-2026",
+        model_name="catboost_3m",
+        emi_cycle=5,
+        vertical="LAP",
+        vendors=["prutech"],
+        run_date=pd.Timestamp("2026-04-08").to_pydatetime(),
+    )
+
+    assert len(output) == 1
+    row = output.iloc[0]
+    assert row["name"] == "PRE_AIML_NORMAL_SMS_LAP_HINDI_5TH_PRUTECH_HR_080426"
+    assert row["date"] == "D-5,D-3"
+    assert row["time"] == "09:00:00"
+
+
+def test_build_campaign_recommendations_groups_same_day_set_across_times(tmp_path: Path) -> None:
+    prediction_file = tmp_path / "predictions_same_day_set.csv"
+    pd.DataFrame(
+        {
+            "SOURCE_RISK": ["HIGH"],
+            "Loan_number": ["L1"],
+            "SOURCE_MONTH_USED": ["APR-2026"],
+            "MONTH": ["MAY-2026"],
+            "D-5": ["SMS-9AM-HINDI|SMS-10AM-HINDI"],
+            "D-4": ["SMS-9AM-HINDI|SMS-10AM-HINDI"],
+            "D-3": ["-"],
+            "D-2": ["-"],
+            "D-1": ["-"],
+            "D": ["-"],
+            "D+1": ["-"],
+            "D+2": ["-"],
+            "D+3": ["-"],
+            "D+4": ["-"],
+            "D+5": ["-"],
+        }
+    ).to_csv(prediction_file, index=False)
+
+    output = build_campaign_recommendations(
+        prediction_file,
+        source_month_label="APR-2026",
+        prediction_month_label="MAY-2026",
+        model_name="catboost_3m",
+        emi_cycle=5,
+        vertical="LAP",
+        vendors=["prutech"],
+        run_date=pd.Timestamp("2026-04-08").to_pydatetime(),
+    )
+
+    assert len(output) == 1
+    row = output.iloc[0]
+    assert row["name"] == "PRE_AIML_NORMAL_SMS_LAP_HINDI_5TH_PRUTECH_HR_080426"
+    assert row["date"] == "D-5,D-4"
+    assert row["time"] == "09:00:00,10:00:00"
+
+
+def test_build_campaign_mappings_links_accounts_to_grouped_campaign_rows(tmp_path: Path) -> None:
+    prediction_file = tmp_path / "predictions_mapping.csv"
+    pd.DataFrame(
+        {
+            "SOURCE_RISK": ["HIGH", "HIGH"],
+            "Loan_number": ["L1", "L2"],
+            "SOURCE_MONTH_USED": ["APR-2026", "APR-2026"],
+            "MONTH": ["MAY-2026", "MAY-2026"],
+            "D-5": ["SMS-9AM-HINDI|SMS-10AM-HINDI", "SMS-9AM-HINDI|SMS-10AM-HINDI"],
+            "D-4": ["SMS-9AM-HINDI|SMS-10AM-HINDI", "SMS-9AM-HINDI|SMS-10AM-HINDI"],
+            "D-3": ["-", "-"],
+            "D-2": ["-", "-"],
+            "D-1": ["-", "-"],
+            "D": ["-", "-"],
+            "D+1": ["-", "-"],
+            "D+2": ["-", "-"],
+            "D+3": ["-", "-"],
+            "D+4": ["-", "-"],
+            "D+5": ["-", "-"],
+        }
+    ).to_csv(prediction_file, index=False)
+
+    mappings = build_campaign_mappings(
+        prediction_file,
+        source_month_label="APR-2026",
+        prediction_month_label="MAY-2026",
+        model_name="catboost_3m",
+        emi_cycle=5,
+        vertical="LAP",
+        vendors=["prutech"],
+        run_date=pd.Timestamp("2026-04-08").to_pydatetime(),
+    )
+
+    assert len(mappings) == 2
+    assert set(mappings["campaign_name"]) == {"PRE_AIML_NORMAL_SMS_LAP_HINDI_5TH_PRUTECH_HR_080426"}
+    assert set(mappings["loan_number"]) == {"L1", "L2"}
+    assert set(mappings["date"]) == {"D-5,D-4"}
+    assert set(mappings["time"]) == {"09:00:00,10:00:00"}
+
+
+def test_build_campaign_recommendations_skips_regional_language(tmp_path: Path) -> None:
+    prediction_file = tmp_path / "predictions.csv"
+    pd.DataFrame(
+        {
+            "SOURCE_RISK": ["HIGH"],
+            "Loan_number": ["L1"],
+            "SOURCE_MONTH_USED": ["APR-2026"],
+            "MONTH": ["MAY-2026"],
+            "D-5": ["SMS-9AM-REGIONAL|SMS-10AM-HINDI"],
+            "D-4": ["-"],
+            "D-3": ["-"],
+            "D-2": ["-"],
+            "D-1": ["-"],
+            "D": ["-"],
+            "D+1": ["-"],
+            "D+2": ["-"],
+            "D+3": ["-"],
+            "D+4": ["-"],
+            "D+5": ["-"],
+        }
+    ).to_csv(prediction_file, index=False)
+
+    output = build_campaign_recommendations(
+        prediction_file,
+        source_month_label="APR-2026",
+        prediction_month_label="MAY-2026",
+        model_name="catboost_3m",
+        emi_cycle=5,
+        vertical="LAP",
+        vendors=["prutech"],
+        run_date=pd.Timestamp("2026-04-08").to_pydatetime(),
+    )
+
+    assert "PRE_AIML_NORMAL_SMS_LAP_HINDI_5TH_PRUTECH_HR_080426" in set(output["name"])
+    assert not any("REGIONAL" in name for name in output["name"])
+    assert not any(output["template_name"].str.contains("REGIONAL", na=False))
+    assert not any(output["dataset_name"].str.contains("REGIONAL", na=False))
 
 
 def test_build_feature_matrix_removes_identifiers_and_one_hot_encodes() -> None:
@@ -239,6 +407,52 @@ def test_build_feature_matrix_removes_identifiers_and_one_hot_encodes() -> None:
     assert "SOURCE_MONTH_APR-2026" in matrix.columns
     assert "RISK_HIGH" in matrix.columns
     assert matrix.loc[0, "SMS_TOTAL_INTENSITY"] == 3
+
+
+def test_resolve_campaign_vendors_reads_all_vendors_from_json_list() -> None:
+    class DummyResult:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class DummyConn:
+        def execute(self, query, params):
+            return DummyResult(('["KALEYRA", "PRUTECH-CPASS", "prutech"]',))
+
+    vendors = resolve_campaign_vendors(
+        DummyConn(),
+        source_schema="digital_collections",
+        target_schema="digital_collections",
+        fallback_vendor="prutech-cpass",
+        logger=__import__("logging").getLogger("test_vendor"),
+    )
+
+    assert vendors == ["kaleyra", "prutech"]
+
+
+def test_resolve_campaign_vendors_normalizes_csv_vendor_variants() -> None:
+    class DummyResult:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class DummyConn:
+        def execute(self, query, params):
+            return DummyResult(("prutech-cpass,prutech,kaleyra",))
+
+    vendors = resolve_campaign_vendors(
+        DummyConn(),
+        source_schema="digital_collections",
+        target_schema="digital_collections",
+        fallback_vendor="prutech-cpass",
+        logger=__import__("logging").getLogger("test_vendor"),
+    )
+
+    assert vendors == ["prutech", "kaleyra"]
 
 
 def test_predict_top_k_by_risk_uses_bucket_quota() -> None:

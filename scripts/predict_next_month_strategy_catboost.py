@@ -145,12 +145,16 @@ def main() -> None:
             logger.info("Prediction matrix | shape=%s", X_pred.shape)
 
         with log_step(logger, "predict_day_columns", rows=len(X_pred)):
-            prediction_output = prediction_rows[["APAC_CARD_NUMBER", "SOURCE_MONTH", "RISK"]].copy()
+            base_columns = ["APAC_CARD_NUMBER", "SOURCE_MONTH", "RISK"]
+            if "VERTICAL" in prediction_rows.columns:
+                base_columns.append("VERTICAL")
+            prediction_output = prediction_rows[base_columns].copy()
             prediction_output = prediction_output.rename(
                 columns={
                     "APAC_CARD_NUMBER": "Loan_number",
                     "SOURCE_MONTH": "SOURCE_MONTH_USED",
                     "RISK": "SOURCE_RISK",
+                    "VERTICAL": "SOURCE_VERTICAL",
                 }
             )
 
@@ -175,6 +179,7 @@ def main() -> None:
             prediction_output = prediction_output[
                 [
                     "SOURCE_RISK",
+                    "SOURCE_VERTICAL",
                     "Loan_number",
                     "SOURCE_MONTH_USED",
                     "MONTH",
