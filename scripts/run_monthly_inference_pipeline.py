@@ -18,6 +18,7 @@ from env_utils import load_dotenv
 from pipeline_common import resolve_emi_cycle
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
 from project_paths import (
+    CASE_DATA_DIR,
     COMMUNICATION_DATA_DIR,
     FEATURE_DATA_DIR,
     LOG_DIR,
@@ -224,6 +225,11 @@ def monthly_extract_file(month: str) -> Path:
     return COMMUNICATION_DATA_DIR / f"mfl_recomm_model_{token}_comm_data.csv"
 
 
+def current_cases_file(source_month: str) -> Path:
+    token = month_file_token(parse_month(source_month))
+    return CASE_DATA_DIR / f"digital_cases_{token}.csv"
+
+
 def selected_history_files(source_month: str, latest_file: Path) -> list[Path]:
     source_period = parse_month(source_month)
     previous_periods = [source_period - 2, source_period - 1]
@@ -397,6 +403,31 @@ def fetch_communication_extract(
         args.source_schema,
         "--table",
         args.source_table,
+        "--fetch-month",
+        fetch_month,
+        "--output-file",
+        str(output_file),
+        logger=logger,
+        env_updates={
+            "PGHOST": args.host,
+            "PGPORT": str(args.port),
+            "PGDATABASE": args.dbname,
+            "PGUSER": args.user,
+            "PGPASSWORD": args.password,
+        },
+    )
+
+
+def fetch_current_cases_extract(
+    args: argparse.Namespace,
+    output_file: Path,
+    fetch_month: str,
+    logger: logging.Logger,
+) -> None:
+    run_python_script(
+        "fetch_cases_from_postgres.py",
+        "--schema",
+        args.source_schema,
         "--fetch-month",
         fetch_month,
         "--output-file",
@@ -1520,6 +1551,7 @@ def main() -> None:
     source_month_label = month_label(args.source_month)
     prediction_month_label = month_label(args.predict_month)
     source_extract_file = latest_extract_file(args.source_month)
+    source_cases_file = current_cases_file(args.source_month)
 
     try:
         source_period = parse_month(args.source_month)
@@ -1531,6 +1563,8 @@ def main() -> None:
         with log_step(logger, "fetch_communication_history", source_month=args.source_month):
             for fetch_month, output_file in history_fetches:
                 fetch_communication_extract(args, output_file, fetch_month, logger)
+        with log_step(logger, "fetch_current_cases", source_month=args.source_month):
+            fetch_current_cases_extract(args, source_cases_file, args.source_month, logger)
 
         if not csv_has_rows(source_extract_file):
             logger.warning("No latest communication rows found. Skipping prediction run.")
@@ -1610,6 +1644,8 @@ def main() -> None:
                     str(model_file),
                     "--prediction-file",
                     str(prediction_file),
+                    "--base-population-file",
+                    str(source_cases_file),
                     "--prediction-source-months",
                     source_month_label,
                     logger=logger,

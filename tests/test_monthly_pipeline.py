@@ -31,6 +31,7 @@ from train_next_month_strategy_model_catboost import (
     build_rolling_feature_windows,
     predict_top_k_by_risk,
 )
+from predict_next_month_strategy_catboost import build_prediction_population
 from campaign_recommendation.recommend import RecommendationPolicy, candidate_hours, generate_candidates
 
 
@@ -481,3 +482,39 @@ def test_predict_top_k_by_risk_uses_bucket_quota() -> None:
         "SMS-9AM-ENGLISH|WH-10AM-HINDI",
         "WH-10AM-HINDI|SMS-9AM-ENGLISH|-",
     ]
+
+
+def test_build_prediction_population_keeps_base_accounts_without_history() -> None:
+    dataset = pd.DataFrame(
+        {
+            "APAC_CARD_NUMBER": ["A1"],
+            "SOURCE_MONTH": ["APR-2026"],
+            "SOURCE_MONTH_PERIOD": [pd.Period("2026-04", freq="M")],
+            "RISK": ["HIGH"],
+            "VERTICAL": ["LAP"],
+            "SMS_TOTAL_INTENSITY": [3],
+            "TARGET_MONTH": [pd.NA],
+            "TARGET_MONTH_PERIOD": [pd.Period("2026-05", freq="M")],
+            "TARGET_RISK": [pd.NA],
+            "D-5": [pd.NA],
+        }
+    )
+    base_population = pd.DataFrame(
+        {
+            "APAC_CARD_NUMBER": ["A1", "A2"],
+            "SOURCE_MONTH": ["APR-2026", "APR-2026"],
+            "RISK": ["HIGH", "LOW"],
+            "VERTICAL": ["LAP", "BUSINESS LOAN"],
+            "collectable_amount": [100.0, 50.0],
+            "emi_date": ["05/04/2026", "05/04/2026"],
+        }
+    )
+
+    with_history, without_history = build_prediction_population(
+        dataset=dataset,
+        base_population=base_population,
+        prediction_source_month="APR-2026",
+    )
+
+    assert with_history["APAC_CARD_NUMBER"].tolist() == ["A1"]
+    assert without_history["APAC_CARD_NUMBER"].tolist() == ["A2"]
