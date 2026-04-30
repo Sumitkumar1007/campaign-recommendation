@@ -24,6 +24,7 @@ dist/
 !.env.example
 
 # Raw/processed data and large generated artifacts
+training-data/mfl_last_6_months_communication_data.csv
 data/communication/
 data/training/
 data/features/
