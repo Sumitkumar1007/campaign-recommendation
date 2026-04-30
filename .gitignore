@@ -28,6 +28,7 @@ data/communication/
 data/training/
 data/features/
 data/schedules/
+data/cases/
 *.joblib
 *.cbm
 *_predictions_*.csv
