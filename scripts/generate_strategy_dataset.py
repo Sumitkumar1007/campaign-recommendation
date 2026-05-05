@@ -225,10 +225,32 @@ def process_chunk(
     month_dates = df["emi_date"] if month_source == "emi_date" else created_ts.dt.normalize()
     df["MONTH"] = month_dates.dt.strftime("%b-%Y").str.upper()
     df["DAY"] = df["offset"].map(day_label)
-    df["IS_SUCCESS"] = df.apply(
-        lambda row: row["STATUS"] in SUCCESS_STATUS_MAP[row["COMM_TYPE"]],
-        axis=1,
+    status_map = {key: set(values) for key, values in SUCCESS_STATUS_MAP.items()}
+    df["IS_SUCCESS"] = False
+    for comm_type, success_statuses in status_map.items():
+        type_mask = df["COMM_TYPE"].eq(comm_type)
+        if type_mask.any():
+            df.loc[type_mask, "IS_SUCCESS"] = df.loc[type_mask, "STATUS"].isin(success_statuses)
+
+    unknown_status = (
+        df["COMM_TYPE"].isin(status_map)
+        & df["STATUS"].ne("")
+        & ~df["IS_SUCCESS"]
     )
+    if unknown_status.any():
+        unknown_counts = (
+            df.loc[unknown_status]
+            .groupby(["COMM_TYPE", "STATUS"], sort=False)
+            .size()
+            .reset_index(name="count")
+        )
+        print(
+            "Observed non-success statuses in chunk: "
+            + ", ".join(
+                f"{row.COMM_TYPE}:{row.STATUS}={row.count}"
+                for row in unknown_counts.itertuples(index=False)
+            )
+        )
 
     totals = (
         df.groupby(["APAC_CARD_NUMBER", "MONTH", "DAY", "COMM_TYPE"], sort=False)
