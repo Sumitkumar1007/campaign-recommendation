@@ -127,6 +127,7 @@ Monthly inference variables:
 ```bash
 MODEL_NAME=catboost_3m
 FEATURE_MONTH_SOURCE=emi_date
+modelserving=local
 CAMPAIGN_VERTICAL=LAP
 CAMPAIGN_VENDOR=prutech-cpass
 ```
@@ -146,6 +147,7 @@ MLflow variables:
 MLFLOW_TRACKING_URI=http://your_mlflow_host:5000
 MLFLOW_EXPERIMENT_NAME=campaign-recommendation
 MLFLOW_REGISTERED_MODEL_NAME=campaign_next_month_catboost_3m
+MLFLOW_MODEL_URI=models:/campaign_next_month_catboost_3m@production
 MLFLOW_RUN_NAME=catboost-3m-may-2026-v1
 ```
 
@@ -177,13 +179,28 @@ source venv/bin/activate
 python scripts/run_monthly_inference_pipeline.py
 ```
 
+To load the model bundle from MLflow Registry instead of a local joblib file:
+
+```bash
+source venv/bin/activate
+
+SOURCE_MONTH=2026-04 \
+PREDICT_MONTH=2026-05 \
+MODEL_NAME=catboost_3m \
+modelserving=mlflow \
+MLFLOW_TRACKING_URI=http://your_mlflow_host:5000 \
+MLFLOW_MODEL_URI=models:/campaign_next_month_catboost_3m@production \
+FEATURE_MONTH_SOURCE=emi_date \
+python scripts/run_monthly_inference_pipeline.py
+```
+
 The script reads these values from env:
 
 ```text
 PGHOST, PGPORT, PGDATABASE, PGUSER, PGPASSWORD
 SOURCE_SCHEMA, SOURCE_TABLE
 TARGET_SCHEMA, FEATURE_TABLE, PREDICTION_TABLE, AUDIT_TABLE, CAMPAIGN_TABLE
-MODEL_NAME, FEATURE_MONTH_SOURCE
+MODEL_NAME, MODEL_SERVING, MLFLOW_MODEL_URI, FEATURE_MONTH_SOURCE
 ```
 
 The pipeline does this:
@@ -195,7 +212,7 @@ The pipeline does this:
 5. Rebuilds schedule targets.
 6. Rebuilds monthly features with source `risk` from communications.
 7. Rolls the latest three months of features per APAC/account.
-8. Loads the saved model bundle.
+8. Loads the saved model bundle from local artifacts or MLflow Registry.
 9. Predicts schedules for `PREDICT_MONTH`.
 10. Saves prediction CSV under `artifacts/predictions/`.
 11. Stores processed feature snapshots in Postgres.

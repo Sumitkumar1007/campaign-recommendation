@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -139,6 +140,20 @@ def parse_args() -> argparse.Namespace:
         choices=["catboost", "catboost_3m", "logistic"],
         default=os.getenv("MODEL_NAME", "catboost_3m"),
         help="Which next-month model pipeline to run.",
+    )
+    parser.add_argument(
+        "--model-serving",
+        choices=["local", "mlflow"],
+        default=os.getenv("MODEL_SERVING", os.getenv("modelserving", "local")).lower(),
+        help="Load model from local artifacts or download the bundle from MLflow registry.",
+    )
+    parser.add_argument(
+        "--mlflow-model-uri",
+        default=os.getenv(
+            "MLFLOW_MODEL_URI",
+            f"models:/{os.getenv('MLFLOW_REGISTERED_MODEL_NAME', 'campaign_next_month_catboost_3m')}@production",
+        ),
+        help="MLflow model URI used when --model-serving=mlflow.",
     )
     parser.add_argument(
         "--feature-month-source",
@@ -456,6 +471,28 @@ def run_python_script(
     if logger:
         logger.info("Running child script | script=%s args=%s", script_name, list(script_args))
     subprocess.run(cmd, check=True, cwd=SCRIPTS_DIR.parent, env=env)
+
+
+def download_mlflow_model_bundle(model_uri: str, target_file: Path, logger: logging.Logger) -> Path:
+    try:
+        import mlflow
+    except ImportError as exc:
+        raise RuntimeError("MLflow model serving requires mlflow. Install project dependencies first.") from exc
+
+    tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
+    if tracking_uri:
+        mlflow.set_tracking_uri(tracking_uri)
+
+    logger.info("Downloading MLflow model bundle | model_uri=%s target_file=%s", model_uri, target_file)
+    local_dir = Path(mlflow.artifacts.download_artifacts(model_uri))
+    joblib_files = sorted(local_dir.rglob("*.joblib"))
+    if not joblib_files:
+        raise FileNotFoundError(f"No .joblib model bundle found in downloaded MLflow model: {local_dir}")
+
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(joblib_files[0], target_file)
+    logger.info("Downloaded MLflow model bundle | source=%s target=%s", joblib_files[0], target_file)
+    return target_file
 
 
 def ensure_feature_table(conn, schema: str, table: str) -> None:
@@ -1627,10 +1664,18 @@ def main() -> None:
             )
             model_file = MODEL_DIR / f"next_month_strategy_{model_suffix}.joblib"
             metrics_file = METRICS_DIR / f"next_month_strategy_{model_suffix}_metrics.json"
+            if args.model_serving == "mlflow":
+                with log_step(
+                    logger,
+                    "download_mlflow_model_bundle",
+                    model_uri=args.mlflow_model_uri,
+                    model_file=model_file,
+                ):
+                    download_mlflow_model_bundle(args.mlflow_model_uri, model_file, logger)
             if not model_file.exists():
                 raise FileNotFoundError(
                     f"CatBoost model bundle not found: {model_file}. "
-                    "Train the CatBoost model once before running monthly inference."
+                    "Train the CatBoost model once or set MODEL_SERVING=mlflow and MLFLOW_MODEL_URI."
                 )
             with log_step(
                 logger,
