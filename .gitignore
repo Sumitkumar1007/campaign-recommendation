@@ -52,6 +52,12 @@ artifacts/explanations/*
 artifacts/mlruns/
 mlruns/
 
+# Local Airflow runtime
+airflow/*
+!airflow/dags/
+airflow/dags/*
+!airflow/dags/*.py
+
 # Keep lightweight analysis outputs created for review.
 !artifacts/analysis/
 !artifacts/analysis/*.md
