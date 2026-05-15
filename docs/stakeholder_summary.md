@@ -55,6 +55,7 @@ The project currently produces:
 - day-wise recommendation calendar
 - bucket count summaries
 - account-level explanation outputs
+- rank-aware business reasons for each recommended or alternate campaign option
 - benchmark reports
 - technical implementation and deployment guide
 
@@ -65,6 +66,7 @@ The collections team can use the output to:
 - decide which channels to use on each EMI-relative day
 - control communication intensity by risk bucket
 - identify blank days where no prior day-level signal exists
+- understand whether a campaign is the primary recommendation or an alternate option
 - view strategy mix counts across risk buckets
 
 ## Current Status

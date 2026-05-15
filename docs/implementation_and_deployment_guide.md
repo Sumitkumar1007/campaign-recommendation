@@ -473,7 +473,17 @@ Output:
 
 - daily strategy calendar
 - selected communications per day
-- optional explanation payload
+- `prediction_reason` payload with one business-readable reason per day
+
+
+### Prediction Reason Storage
+
+Monthly inference writes rank-aware business reasons into:
+
+- `ai_ml_recommendations_data.prediction_reason` as JSONB keyed by `D-5` through `D+5`
+- `ai_ml_campaign_mapping.prediction_reason` as text for the mapped campaign day(s)
+
+The reason text follows the strategy rank order. If the payload starts with `-`, no campaign is the primary recommendation and any following campaign is described as an alternate option. If the payload starts with a campaign, that campaign is described as recommended.
 
 ## 19. GitHub And Versioning
 
@@ -547,6 +557,6 @@ This project now supports:
 - channel-aware success logic
 - weighted engagement-aware training
 - benchmarked model selection
-- Extra Trees as the current production default
-- batch inference and account-level explanation
+- CatBoost 3-month next-month model as the current production default
+- batch inference, account-level explanation, and rank-aware prediction reasons
 - saved model artifact and reproducible CLI workflow

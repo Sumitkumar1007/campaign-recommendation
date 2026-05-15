@@ -147,17 +147,6 @@ def _strategy_parts(label: str) -> tuple[str, str, str] | None:
     return normalized_channel, hour.upper(), language.upper()
 
 
-def _strongest_signal(row: pd.Series, contains: str) -> tuple[str, float]:
-    candidates = {
-        column: _safe_numeric(row.get(column))
-        for column in row.index
-        if contains in column and _safe_numeric(row.get(column)) > 0
-    }
-    if not candidates:
-        return "", 0.0
-    return max(candidates.items(), key=lambda item: (item[1], item[0]))
-
-
 def _matching_success_signal(row: pd.Series, label: str) -> tuple[str, float]:
     parts = _strategy_parts(label)
     if not parts:
@@ -166,21 +155,6 @@ def _matching_success_signal(row: pd.Series, label: str) -> tuple[str, float]:
     column = f"{channel}_SUCCESS_{hour}_{language}"
     value = _safe_numeric(row.get(column))
     return (column, value) if value > 0 else ("", 0.0)
-
-
-def _prediction_probability(
-    probability_details: dict[str, tuple[list[str], object]],
-    day: str,
-    row_idx: int,
-    label: str,
-) -> float | None:
-    if day not in probability_details:
-        return None
-    classes, probabilities = probability_details[day]
-    if label not in classes:
-        return None
-    class_idx = classes.index(label)
-    return float(probabilities[row_idx][class_idx])
 
 
 def _readable_strategy(label: str) -> str:
@@ -192,53 +166,8 @@ def _readable_strategy(label: str) -> str:
     return f"{channel_name} at {hour} in {language.title()}"
 
 
-def _readable_signal(signal: str) -> str:
-    parts = signal.split("_", 3)
-    channel_name = {"SMS": "SMS", "WH": "WhatsApp", "VOICE": "voice call"}.get(parts[0], parts[0].title()) if parts else "Campaign"
-    if len(parts) == 3 and parts[1] == "FAILED":
-        return f"{channel_name} in {parts[2].replace('_', ' ').title()} did not succeed"
-    if len(parts) < 4:
-        return "similar past campaign"
-    channel, outcome, hour, language = parts
-    channel_name = {"SMS": "SMS", "WH": "WhatsApp", "VOICE": "voice call"}.get(channel, channel.title())
-    outcome_text = "succeeded" if outcome == "SUCCESS" else "did not succeed"
-    return f"{channel_name} at {hour} in {language.replace('_', ' ').title()} {outcome_text}"
-
-
-def build_history_feature_summary(source_row: pd.Series | None, history_window_months: int) -> str:
-    if source_row is None:
-        return "No recent source-month feature history was found for this loan."
-
-    risk = str(source_row.get("RISK", "UNKNOWN")).upper()
-    source_month = str(source_row.get("SOURCE_MONTH", "UNKNOWN"))
-    sms_total = int(_safe_numeric(source_row.get("SMS_TOTAL_INTENSITY")))
-    wh_total = int(_safe_numeric(source_row.get("WH_TOTAL_INTENSITY")))
-    voice_total = int(_safe_numeric(source_row.get("VOICE_TOTAL_INTENSITY")))
-    strongest_success, success_count = _strongest_signal(source_row, "SUCCESS")
-    strongest_failure, failure_count = _strongest_signal(source_row, "FAILED")
-
-    parts = [
-        f"Source month {source_month}",
-        f"risk {risk}",
-        f"last {history_window_months} month activity: SMS {sms_total}, WhatsApp {wh_total}, Voice {voice_total}",
-    ]
-    if strongest_success:
-        parts.append(f"strongest successful past signal: {_readable_signal(strongest_success)} {int(success_count)} time(s)")
-    else:
-        parts.append("no successful past communication signal")
-    if strongest_failure:
-        parts.append(f"strongest unsuccessful past signal: {_readable_signal(strongest_failure)} {int(failure_count)} time(s)")
-    else:
-        parts.append("no unsuccessful past communication signal")
-    return "; ".join(parts) + "."
-
-
 def _ranked_business_labels(predicted: object) -> list[str]:
     return [label.strip() for label in str(predicted or "-").split("|") if label.strip()]
-
-
-def _best_business_label(predicted: object) -> str | None:
-    return next((label for label in _ranked_business_labels(predicted) if label != "-"), None)
 
 
 def _channel_totals(source_row: pd.Series | None) -> dict[str, int]:
@@ -359,9 +288,6 @@ def build_prediction_reason(
     *,
     prediction_row: pd.Series,
     source_row: pd.Series | None,
-    probability_details: dict[str, tuple[list[str], object]] | None = None,
-    row_idx: int = 0,
-    history_window_months: int = 3,
 ) -> str:
     payload: dict[str, str] = {}
     for day in DAY_COLUMNS:
@@ -454,7 +380,6 @@ def main() -> None:
                 logger.info("Prediction matrix | shape=%s", X_pred.shape)
 
             with log_step(logger, "predict_day_columns", rows=len(X_pred)):
-                probability_details = {}
                 prediction_output = prediction_rows[["APAC_CARD_NUMBER", "SOURCE_MONTH", "RISK", "VERTICAL"]].copy()
                 prediction_output = prediction_output.rename(
                     columns={
@@ -480,14 +405,10 @@ def main() -> None:
                         X_pred,
                         prediction_rows["RISK"],
                     )
-                    probability_details[day] = (list(encoder.classes_), model.predict_proba(X_pred))
                 prediction_output["PREDICTION_REASON"] = [
                     build_prediction_reason(
                         prediction_row=prediction_output.iloc[row_idx],
                         source_row=prediction_rows.iloc[row_idx],
-                        probability_details=probability_details,
-                        row_idx=row_idx,
-                        history_window_months=history_window_months,
                     )
                     for row_idx in range(len(prediction_output))
                 ]
@@ -513,7 +434,6 @@ def main() -> None:
                 build_prediction_reason(
                     prediction_row=blank_output.iloc[row_idx],
                     source_row=None,
-                    history_window_months=history_window_months,
                 )
                 for row_idx in range(len(blank_output))
             ]

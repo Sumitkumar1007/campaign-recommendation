@@ -33,7 +33,7 @@ from train_next_month_strategy_model_catboost import (
     predict_top_k_by_risk,
 )
 from pipeline_common import DAY_COLUMNS
-from predict_next_month_strategy_catboost import build_history_feature_summary, build_prediction_population, build_prediction_reason
+from predict_next_month_strategy_catboost import build_prediction_population, build_prediction_reason
 from campaign_recommendation.recommend import RecommendationPolicy, candidate_hours, generate_candidates
 
 
@@ -565,28 +565,6 @@ def test_build_prediction_population_keeps_base_accounts_without_history() -> No
 
 
 
-def test_build_history_feature_summary_contains_past_features() -> None:
-    source_row = pd.Series(
-        {
-            "SOURCE_MONTH": "MAY-2026",
-            "RISK": "MEDIUM",
-            "SMS_TOTAL_INTENSITY": 3,
-            "WH_TOTAL_INTENSITY": 2,
-            "VOICE_TOTAL_INTENSITY": 1,
-            "WH_SUCCESS_10AM_HINDI": 1,
-            "SMS_FAILED_ENGLISH": 1,
-        }
-    )
-
-    summary = build_history_feature_summary(source_row, history_window_months=3)
-
-    assert "Source month MAY-2026" in summary
-    assert "risk MEDIUM" in summary
-    assert "SMS 3, WhatsApp 2, Voice 1" in summary
-    assert "WhatsApp at 10AM in Hindi succeeded 1 time(s)" in summary
-    assert "SMS in English did not succeed 1 time(s)" in summary
-
-
 def test_build_prediction_reason_explains_matching_success_signal() -> None:
     prediction_row = pd.Series(
         {
@@ -611,8 +589,6 @@ def test_build_prediction_reason_explains_matching_success_signal() -> None:
         build_prediction_reason(
             prediction_row=prediction_row,
             source_row=source_row,
-            probability_details={"D-5": (["-", "SMS-9AM-HINDI", "WH-5PM-HINDI"], [[0.1, 0.7, 0.2]])},
-            history_window_months=3,
         )
     )
 

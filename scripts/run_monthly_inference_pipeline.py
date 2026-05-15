@@ -525,7 +525,6 @@ def ensure_prediction_table(conn, schema: str, table: str) -> None:
                 source_risk TEXT,
                 prediction_payload JSONB NOT NULL,
                 prediction_reason JSONB,
-                history_feature_summary TEXT,
                 created_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY (loan_number, prediction_month, model_name)
             )
@@ -534,11 +533,6 @@ def ensure_prediction_table(conn, schema: str, table: str) -> None:
     )
     conn.execute(
         sql.SQL("ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS prediction_reason JSONB").format(
-            table_ref=qualified_identifier(schema, table)
-        )
-    )
-    conn.execute(
-        sql.SQL("ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS history_feature_summary TEXT").format(
             table_ref=qualified_identifier(schema, table)
         )
     )
@@ -595,7 +589,6 @@ def ensure_campaign_mapping_table(conn, schema: str, table: str) -> None:
                 campaign_type TEXT NOT NULL,
                 due_type TEXT NOT NULL,
                 prediction_reason TEXT,
-                history_feature_summary TEXT,
                 created_at TIMESTAMPTZ NOT NULL,
                 modified_at TIMESTAMPTZ NOT NULL,
                 created_by TEXT NOT NULL,
@@ -607,11 +600,6 @@ def ensure_campaign_mapping_table(conn, schema: str, table: str) -> None:
     )
     conn.execute(
         sql.SQL("ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS prediction_reason TEXT").format(
-            table_ref=qualified_identifier(schema, table)
-        )
-    )
-    conn.execute(
-        sql.SQL("ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS history_feature_summary TEXT").format(
             table_ref=qualified_identifier(schema, table)
         )
     )
@@ -888,9 +876,6 @@ def store_prediction_snapshots(
                     reason_payload = json.loads(raw_reason)
                 except json.JSONDecodeError:
                     reason_payload = {"raw": raw_reason}
-        history_feature_summary = None
-        if "HISTORY_FEATURE_SUMMARY" in row.index and not pd.isna(row["HISTORY_FEATURE_SUMMARY"]):
-            history_feature_summary = str(row["HISTORY_FEATURE_SUMMARY"]).strip() or None
         rows.append(
             (
                 str(row["Loan_number"]),
@@ -900,7 +885,6 @@ def store_prediction_snapshots(
                 row.get(source_risk_col),
                 Jsonb(payload),
                 Jsonb(reason_payload) if reason_payload is not None else None,
-                history_feature_summary,
                 now,
             )
         )
@@ -915,17 +899,15 @@ def store_prediction_snapshots(
             source_risk,
             prediction_payload,
             prediction_reason,
-            history_feature_summary,
             created_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (loan_number, prediction_month, model_name)
         DO UPDATE SET
             source_month_used = EXCLUDED.source_month_used,
             source_risk = EXCLUDED.source_risk,
             prediction_payload = EXCLUDED.prediction_payload,
             prediction_reason = EXCLUDED.prediction_reason,
-            history_feature_summary = EXCLUDED.history_feature_summary,
             created_at = EXCLUDED.created_at
         """
     ).format(table_ref=qualified_identifier(schema, table))
@@ -1138,8 +1120,6 @@ def _load_prediction_context_lookup(prediction_file: Path, prediction_month_labe
                 parsed = {}
             if isinstance(parsed, dict):
                 context["reasons"] = {str(key): str(value) for key, value in parsed.items()}
-        if "HISTORY_FEATURE_SUMMARY" in row.index and not pd.isna(row["HISTORY_FEATURE_SUMMARY"]):
-            context["history_feature_summary"] = str(row["HISTORY_FEATURE_SUMMARY"])
         lookup[str(row["Loan_number"])] = context
     return lookup
 
@@ -1247,7 +1227,6 @@ def _build_campaign_assignment_groups(
                 "campaign_type",
                 "due_type",
                 "prediction_reason",
-                "history_feature_summary",
             ]
         )
 
@@ -1380,9 +1359,6 @@ def _prepare_campaign_outputs(
     mappings["prediction_reason"] = mappings.apply(
         lambda row: _mapping_prediction_reason(row, context_lookup),
         axis=1,
-    )
-    mappings["history_feature_summary"] = mappings["loan_number"].map(
-        lambda loan_number: str(context_lookup.get(str(loan_number), {}).get("history_feature_summary", ""))
     )
 
     campaign_output = campaigns[
@@ -1534,7 +1510,7 @@ def store_campaign_recommendations(
             created_by,
             modified_by
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (name)
         DO UPDATE SET
             mode = EXCLUDED.mode,
@@ -1607,7 +1583,6 @@ def store_campaign_mappings(
                 row["campaign_type"],
                 row["due_type"],
                 row.get("prediction_reason"),
-                row.get("history_feature_summary"),
                 now,
                 now,
                 actor,
@@ -1633,13 +1608,12 @@ def store_campaign_mappings(
             campaign_type,
             due_type,
             prediction_reason,
-            history_feature_summary,
             created_at,
             modified_at,
             created_by,
             modified_by
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (campaign_name, loan_number)
         DO UPDATE SET
             mode = EXCLUDED.mode,
@@ -1655,7 +1629,6 @@ def store_campaign_mappings(
             campaign_type = EXCLUDED.campaign_type,
             due_type = EXCLUDED.due_type,
             prediction_reason = EXCLUDED.prediction_reason,
-            history_feature_summary = EXCLUDED.history_feature_summary,
             modified_at = EXCLUDED.modified_at,
             modified_by = EXCLUDED.modified_by
         """

@@ -220,6 +220,28 @@ Training pairing example:
 - source row ending in `MAR-2026` predicts target schedule `APR-2026`
 - source row ending in `APR-2026` predicts target schedule `MAY-2026` during inference
 
+## 6. Prediction Reason Output
+
+Inference writes a `PREDICTION_REASON` column to the prediction CSV and stores it as `prediction_reason` in `ai_ml_recommendations_data`. The value is a JSON object keyed by day. The text is business-readable and follows the predicted rank order.
+
+Rules:
+
+- `D` always says no campaign is recommended because it is the EMI due date.
+- If the payload value is only `-`, the reason says no campaign is recommended for that day.
+- If the first payload value is a campaign, the reason says that campaign is recommended.
+- If the first payload value is `-` and a campaign appears after it, the reason says no campaign is primary and the campaign is an alternate option.
+
+Example:
+
+```json
+{
+  "D+2": "No campaign is the primary recommendation; SMS at 8AM in Regional is kept as an alternate option because SMS is a suitable follow-up channel based on past communication history.",
+  "D-4": "SMS at 9AM in English is recommended because SMS has shown a positive response pattern for this customer."
+}
+```
+
+`ai_ml_campaign_mapping.prediction_reason` stores the relevant day reason for each mapped campaign row.
+
 ## 6. Exact Training Flow
 
 This is what the script does:
