@@ -216,9 +216,10 @@ The pipeline does this:
 9. Predicts schedules for `PREDICT_MONTH`.
 10. Saves prediction CSV under `artifacts/predictions/`.
 11. Stores processed feature snapshots in Postgres.
-12. Stores prediction snapshots in Postgres table `ai_ml_recommendations_data`.
+12. Stores prediction snapshots in Postgres table `ai_ml_recommendations_data`, including `prediction_payload` and rank-aware `prediction_reason`.
 13. Stores a pipeline audit record in Postgres table `ai_ml_audit_table`.
 14. Stores campaign scheduler rows in Postgres table `ai_ml_campaign_recommendations`.
+15. Stores per-loan campaign mapping rows in `ai_ml_campaign_mapping`, including the business-readable reason for each mapped campaign.
 
 When omitted, `SOURCE_MONTH` defaults to the current month and `PREDICT_MONTH` defaults to the following month. If provided, `PREDICT_MONTH` must be exactly one month after `SOURCE_MONTH` for the current next-month model.
 
@@ -252,9 +253,30 @@ Send-hour candidates are configured as a window, not as hardcoded channel-specif
 
 This generates hourly candidates from `09:00:00` through `18:00:00`. In feature preparation, communication sent before `start_hour` is bucketed into `start_hour`, and communication sent at or after `end_hour` is bucketed into `end_hour`. If future operations require every two hours, set `step_hours` to `2`.
 
+
+## Prediction Reason Output
+
+`ai_ml_recommendations_data.prediction_reason` stores one business-readable reason per EMI-relative day. It follows the ranking in `prediction_payload`:
+
+- If a day is only `-`, the reason starts with `No campaign is recommended...`.
+- If a day starts with a campaign, for example `SMS-9AM-ENGLISH|-`, the reason starts with `SMS at 9AM in English is recommended...`.
+- If a day starts with `-` and then has a campaign, for example `-|SMS-8AM-REGIONAL`, the reason starts with `No campaign is the primary recommendation; SMS at 8AM in Regional is kept as an alternate option...`.
+- `D` always says no campaign is recommended because it is the EMI due date.
+
+The same rank-aware business reason is also copied into `ai_ml_campaign_mapping.prediction_reason` for mapped campaign rows. This keeps scheduler/account mapping output readable without requiring a separate explanation job.
+
+Example:
+
+```json
+{
+  "D+2": "No campaign is the primary recommendation; SMS at 8AM in Regional is kept as an alternate option because SMS is a suitable follow-up channel based on past communication history.",
+  "D-4": "SMS at 9AM in English is recommended because SMS has shown a positive response pattern for this customer."
+}
+```
+
 ## Campaign Scheduler Output
 
-The pipeline creates campaign-level scheduler rows in `digital_collections.ai_ml_campaign_recommendations`. This table is separate from account-level recommendations in `digital_collections.ai_ml_recommendations_data`.
+The pipeline creates campaign-level scheduler rows in `digital_collections.ai_ml_campaign_recommendations`. This table is separate from account-level recommendations in `digital_collections.ai_ml_recommendations_data` and per-loan scheduler mappings in `digital_collections.ai_ml_campaign_mapping`.
 
 Current campaign scheduler rules:
 
@@ -430,17 +452,19 @@ digital_collections.ai_ml_recommendations_feature
 digital_collections.ai_ml_recommendations_data
 digital_collections.ai_ml_audit_table
 digital_collections.ai_ml_campaign_recommendations
+digital_collections.ai_ml_campaign_mapping
 ```
 
 ## Explainability
 
-The inference pipeline stores processed monthly feature snapshots and prediction snapshots in Postgres. This allows stakeholder-facing explainability such as:
+The inference pipeline stores processed monthly feature snapshots, prediction snapshots, and rank-aware business reasons in Postgres. This allows stakeholder-facing explainability such as:
 
 - Latest 3 months used for the APAC/account.
 - Channel intensity by `SMS`, `WH`, and `VOICE`.
 - Success and failure counts by channel, time, and language.
 - Predicted day-wise recommendation.
 - Blank/no-contact cases and best alternatives.
+- Business-readable `prediction_reason` text that respects rank order in the payload.
 
 Example analysis file:
 
