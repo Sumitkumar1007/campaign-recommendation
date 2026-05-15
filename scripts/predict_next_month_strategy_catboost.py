@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import joblib
@@ -123,6 +124,271 @@ def build_prediction_population(
     return with_history, without_history
 
 
+def _safe_numeric(value: object) -> float:
+    try:
+        if pd.isna(value):
+            return 0.0
+        return float(value)
+    except Exception:
+        return 0.0
+
+
+def _strategy_parts(label: str) -> tuple[str, str, str] | None:
+    if not label or label == "-" or pd.isna(label):
+        return None
+    parts = str(label).split("-", 2)
+    if len(parts) != 3:
+        return None
+    channel, hour, language = parts
+    channel_map = {"SMS": "SMS", "WH": "WH", "WHATSAPP": "WH", "IVR": "VOICE", "VOICE": "VOICE"}
+    normalized_channel = channel_map.get(channel.upper())
+    if not normalized_channel:
+        return None
+    return normalized_channel, hour.upper(), language.upper()
+
+
+def _strongest_signal(row: pd.Series, contains: str) -> tuple[str, float]:
+    candidates = {
+        column: _safe_numeric(row.get(column))
+        for column in row.index
+        if contains in column and _safe_numeric(row.get(column)) > 0
+    }
+    if not candidates:
+        return "", 0.0
+    return max(candidates.items(), key=lambda item: (item[1], item[0]))
+
+
+def _matching_success_signal(row: pd.Series, label: str) -> tuple[str, float]:
+    parts = _strategy_parts(label)
+    if not parts:
+        return "", 0.0
+    channel, hour, language = parts
+    column = f"{channel}_SUCCESS_{hour}_{language}"
+    value = _safe_numeric(row.get(column))
+    return (column, value) if value > 0 else ("", 0.0)
+
+
+def _prediction_probability(
+    probability_details: dict[str, tuple[list[str], object]],
+    day: str,
+    row_idx: int,
+    label: str,
+) -> float | None:
+    if day not in probability_details:
+        return None
+    classes, probabilities = probability_details[day]
+    if label not in classes:
+        return None
+    class_idx = classes.index(label)
+    return float(probabilities[row_idx][class_idx])
+
+
+def _readable_strategy(label: str) -> str:
+    parts = _strategy_parts(label)
+    if not parts:
+        return "no campaign"
+    channel, hour, language = parts
+    channel_name = {"SMS": "SMS", "WH": "WhatsApp", "VOICE": "voice call"}.get(channel, channel)
+    return f"{channel_name} at {hour} in {language.title()}"
+
+
+def _readable_signal(signal: str) -> str:
+    parts = signal.split("_", 3)
+    channel_name = {"SMS": "SMS", "WH": "WhatsApp", "VOICE": "voice call"}.get(parts[0], parts[0].title()) if parts else "Campaign"
+    if len(parts) == 3 and parts[1] == "FAILED":
+        return f"{channel_name} in {parts[2].replace('_', ' ').title()} did not succeed"
+    if len(parts) < 4:
+        return "similar past campaign"
+    channel, outcome, hour, language = parts
+    channel_name = {"SMS": "SMS", "WH": "WhatsApp", "VOICE": "voice call"}.get(channel, channel.title())
+    outcome_text = "succeeded" if outcome == "SUCCESS" else "did not succeed"
+    return f"{channel_name} at {hour} in {language.replace('_', ' ').title()} {outcome_text}"
+
+
+def build_history_feature_summary(source_row: pd.Series | None, history_window_months: int) -> str:
+    if source_row is None:
+        return "No recent source-month feature history was found for this loan."
+
+    risk = str(source_row.get("RISK", "UNKNOWN")).upper()
+    source_month = str(source_row.get("SOURCE_MONTH", "UNKNOWN"))
+    sms_total = int(_safe_numeric(source_row.get("SMS_TOTAL_INTENSITY")))
+    wh_total = int(_safe_numeric(source_row.get("WH_TOTAL_INTENSITY")))
+    voice_total = int(_safe_numeric(source_row.get("VOICE_TOTAL_INTENSITY")))
+    strongest_success, success_count = _strongest_signal(source_row, "SUCCESS")
+    strongest_failure, failure_count = _strongest_signal(source_row, "FAILED")
+
+    parts = [
+        f"Source month {source_month}",
+        f"risk {risk}",
+        f"last {history_window_months} month activity: SMS {sms_total}, WhatsApp {wh_total}, Voice {voice_total}",
+    ]
+    if strongest_success:
+        parts.append(f"strongest successful past signal: {_readable_signal(strongest_success)} {int(success_count)} time(s)")
+    else:
+        parts.append("no successful past communication signal")
+    if strongest_failure:
+        parts.append(f"strongest unsuccessful past signal: {_readable_signal(strongest_failure)} {int(failure_count)} time(s)")
+    else:
+        parts.append("no unsuccessful past communication signal")
+    return "; ".join(parts) + "."
+
+
+def _ranked_business_labels(predicted: object) -> list[str]:
+    return [label.strip() for label in str(predicted or "-").split("|") if label.strip()]
+
+
+def _best_business_label(predicted: object) -> str | None:
+    return next((label for label in _ranked_business_labels(predicted) if label != "-"), None)
+
+
+def _channel_totals(source_row: pd.Series | None) -> dict[str, int]:
+    return {
+        "SMS": int(_safe_numeric(source_row.get("SMS_TOTAL_INTENSITY"))) if source_row is not None else 0,
+        "WH": int(_safe_numeric(source_row.get("WH_TOTAL_INTENSITY"))) if source_row is not None else 0,
+        "VOICE": int(_safe_numeric(source_row.get("VOICE_TOTAL_INTENSITY"))) if source_row is not None else 0,
+    }
+
+
+def _has_channel_success(source_row: pd.Series | None, channel: str) -> bool:
+    if source_row is None:
+        return False
+    prefix = f"{channel}_SUCCESS"
+    return any(str(column).startswith(prefix) and _safe_numeric(value) > 0 for column, value in source_row.items())
+
+
+def _no_campaign_reason(day: str) -> str:
+    if day == "D":
+        return "No campaign is recommended because this is the EMI due date."
+    if day == "D-1":
+        return "No campaign is recommended because there is no strong day-specific evidence for a suitable contact before the EMI date."
+    if day == "D-2":
+        return "No campaign is recommended because past communication history does not show enough evidence for an effective campaign on this day."
+    if day == "D-4":
+        return "No campaign is recommended because there is no strong successful signal for this day."
+    if day.startswith("D-"):
+        return "No campaign is recommended because past communication history does not show enough early-reminder evidence for this day."
+    return "No campaign is recommended because past communication history does not show enough post-due follow-up evidence for this day."
+
+
+def _business_reason_for_label(label: str, day: str, source_row: pd.Series | None) -> str:
+    parts = _strategy_parts(label)
+    if not parts:
+        return "Campaign is recommended based on the customer's past communication pattern."
+
+    channel, _hour, language = parts
+    readable = _readable_strategy(label)
+    totals = _channel_totals(source_row)
+    has_exact_success = bool(_matching_success_signal(source_row, label)[0]) if source_row is not None else False
+    has_channel_success = _has_channel_success(source_row, channel)
+    is_predue = day.startswith("D-")
+    is_postdue = day.startswith("D+")
+
+    if channel == "SMS":
+        if day == "D-5":
+            return f"{readable} is recommended because SMS has shown positive response patterns and can be used as an early reminder."
+        if day == "D-1":
+            return f"{readable} is recommended because SMS is suitable for a final reminder before the EMI date."
+        if day == "D+1":
+            return f"{readable} is recommended because SMS has shown a positive response pattern for this customer."
+        if day == "D+2":
+            if language == "REGIONAL":
+                return f"{readable} is recommended because SMS is a suitable follow-up channel based on the customer's past communication history."
+            return f"{readable} is recommended because SMS is a suitable early post-due follow-up channel for this customer."
+        if day == "D+3":
+            return f"{readable} is recommended because SMS has shown better suitability for post-due follow-up communication."
+        if day == "D+4":
+            if language == "REGIONAL":
+                return f"{readable} is recommended because regional SMS can improve customer reach based on past digital communication behavior."
+            return f"{readable} is recommended because SMS is suitable for continued post-due follow-up based on past activity."
+        if day == "D+5":
+            return f"{readable} is recommended because SMS remains the preferred follow-up channel based on previous response patterns."
+        if has_exact_success or has_channel_success:
+            return f"{readable} is recommended because SMS has shown a positive response pattern for this customer."
+        if language == "REGIONAL" and is_postdue:
+            return f"{readable} is recommended because regional SMS may improve customer reach after the EMI due date."
+        if is_predue and totals["SMS"] >= max(totals["WH"], totals["VOICE"]):
+            return f"{readable} is recommended because SMS has been frequently used and is suitable before the EMI due date."
+        return f"{readable} is recommended because SMS is a suitable channel based on the customer's past campaign activity."
+
+    if channel == "WH":
+        if has_exact_success or has_channel_success or totals["WH"] >= max(totals["SMS"], totals["VOICE"]):
+            return f"{readable} is recommended because WhatsApp has shown better engagement in the customer's past communication history."
+        return f"{readable} is recommended because the customer has relevant past digital communication activity."
+
+    if channel == "VOICE":
+        if has_exact_success or has_channel_success:
+            return f"{readable} is recommended because past voice communication has shown a positive response signal."
+        return f"{readable} is recommended as an alternate contact option based on the customer's overall communication pattern."
+
+    return f"{readable} is recommended based on the customer's past communication history."
+
+def _business_alternate_reason_for_label(label: str, day: str, source_row: pd.Series | None) -> str:
+    parts = _strategy_parts(label)
+    if not parts:
+        return "campaign is kept as an alternate option based on the customer's past communication pattern."
+
+    channel, _hour, language = parts
+    readable = _readable_strategy(label)
+    if channel == "SMS":
+        if day == "D-5":
+            return f"{readable} is kept as an alternate option because SMS can be used as an early reminder."
+        if day == "D-1":
+            return f"{readable} is kept as an alternate option for a final reminder before the EMI date."
+        if day == "D+2":
+            return f"{readable} is kept as an alternate option because SMS is a suitable follow-up channel based on past communication history."
+        if day == "D+3":
+            return f"{readable} is kept as an alternate option because SMS has shown suitability for post-due follow-up communication."
+        if day == "D+4":
+            if language == "REGIONAL":
+                return f"{readable} is kept as an alternate option because regional SMS can improve customer reach based on past digital communication behavior."
+            return f"{readable} is kept as an alternate option because SMS is suitable for continued post-due follow-up."
+        if day == "D+5":
+            return f"{readable} is kept as an alternate option because SMS remains a suitable follow-up channel based on previous response patterns."
+        return f"{readable} is kept as an alternate option because SMS has shown a positive response pattern for this customer."
+
+    if channel == "WH":
+        return f"{readable} is kept as an alternate option because WhatsApp has shown engagement in the customer's past communication history."
+
+    if channel == "VOICE":
+        return f"{readable} is kept as an alternate contact option based on the customer's communication pattern."
+
+    return f"{readable} is kept as an alternate option based on the customer's past communication history."
+
+
+def build_prediction_reason(
+    *,
+    prediction_row: pd.Series,
+    source_row: pd.Series | None,
+    probability_details: dict[str, tuple[list[str], object]] | None = None,
+    row_idx: int = 0,
+    history_window_months: int = 3,
+) -> str:
+    payload: dict[str, str] = {}
+    for day in DAY_COLUMNS:
+        if day == "D":
+            payload[day] = _no_campaign_reason(day)
+            continue
+
+        ranked_labels = _ranked_business_labels(prediction_row.get(day, "-"))
+        first_label = ranked_labels[0] if ranked_labels else "-"
+        alternate_label = next((label for label in ranked_labels[1:] if label != "-"), None)
+        if first_label == "-" and alternate_label is not None:
+            payload[day] = "No campaign is the primary recommendation; " + _business_alternate_reason_for_label(
+                alternate_label,
+                day,
+                source_row,
+            )
+            continue
+
+        best_label = first_label if first_label != "-" else None
+        if best_label is None:
+            payload[day] = _no_campaign_reason(day)
+            continue
+
+        payload[day] = _business_reason_for_label(best_label, day, source_row)
+
+    return json.dumps(payload, sort_keys=True)
+
 def main() -> None:
     args = parse_args()
     logger = setup_logging(args.log_file, "catboost_inference")
@@ -188,6 +454,7 @@ def main() -> None:
                 logger.info("Prediction matrix | shape=%s", X_pred.shape)
 
             with log_step(logger, "predict_day_columns", rows=len(X_pred)):
+                probability_details = {}
                 prediction_output = prediction_rows[["APAC_CARD_NUMBER", "SOURCE_MONTH", "RISK", "VERTICAL"]].copy()
                 prediction_output = prediction_output.rename(
                     columns={
@@ -213,6 +480,17 @@ def main() -> None:
                         X_pred,
                         prediction_rows["RISK"],
                     )
+                    probability_details[day] = (list(encoder.classes_), model.predict_proba(X_pred))
+                prediction_output["PREDICTION_REASON"] = [
+                    build_prediction_reason(
+                        prediction_row=prediction_output.iloc[row_idx],
+                        source_row=prediction_rows.iloc[row_idx],
+                        probability_details=probability_details,
+                        row_idx=row_idx,
+                        history_window_months=history_window_months,
+                    )
+                    for row_idx in range(len(prediction_output))
+                ]
                 prediction_outputs.append(prediction_output)
 
         if not blank_rows.empty:
@@ -231,6 +509,14 @@ def main() -> None:
             ).dt.to_timestamp().dt.strftime("%b-%Y").str.upper()
             for day in DAY_COLUMNS:
                 blank_output[day] = "-"
+            blank_output["PREDICTION_REASON"] = [
+                build_prediction_reason(
+                    prediction_row=blank_output.iloc[row_idx],
+                    source_row=None,
+                    history_window_months=history_window_months,
+                )
+                for row_idx in range(len(blank_output))
+            ]
             prediction_outputs.append(blank_output)
 
         if prediction_outputs:
@@ -244,6 +530,7 @@ def main() -> None:
                     "SOURCE_MONTH_USED",
                     "MONTH",
                     *DAY_COLUMNS,
+                    "PREDICTION_REASON",
                 ]
             )
 
@@ -267,6 +554,7 @@ def main() -> None:
                     "D+3",
                     "D+4",
                     "D+5",
+                    "PREDICTION_REASON",
                 ]
             ]
             prediction_output.to_csv(prediction_file, index=False)
