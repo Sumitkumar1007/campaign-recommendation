@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -31,7 +32,8 @@ from train_next_month_strategy_model_catboost import (
     build_rolling_feature_windows,
     predict_top_k_by_risk,
 )
-from predict_next_month_strategy_catboost import build_prediction_population
+from pipeline_common import DAY_COLUMNS
+from predict_next_month_strategy_catboost import build_history_feature_summary, build_prediction_population, build_prediction_reason
 from campaign_recommendation.recommend import RecommendationPolicy, candidate_hours, generate_candidates
 
 
@@ -349,6 +351,47 @@ def test_build_campaign_mappings_links_accounts_to_grouped_campaign_rows(tmp_pat
     assert set(mappings["time"]) == {"09:00:00,10:00:00"}
 
 
+
+def test_build_campaign_mappings_includes_business_readable_reason(tmp_path: Path) -> None:
+    prediction_file = tmp_path / "predictions_mapping_reason.csv"
+    reason = {"D-5": "SMS at 9AM in Hindi is recommended because SMS has shown positive response patterns and can be used as an early reminder."}
+    pd.DataFrame(
+        {
+            "SOURCE_RISK": ["HIGH"],
+            "Loan_number": ["L1"],
+            "SOURCE_MONTH_USED": ["APR-2026"],
+            "MONTH": ["MAY-2026"],
+            "D-5": ["SMS-9AM-HINDI"],
+            "D-4": ["-"],
+            "D-3": ["-"],
+            "D-2": ["-"],
+            "D-1": ["-"],
+            "D": ["-"],
+            "D+1": ["-"],
+            "D+2": ["-"],
+            "D+3": ["-"],
+            "D+4": ["-"],
+            "D+5": ["-"],
+            "PREDICTION_REASON": [json.dumps(reason)],
+        }
+    ).to_csv(prediction_file, index=False)
+
+    mappings = build_campaign_mappings(
+        prediction_file,
+        source_month_label="APR-2026",
+        prediction_month_label="MAY-2026",
+        model_name="catboost_3m",
+        emi_cycle=5,
+        vertical="LAP",
+        vendors=["prutech"],
+        run_date=pd.Timestamp("2026-04-08").to_pydatetime(),
+    )
+
+    assert "prediction_reason" in mappings.columns
+    assert mappings.loc[0, "prediction_reason"].startswith("D-5: SMS at 9AM in Hindi is recommended")
+    assert "early reminder" in mappings.loc[0, "prediction_reason"]
+
+
 def test_build_campaign_recommendations_skips_regional_language(tmp_path: Path) -> None:
     prediction_file = tmp_path / "predictions.csv"
     pd.DataFrame(
@@ -518,3 +561,99 @@ def test_build_prediction_population_keeps_base_accounts_without_history() -> No
 
     assert with_history["APAC_CARD_NUMBER"].tolist() == ["A1"]
     assert without_history["APAC_CARD_NUMBER"].tolist() == ["A2"]
+
+
+
+
+def test_build_history_feature_summary_contains_past_features() -> None:
+    source_row = pd.Series(
+        {
+            "SOURCE_MONTH": "MAY-2026",
+            "RISK": "MEDIUM",
+            "SMS_TOTAL_INTENSITY": 3,
+            "WH_TOTAL_INTENSITY": 2,
+            "VOICE_TOTAL_INTENSITY": 1,
+            "WH_SUCCESS_10AM_HINDI": 1,
+            "SMS_FAILED_ENGLISH": 1,
+        }
+    )
+
+    summary = build_history_feature_summary(source_row, history_window_months=3)
+
+    assert "Source month MAY-2026" in summary
+    assert "risk MEDIUM" in summary
+    assert "SMS 3, WhatsApp 2, Voice 1" in summary
+    assert "WhatsApp at 10AM in Hindi succeeded 1 time(s)" in summary
+    assert "SMS in English did not succeed 1 time(s)" in summary
+
+
+def test_build_prediction_reason_explains_matching_success_signal() -> None:
+    prediction_row = pd.Series(
+        {
+            "SOURCE_RISK": "HIGH",
+            "D-5": "SMS-9AM-HINDI|WH-5PM-HINDI|-",
+            "D-4": "-",
+        }
+    )
+    source_row = pd.Series(
+        {
+            "RISK": "HIGH",
+            "SMS_TOTAL_INTENSITY": 7,
+            "WH_TOTAL_INTENSITY": 3,
+            "VOICE_TOTAL_INTENSITY": 1,
+            "SMS_SUCCESS_9AM_HINDI": 4,
+            "WH_SUCCESS_5PM_HINDI": 2,
+            "VOICE_FAILED_HINDI": 1,
+        }
+    )
+
+    reason = json.loads(
+        build_prediction_reason(
+            prediction_row=prediction_row,
+            source_row=source_row,
+            probability_details={"D-5": (["-", "SMS-9AM-HINDI", "WH-5PM-HINDI"], [[0.1, 0.7, 0.2]])},
+            history_window_months=3,
+        )
+    )
+
+    assert reason["D-5"] == (
+        "SMS at 9AM in Hindi is recommended because SMS has shown positive response patterns "
+        "and can be used as an early reminder."
+    )
+
+
+
+def test_build_prediction_reason_respects_no_campaign_primary_rank() -> None:
+    prediction_row = pd.Series(
+        {
+            "SOURCE_RISK": "MEDIUM",
+            "D+2": "-|SMS-8AM-REGIONAL",
+        }
+    )
+    source_row = pd.Series(
+        {
+            "RISK": "MEDIUM",
+            "SMS_TOTAL_INTENSITY": 3,
+            "WH_TOTAL_INTENSITY": 1,
+            "VOICE_TOTAL_INTENSITY": 0,
+        }
+    )
+
+    reason = json.loads(build_prediction_reason(prediction_row=prediction_row, source_row=source_row))
+
+    assert reason["D+2"] == (
+        "No campaign is the primary recommendation; SMS at 8AM in Regional is kept as an alternate option "
+        "because SMS is a suitable follow-up channel based on past communication history."
+    )
+
+
+def test_build_prediction_reason_explains_no_history_blank_predictions() -> None:
+    prediction_row = pd.Series({"SOURCE_RISK": "LOW", "D-5": "-"})
+
+    reason = json.loads(build_prediction_reason(prediction_row=prediction_row, source_row=None))
+
+    assert reason["D-5"] == (
+        "No campaign is recommended because past communication history does not show enough "
+        "early-reminder evidence for this day."
+    )
+    assert set(reason) == set(DAY_COLUMNS)

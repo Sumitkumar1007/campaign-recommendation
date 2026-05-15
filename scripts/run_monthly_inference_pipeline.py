@@ -524,11 +524,23 @@ def ensure_prediction_table(conn, schema: str, table: str) -> None:
                 model_name TEXT NOT NULL,
                 source_risk TEXT,
                 prediction_payload JSONB NOT NULL,
+                prediction_reason JSONB,
+                history_feature_summary TEXT,
                 created_at TIMESTAMPTZ NOT NULL,
                 PRIMARY KEY (loan_number, prediction_month, model_name)
             )
             """
         ).format(table_ref=qualified_identifier(schema, table))
+    )
+    conn.execute(
+        sql.SQL("ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS prediction_reason JSONB").format(
+            table_ref=qualified_identifier(schema, table)
+        )
+    )
+    conn.execute(
+        sql.SQL("ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS history_feature_summary TEXT").format(
+            table_ref=qualified_identifier(schema, table)
+        )
     )
 
 
@@ -582,6 +594,8 @@ def ensure_campaign_mapping_table(conn, schema: str, table: str) -> None:
                 vertical TEXT NOT NULL,
                 campaign_type TEXT NOT NULL,
                 due_type TEXT NOT NULL,
+                prediction_reason TEXT,
+                history_feature_summary TEXT,
                 created_at TIMESTAMPTZ NOT NULL,
                 modified_at TIMESTAMPTZ NOT NULL,
                 created_by TEXT NOT NULL,
@@ -590,6 +604,16 @@ def ensure_campaign_mapping_table(conn, schema: str, table: str) -> None:
             )
             """
         ).format(table_ref=qualified_identifier(schema, table))
+    )
+    conn.execute(
+        sql.SQL("ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS prediction_reason TEXT").format(
+            table_ref=qualified_identifier(schema, table)
+        )
+    )
+    conn.execute(
+        sql.SQL("ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS history_feature_summary TEXT").format(
+            table_ref=qualified_identifier(schema, table)
+        )
     )
 
 
@@ -856,6 +880,17 @@ def store_prediction_snapshots(
             for day in ["D-5", "D-4", "D-3", "D-2", "D-1", "D", "D+1", "D+2", "D+3", "D+4", "D+5"]
             if day in row.index
         }
+        reason_payload = None
+        if "PREDICTION_REASON" in row.index and not pd.isna(row["PREDICTION_REASON"]):
+            raw_reason = str(row["PREDICTION_REASON"]).strip()
+            if raw_reason:
+                try:
+                    reason_payload = json.loads(raw_reason)
+                except json.JSONDecodeError:
+                    reason_payload = {"raw": raw_reason}
+        history_feature_summary = None
+        if "HISTORY_FEATURE_SUMMARY" in row.index and not pd.isna(row["HISTORY_FEATURE_SUMMARY"]):
+            history_feature_summary = str(row["HISTORY_FEATURE_SUMMARY"]).strip() or None
         rows.append(
             (
                 str(row["Loan_number"]),
@@ -864,6 +899,8 @@ def store_prediction_snapshots(
                 model_name,
                 row.get(source_risk_col),
                 Jsonb(payload),
+                Jsonb(reason_payload) if reason_payload is not None else None,
+                history_feature_summary,
                 now,
             )
         )
@@ -877,14 +914,18 @@ def store_prediction_snapshots(
             model_name,
             source_risk,
             prediction_payload,
+            prediction_reason,
+            history_feature_summary,
             created_at
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (loan_number, prediction_month, model_name)
         DO UPDATE SET
             source_month_used = EXCLUDED.source_month_used,
             source_risk = EXCLUDED.source_risk,
             prediction_payload = EXCLUDED.prediction_payload,
+            prediction_reason = EXCLUDED.prediction_reason,
+            history_feature_summary = EXCLUDED.history_feature_summary,
             created_at = EXCLUDED.created_at
         """
     ).format(table_ref=qualified_identifier(schema, table))
@@ -1083,6 +1124,41 @@ def _join_campaign_times(values: pd.Series) -> str:
     return ",".join(sorted(set(values)))
 
 
+def _load_prediction_context_lookup(prediction_file: Path, prediction_month_label: str) -> dict[str, dict[str, object]]:
+    df = pd.read_csv(prediction_file)
+    df = df[df["MONTH"] == prediction_month_label].copy()
+    lookup: dict[str, dict[str, object]] = {}
+    for _, row in df.iterrows():
+        context: dict[str, object] = {}
+        raw_reason = row.get("PREDICTION_REASON") if "PREDICTION_REASON" in row.index else None
+        if raw_reason is not None and not pd.isna(raw_reason):
+            try:
+                parsed = json.loads(str(raw_reason))
+            except json.JSONDecodeError:
+                parsed = {}
+            if isinstance(parsed, dict):
+                context["reasons"] = {str(key): str(value) for key, value in parsed.items()}
+        if "HISTORY_FEATURE_SUMMARY" in row.index and not pd.isna(row["HISTORY_FEATURE_SUMMARY"]):
+            context["history_feature_summary"] = str(row["HISTORY_FEATURE_SUMMARY"])
+        lookup[str(row["Loan_number"])] = context
+    return lookup
+
+
+def _mapping_prediction_reason(row: pd.Series, context_lookup: dict[str, dict[str, object]]) -> str:
+    loan_reasons = context_lookup.get(str(row["loan_number"]), {}).get("reasons", {})
+    parts: list[str] = []
+    for day in str(row["date"]).split(","):
+        day = day.strip()
+        if not day:
+            continue
+        reason = loan_reasons.get(day)
+        if reason:
+            parts.append(f"{day}: {reason}")
+    if parts:
+        return " ".join(parts)
+    return "Reason not available from prediction output for this campaign mapping."
+
+
 def _build_campaign_assignment_groups(
     prediction_file: Path,
     *,
@@ -1170,6 +1246,8 @@ def _build_campaign_assignment_groups(
                 "vertical",
                 "campaign_type",
                 "due_type",
+                "prediction_reason",
+                "history_feature_summary",
             ]
         )
 
@@ -1246,6 +1324,7 @@ def _prepare_campaign_outputs(
                 "vertical",
                 "campaign_type",
                 "due_type",
+                "prediction_reason",
             ]
         )
         return empty_campaigns, empty_mappings
@@ -1297,6 +1376,14 @@ def _prepare_campaign_outputs(
             "due_type",
         ]
     ].drop_duplicates()
+    context_lookup = _load_prediction_context_lookup(prediction_file, prediction_month_label)
+    mappings["prediction_reason"] = mappings.apply(
+        lambda row: _mapping_prediction_reason(row, context_lookup),
+        axis=1,
+    )
+    mappings["history_feature_summary"] = mappings["loan_number"].map(
+        lambda loan_number: str(context_lookup.get(str(loan_number), {}).get("history_feature_summary", ""))
+    )
 
     campaign_output = campaigns[
         [
@@ -1519,6 +1606,8 @@ def store_campaign_mappings(
                 row["vertical"],
                 row["campaign_type"],
                 row["due_type"],
+                row.get("prediction_reason"),
+                row.get("history_feature_summary"),
                 now,
                 now,
                 actor,
@@ -1543,12 +1632,14 @@ def store_campaign_mappings(
             vertical,
             campaign_type,
             due_type,
+            prediction_reason,
+            history_feature_summary,
             created_at,
             modified_at,
             created_by,
             modified_by
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (campaign_name, loan_number)
         DO UPDATE SET
             mode = EXCLUDED.mode,
@@ -1563,6 +1654,8 @@ def store_campaign_mappings(
             vertical = EXCLUDED.vertical,
             campaign_type = EXCLUDED.campaign_type,
             due_type = EXCLUDED.due_type,
+            prediction_reason = EXCLUDED.prediction_reason,
+            history_feature_summary = EXCLUDED.history_feature_summary,
             modified_at = EXCLUDED.modified_at,
             modified_by = EXCLUDED.modified_by
         """
@@ -1570,7 +1663,6 @@ def store_campaign_mappings(
     with conn.cursor() as cur:
         cur.executemany(query, rows)
     return len(rows)
-
 
 def main() -> None:
     args = parse_args()
