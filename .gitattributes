@@ -1,0 +1,1 @@
+training-data/mfl_last_6_months_communication_data.csv !text !filter !merge !diff
