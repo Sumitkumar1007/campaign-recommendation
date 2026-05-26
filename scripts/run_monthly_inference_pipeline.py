@@ -1510,7 +1510,7 @@ def store_campaign_recommendations(
             created_by,
             modified_by
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (name)
         DO UPDATE SET
             mode = EXCLUDED.mode,

@@ -19,6 +19,9 @@ if str(SRC_DIR) not in sys.path:
 
 from fetch_month_from_postgres import emi_cycle_dates, month_bounds, resolve_emi_cycle
 from generate_strategy_dataset import bucket_send_hour, candidate_hours as dataset_candidate_hours, process_chunk
+
+from quartz_job_data import build_mcollect_job_data, serialize_quartz_job_data_map
+from export_mcollect_scheduler import build_cron_trigger_specs, relative_campaign_day_to_date
 from run_monthly_inference_pipeline import (
     build_campaign_mappings,
     build_campaign_recommendations,
@@ -633,3 +636,68 @@ def test_build_prediction_reason_explains_no_history_blank_predictions() -> None
         "early-reminder evidence for this day."
     )
     assert set(reason) == set(DAY_COLUMNS)
+
+
+def test_serialize_quartz_job_data_map_matches_existing_sms_job_data() -> None:
+    expected_hex = (
+        "aced0005737200156f72672e71756172747a2e4a6f62446174614d61709fb083e8bfa9b0cb020000787200"
+        "266f72672e71756172747a2e7574696c732e537472696e674b65794469727479466c61674d61708208e8"
+        "c3fbc55d280200015a0013616c6c6f77735472616e7369656e74446174617872001d6f72672e717561"
+        "72747a2e7574696c732e4469727479466c61674d617013e62ead28760ace0200025a000564697274794c"
+        "00036d617074000f4c6a6176612f7574696c2f4d61703b787001737200116a6176612e7574696c2e"
+        "486173684d61700507dac1c31660d103000246000a6c6f6164466163746f724900097468726573686f"
+        "6c6478703f4000000000000c770800000010000000027400084461746173657473740012504f535444"
+        "5545204d52485020515545525974000854656d706c61746574000c504f535444554520534d53357800"
+    )
+
+    actual = serialize_quartz_job_data_map(
+        [("Datasets", "POSTDUE MRHP QUERY"), ("Template", "POSTDUE SMS5")]
+    )
+
+    assert actual.hex() == expected_hex
+
+
+def test_build_mcollect_job_data_matches_existing_voice_bot_vendor_job_data() -> None:
+    expected_hex = (
+        "aced0005737200156f72672e71756172747a2e4a6f62446174614d61709fb083e8bfa9b0cb020000787200"
+        "266f72672e71756172747a2e7574696c732e537472696e674b65794469727479466c61674d61708208e8"
+        "c3fbc55d280200015a0013616c6c6f77735472616e7369656e74446174617872001d6f72672e717561"
+        "72747a2e7574696c732e4469727479466c61674d617013e62ead28760ace0200025a000564697274794c"
+        "00036d617074000f4c6a6176612f7574696c2f4d61703b787001737200116a6176612e7574696c2e"
+        "486173684d61700507dac1c31660d103000246000a6c6f6164466163746f724900097468726573686f"
+        "6c6478703f4000000000000c770800000010000000037400084461746173657473740020504f535444"
+        "554520414c4c5249534b20454e474c49534820564220515545525974000656656e646f727400097665"
+        "7262616c797a6574000854656d706c61746574001456455242414c595a4520454e474c495348205642"
+        "7800"
+    )
+
+    actual = build_mcollect_job_data(
+        dataset_name="POSTDUE ALLRISK ENGLISH VB QUERY",
+        vendor="verbalyze",
+        template_name="VERBALYZE ENGLISH VB",
+    )
+
+    assert actual.hex() == expected_hex
+
+
+def test_mcollect_relative_campaign_day_to_date_handles_previous_month() -> None:
+    assert relative_campaign_day_to_date("D-5", "MAY-2026", 5).strftime("%Y-%m-%d") == "2026-04-30"
+    assert relative_campaign_day_to_date("D-1", "MAY-2026", 5).strftime("%Y-%m-%d") == "2026-05-04"
+    assert relative_campaign_day_to_date("D+5", "MAY-2026", 5).strftime("%Y-%m-%d") == "2026-05-10"
+
+
+def test_build_cron_trigger_specs_splits_month_boundaries() -> None:
+    row = pd.Series(
+        {
+            "name": "TEST",
+            "date": "D-5,D-4",
+            "time": "09:00:00,10:00:00",
+            "prediction_month": "MAY-2026",
+            "emi_cycle": 5,
+        }
+    )
+
+    specs = build_cron_trigger_specs(row, trigger_state="PAUSED")
+
+    assert [spec.cron_expression for spec in specs] == ["0 0 9,10 30 4 ?", "0 0 9,10 1 5 ?"]
+    assert {spec.trigger_state for spec in specs} == {"PAUSED"}
