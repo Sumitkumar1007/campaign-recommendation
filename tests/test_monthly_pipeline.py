@@ -212,26 +212,26 @@ def test_build_campaign_recommendations_groups_unique_scheduler_rows(tmp_path: P
     )
 
     sms_pre_one = output[
-        (output["name"] == "PRE_AIML_NORMAL_SMS_LAP_HINDI_5TH_PRUTECH_HR_080426_1")
+        (output["name"] == "PREDUE_AIML_SMS_LAP_HINDI_HR_5TH_PRUTECH_080426_1")
     ].iloc[0]
     assert sms_pre_one["mode"] == "SMS"
     assert sms_pre_one["date"] == "D-5"
     assert sms_pre_one["time"] == "09:00:00"
-    assert sms_pre_one["template_name"] == "PREDUE AIML SMS LAP HINDI"
-    assert sms_pre_one["dataset_name"] == "PREDUE AIML HINDI HR SMS LAP NORMAL FOR EMI 5TH"
+    assert sms_pre_one["template_name"] == "PREDUE_AIML_SMS_HINDI"
+    assert sms_pre_one["dataset_name"] == "PREDUE AIML SMS LAP HINDI HR EMI 5TH [D-5] 09"
     assert sms_pre_one["vendor"] == "prutech"
     assert sms_pre_one["active"] == "T"
 
     sms_pre_two = output[
-        (output["name"] == "PRE_AIML_NORMAL_SMS_LAP_HINDI_5TH_PRUTECH_HR_080426_2")
+        (output["name"] == "PREDUE_AIML_SMS_LAP_HINDI_HR_5TH_PRUTECH_080426_2")
     ].iloc[0]
     assert sms_pre_two["date"] == "D-4"
     assert sms_pre_two["time"] == "10:00:00"
 
-    assert "POST_AIML_NORMAL_SMS_LAP_HINDI_5TH_PRUTECH_HR_080426" in set(output["name"])
-    assert "PRE_AIML_NORMAL_WA_LAP_HINDI_5TH_PRUTECH_HR_080426" in set(output["name"])
-    assert "PRE_AIML_NORMAL_IVR_LAP_HINDI_5TH_PRUTECH_HR_080426" in set(output["name"])
-    assert "PRE_AIML_NORMAL_SMS_LAP_HINDI_5TH_KALEYRA_HR_080426_1" in set(output["name"])
+    assert "POSTDUE_AIML_SMS_LAP_HINDI_HR_5TH_PRUTECH_080426" in set(output["name"])
+    assert "PREDUE_AIML_WA_LAP_HINDI_HR_5TH_PRUTECH_080426" in set(output["name"])
+    assert "PREDUE_AIML_VOICE_LAP_HINDI_HR_5TH_PRUTECH_080426" in set(output["name"])
+    assert "PREDUE_AIML_SMS_LAP_HINDI_HR_5TH_KALEYRA_080426_1" in set(output["name"])
 
 
 def test_build_campaign_recommendations_groups_same_time_across_days(tmp_path: Path) -> None:
@@ -269,7 +269,7 @@ def test_build_campaign_recommendations_groups_same_time_across_days(tmp_path: P
 
     assert len(output) == 1
     row = output.iloc[0]
-    assert row["name"] == "PRE_AIML_NORMAL_SMS_LAP_HINDI_5TH_PRUTECH_HR_080426"
+    assert row["name"] == "PREDUE_AIML_SMS_LAP_HINDI_HR_5TH_PRUTECH_080426"
     assert row["date"] == "D-5,D-3"
     assert row["time"] == "09:00:00"
 
@@ -309,7 +309,7 @@ def test_build_campaign_recommendations_groups_same_day_set_across_times(tmp_pat
 
     assert len(output) == 1
     row = output.iloc[0]
-    assert row["name"] == "PRE_AIML_NORMAL_SMS_LAP_HINDI_5TH_PRUTECH_HR_080426"
+    assert row["name"] == "PREDUE_AIML_SMS_LAP_HINDI_HR_5TH_PRUTECH_080426"
     assert row["date"] == "D-5,D-4"
     assert row["time"] == "09:00:00,10:00:00"
 
@@ -348,7 +348,7 @@ def test_build_campaign_mappings_links_accounts_to_grouped_campaign_rows(tmp_pat
     )
 
     assert len(mappings) == 2
-    assert set(mappings["campaign_name"]) == {"PRE_AIML_NORMAL_SMS_LAP_HINDI_5TH_PRUTECH_HR_080426"}
+    assert set(mappings["campaign_name"]) == {"PREDUE_AIML_SMS_LAP_HINDI_HR_5TH_PRUTECH_080426"}
     assert set(mappings["loan_number"]) == {"L1", "L2"}
     assert set(mappings["date"]) == {"D-5,D-4"}
     assert set(mappings["time"]) == {"09:00:00,10:00:00"}
@@ -428,7 +428,7 @@ def test_build_campaign_recommendations_skips_regional_language(tmp_path: Path) 
         run_date=pd.Timestamp("2026-04-08").to_pydatetime(),
     )
 
-    assert "PRE_AIML_NORMAL_SMS_LAP_HINDI_5TH_PRUTECH_HR_080426" in set(output["name"])
+    assert "PREDUE_AIML_SMS_LAP_HINDI_HR_5TH_PRUTECH_080426" in set(output["name"])
     assert not any("REGIONAL" in name for name in output["name"])
     assert not any(output["template_name"].str.contains("REGIONAL", na=False))
     assert not any(output["dataset_name"].str.contains("REGIONAL", na=False))
@@ -566,6 +566,43 @@ def test_build_prediction_population_keeps_base_accounts_without_history() -> No
     assert without_history["APAC_CARD_NUMBER"].tolist() == ["A2"]
 
 
+def test_build_prediction_population_uses_latest_prior_history_for_source_month() -> None:
+    dataset = pd.DataFrame(
+        {
+            "APAC_CARD_NUMBER": ["A1", "A1"],
+            "SOURCE_MONTH": ["FEB-2026", "MAR-2026"],
+            "SOURCE_MONTH_PERIOD": [pd.Period("2026-02", freq="M"), pd.Period("2026-03", freq="M")],
+            "RISK": ["HIGH", "HIGH"],
+            "VERTICAL": ["LAP", "LAP"],
+            "SMS_TOTAL_INTENSITY": [2, 7],
+            "TARGET_MONTH": [pd.NA, pd.NA],
+            "TARGET_MONTH_PERIOD": [pd.Period("2026-03", freq="M"), pd.Period("2026-04", freq="M")],
+            "TARGET_RISK": [pd.NA, pd.NA],
+            "D-5": [pd.NA, pd.NA],
+        }
+    )
+    base_population = pd.DataFrame(
+        {
+            "APAC_CARD_NUMBER": ["A1"],
+            "SOURCE_MONTH": ["APR-2026"],
+            "RISK": ["HIGH"],
+            "VERTICAL": ["LAP"],
+            "collectable_amount": [100.0],
+            "emi_date": ["05/04/2026"],
+        }
+    )
+
+    with_history, without_history = build_prediction_population(
+        dataset=dataset,
+        base_population=base_population,
+        prediction_source_month="APR-2026",
+    )
+
+    assert without_history.empty
+    assert with_history["APAC_CARD_NUMBER"].tolist() == ["A1"]
+    assert with_history.loc[0, "SMS_TOTAL_INTENSITY"] == 7
+    assert with_history.loc[0, "SOURCE_MONTH"] == "APR-2026"
+    assert with_history.loc[0, "SOURCE_MONTH_PERIOD"] == pd.Period("2026-04", freq="M")
 
 
 def test_build_prediction_reason_explains_matching_success_signal() -> None:

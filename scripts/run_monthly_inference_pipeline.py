@@ -51,7 +51,7 @@ MODE_BY_STRATEGY_CHANNEL = {
 NAME_CHANNEL_BY_MODE = {
     "SMS": "SMS",
     "WHATSAPP": "WA",
-    "VOICE": "IVR",
+    "VOICE": "VOICE",
 }
 VENDOR_CONFIG_KEY = "voice.service.vendor-list"
 
@@ -949,7 +949,7 @@ def _due_bucket(day: str) -> tuple[str, str, str]:
 
 def _scheduler_name(
     *,
-    campaign_type: str,
+    due_type: str,
     mode: str,
     vertical: str,
     language: str,
@@ -961,8 +961,29 @@ def _scheduler_name(
     channel = NAME_CHANNEL_BY_MODE[mode]
     vendor_token = vendor.upper().replace("-", "_")
     return (
-        f"{campaign_type}_AIML_NORMAL_{channel}_{vertical.upper()}_{language}_"
-        f"{emi_cycle}TH_{vendor_token}_{risk_code}_{run_token}"
+        f"{due_type}_AIML_{channel}_{vertical.upper()}_{language}_{risk_code}_"
+        f"{emi_cycle}TH_{vendor_token}_{run_token}"
+    )
+
+
+def _template_name(*, due_type: str, mode: str, language: str) -> str:
+    return f"{due_type}_AIML_{NAME_CHANNEL_BY_MODE[mode]}_{language}"
+
+
+def _dataset_time_label(value: str) -> str:
+    labels = []
+    for part in str(value).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        labels.append(datetime.strptime(part, "%H:%M:%S").strftime("%H"))
+    return ",".join(labels)
+
+
+def _dataset_name(*, due_type: str, mode: str, vertical: str, language: str, risk_code: str, emi_cycle: int, date_value: str, time_value: str) -> str:
+    return (
+        f"{due_type} AIML {NAME_CHANNEL_BY_MODE[mode]} {vertical.upper()} {language} {risk_code} "
+        f"EMI {emi_cycle}TH [{date_value}] {_dataset_time_label(time_value)}"
     )
 
 
@@ -1168,14 +1189,15 @@ def _build_campaign_assignment_groups(
                 vertical_value = str(row.get("SOURCE_VERTICAL", row.get("VERTICAL", vertical))).strip().upper()
                 if not vertical_value or vertical_value == "UNKNOWN":
                     vertical_value = vertical.upper()
-                template_name = f"{due_type} AIML {mode} {vertical_value} {language}"
-                dataset_name = (
-                    f"{due_type} AIML {language} {risk_code} {mode} {vertical_value} "
-                    f"NORMAL FOR EMI {emi_cycle}TH"
+                template_name = _template_name(
+                    due_type=due_type,
+                    mode=mode,
+                    language=language,
                 )
+                dataset_name = f"{due_type}|{NAME_CHANNEL_BY_MODE[mode]}|{vertical_value}|{language}|{risk_code}|{emi_cycle}"
                 for vendor in vendors:
                     base_name = _scheduler_name(
-                        campaign_type=campaign_type,
+                        due_type=due_type,
                         mode=mode,
                         vertical=vertical_value,
                         language=language,
@@ -1215,8 +1237,7 @@ def _build_campaign_assignment_groups(
                 "date",
                 "time",
                 "template_name",
-                "dataset_name",
-                "vendor",
+                        "vendor",
                 "active",
                 "source_month",
                 "prediction_month",
@@ -1316,6 +1337,19 @@ def _prepare_campaign_outputs(
     campaigns.loc[duplicate_count > 1, "name"] = (
         campaigns.loc[duplicate_count > 1, "base_name"] + "_" + duplicate_index.loc[duplicate_count > 1].astype(str)
     )
+    campaigns["dataset_name"] = campaigns.apply(
+        lambda row: _dataset_name(
+            due_type=str(row["due_type"]),
+            mode=str(row["mode"]),
+            vertical=str(row["vertical"]),
+            language=str(row["template_name"]).rsplit("_", 1)[-1],
+            risk_code=str(row["risk"]),
+            emi_cycle=int(row["emi_cycle"]),
+            date_value=str(row["date"]),
+            time_value=str(row["time"]),
+        ),
+        axis=1,
+    )
 
     join_cols = [
         "base_name",
@@ -1323,7 +1357,6 @@ def _prepare_campaign_outputs(
         "date",
         "time",
         "template_name",
-        "dataset_name",
         "vendor",
         "active",
         "source_month",
