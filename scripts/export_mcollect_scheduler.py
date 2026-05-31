@@ -185,10 +185,10 @@ def build_cron_trigger_specs(row: pd.Series, *, trigger_state: str) -> list[Cron
 
 
 def language_from_template(template_name: str) -> str:
-    parts = template_name.split()
-    if not parts:
+    tokenized = re.split(r"[ _]+", template_name.strip())
+    if not tokenized:
         return "English"
-    language = parts[-1].title()
+    language = tokenized[-1].title()
     if language.upper() == "ENGLISH":
         return "English"
     return language

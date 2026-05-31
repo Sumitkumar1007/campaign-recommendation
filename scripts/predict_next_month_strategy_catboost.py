@@ -14,7 +14,6 @@ from pipeline_common import (
     month_to_period,
     predict_top_k_by_risk,
     prepare_next_month_dataset,
-    split_by_source_month,
 )
 from project_paths import (
     CASE_DATA_DIR,
@@ -105,12 +104,21 @@ def build_prediction_population(
     base_population: pd.DataFrame,
     prediction_source_month: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    prediction_df = split_by_source_month(dataset, [prediction_source_month], require_target=False)
-    feature_rows = prediction_df[prediction_df["TARGET_MONTH"].isna()].copy()
+    source_month_period = month_to_period(pd.Series([prediction_source_month])).iloc[0]
+    feature_rows = dataset[dataset["TARGET_MONTH"].isna()].copy()
+    feature_rows = feature_rows[feature_rows["SOURCE_MONTH_PERIOD"].notna()].copy()
+    feature_rows = feature_rows[feature_rows["SOURCE_MONTH_PERIOD"] <= source_month_period].copy()
+    feature_rows = (
+        feature_rows.sort_values(["APAC_CARD_NUMBER", "SOURCE_MONTH_PERIOD"])
+        .drop_duplicates(subset=["APAC_CARD_NUMBER"], keep="last")
+        .reset_index(drop=True)
+    )
     feature_rows = feature_rows.drop(
         columns=["RISK", "VERTICAL", "TARGET_MONTH", "TARGET_MONTH_PERIOD", "TARGET_RISK"],
         errors="ignore",
     )
+    feature_rows["SOURCE_MONTH"] = prediction_source_month
+    feature_rows["SOURCE_MONTH_PERIOD"] = source_month_period
 
     merged = base_population.merge(
         feature_rows,

@@ -103,6 +103,7 @@ def build_query(schema: str, table: str) -> sql.Composed:
             d.emi_date
         FROM {table_ref} d
         WHERE {where_sql}
+        and d.apac_card_number='MOB-TEST-Sumit'
         """
     ).format(table_ref=table_ref, where_sql=where_sql)
 
