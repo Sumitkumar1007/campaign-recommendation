@@ -580,6 +580,7 @@ def ensure_campaign_mapping_table(conn, schema: str, table: str) -> None:
                 date TEXT NOT NULL,
                 time TEXT NOT NULL,
                 vendor TEXT NOT NULL,
+                language TEXT NOT NULL,
                 source_month TEXT NOT NULL,
                 prediction_month TEXT NOT NULL,
                 model_name TEXT NOT NULL,
@@ -600,6 +601,11 @@ def ensure_campaign_mapping_table(conn, schema: str, table: str) -> None:
     )
     conn.execute(
         sql.SQL("ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS prediction_reason TEXT").format(
+            table_ref=qualified_identifier(schema, table)
+        )
+    )
+    conn.execute(
+        sql.SQL("ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS language TEXT").format(
             table_ref=qualified_identifier(schema, table)
         )
     )
@@ -1216,6 +1222,7 @@ def _build_campaign_assignment_groups(
                             "template_name": template_name,
                             "dataset_name": dataset_name,
                             "vendor": vendor,
+                            "language": language,
                             "active": "T",
                             "source_month": source_month_label,
                             "prediction_month": prediction_month_label,
@@ -1237,7 +1244,9 @@ def _build_campaign_assignment_groups(
                 "date",
                 "time",
                 "template_name",
-                        "vendor",
+                "dataset_name",
+                "vendor",
+                "language",
                 "active",
                 "source_month",
                 "prediction_month",
@@ -1316,6 +1325,7 @@ def _prepare_campaign_outputs(
                 "date",
                 "time",
                 "vendor",
+                "language",
                 "source_month",
                 "prediction_month",
                 "model_name",
@@ -1358,6 +1368,7 @@ def _prepare_campaign_outputs(
         "time",
         "template_name",
         "vendor",
+        "language",
         "active",
         "source_month",
         "prediction_month",
@@ -1378,6 +1389,7 @@ def _prepare_campaign_outputs(
             "date",
             "time",
             "vendor",
+            "language",
             "source_month",
             "prediction_month",
             "model_name",
@@ -1607,6 +1619,7 @@ def store_campaign_mappings(
                 row["date"],
                 row["time"],
                 row["vendor"],
+                row["language"],
                 row["source_month"],
                 row["prediction_month"],
                 row["model_name"],
@@ -1632,6 +1645,7 @@ def store_campaign_mappings(
             date,
             time,
             vendor,
+            language,
             source_month,
             prediction_month,
             model_name,
@@ -1646,13 +1660,14 @@ def store_campaign_mappings(
             created_by,
             modified_by
         )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (campaign_name, loan_number)
         DO UPDATE SET
             mode = EXCLUDED.mode,
             date = EXCLUDED.date,
             time = EXCLUDED.time,
             vendor = EXCLUDED.vendor,
+            language = EXCLUDED.language,
             source_month = EXCLUDED.source_month,
             prediction_month = EXCLUDED.prediction_month,
             model_name = EXCLUDED.model_name,
