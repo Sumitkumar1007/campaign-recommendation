@@ -116,9 +116,8 @@ Source and target table variables:
 SOURCE_SCHEMA=digital_collections
 SOURCE_TABLE=communications
 TARGET_SCHEMA=digital_collections
-FEATURE_TABLE=ai_ml_recommendations_feature
 PREDICTION_TABLE=ai_ml_recommendations_data
-AUDIT_TABLE=ai_ml_audit_table
+AUDIT_TABLE=api_audit_log
 CAMPAIGN_TABLE=ai_ml_campaign_recommendations
 ```
 
@@ -215,12 +214,11 @@ The pipeline does this:
 8. Loads the saved model bundle from local artifacts or MLflow Registry.
 9. Predicts schedules for `PREDICT_MONTH`.
 10. Saves prediction CSV under `artifacts/predictions/`.
-11. Stores processed feature snapshots in Postgres.
-12. Stores prediction snapshots in Postgres table `ai_ml_recommendations_data`, including `prediction_payload` and rank-aware `prediction_reason`.
-13. Stores a pipeline audit record in Postgres table `ai_ml_audit_table`.
-14. Stores campaign scheduler staging rows in Postgres table `ai_ml_campaign_recommendations`.
-15. Stores per-loan campaign mapping staging rows in `ai_ml_campaign_mapping`, including the business-readable reason for each mapped campaign.
-16. Final MCollect export writes `dataset`, `qrtz_job_details`, `qrtz_triggers`, and `qrtz_cron_triggers` when `scripts/export_mcollect_scheduler.py --write` is run. `digital_rules` templates/verbiages are predefined, managed manually in MCollect, and only referenced by template name from campaign rows.
+11. Stores prediction snapshots in Postgres table `ai_ml_recommendations_data`, including `prediction_payload` and rank-aware `prediction_reason`.
+12. Stores campaign scheduler staging rows in Postgres table `ai_ml_campaign_recommendations`.
+13. Stores per-loan campaign mapping staging rows in `ai_ml_campaign_mapping`, including the business-readable reason for each mapped campaign.
+14. Stores one run-level audit row in Postgres table `api_audit_log` with type `AI-ML RECOMMENDATIONS`.
+15. Final MCollect export writes `dataset`, `qrtz_job_details`, `qrtz_triggers`, and `qrtz_cron_triggers` when `scripts/export_mcollect_scheduler.py --write` is run. `digital_rules` templates/verbiages are predefined, managed manually in MCollect, and only referenced by template name from campaign rows.
 
 When omitted, `SOURCE_MONTH` defaults to the current month and `PREDICT_MONTH` defaults to the following month. If provided, `PREDICT_MONTH` must be exactly one month after `SOURCE_MONTH` for the current next-month model.
 
@@ -327,24 +325,23 @@ PREDUE AIML SMS LAP ENGLISH MR EMI 5TH [D-4,D-2] 09
 
 ## Audit Output
 
-Every monthly inference run writes one audit row to `digital_collections.ai_ml_audit_table`.
+Every monthly inference run writes one audit row to `digital_collections.api_audit_log`.
 
 Audit rows use:
 
 ```text
-audit_key=model
-audit_value=recommendation
+type=AI-ML RECOMMENDATIONS
+request_url=scripts/run_monthly_inference_pipeline.py
 ```
-
-The audit table is upserted by `audit_key`, `audit_value`, `model_name`, `source_month`, and `prediction_month`. Re-running the same model/month updates the existing audit record instead of inserting a duplicate.
 
 The audit record stores:
 
-- Run status: `SUCCESS` or `FAILED`.
-- Prediction completed and failed counts.
-- Failure reason when the pipeline fails.
-- Duration in seconds.
-- Feature table, prediction table, and prediction file path.
+- Run status: `SUCCESS`, `FAILED`, or `SKIPPED`.
+- Source and prediction month reference in `reference_number`.
+- Request metadata in `request_body`.
+- Response summary in `response_body`.
+- Prediction success and failure counts.
+- Total processed records and processing time in milliseconds.
 - `created_by` and `modified_by` as `campaign-model`.
 
 The command can still be overridden through CLI args:
@@ -460,9 +457,8 @@ artifacts/logs/
 Postgres snapshot and staging tables:
 
 ```text
-digital_collections.ai_ml_recommendations_feature
 digital_collections.ai_ml_recommendations_data
-digital_collections.ai_ml_audit_table
+digital_collections.api_audit_log
 digital_collections.ai_ml_campaign_recommendations
 digital_collections.ai_ml_campaign_mapping
 ```

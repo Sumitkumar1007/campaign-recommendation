@@ -222,7 +222,7 @@ def build() -> None:
             "Typical run: after monthly source data is available.",
             "DAG checks data availability before prediction starts.",
             "If input rows are missing, job stops safely and logs reason.",
-            "Successful run stores predictions, campaign rows, mappings, and audit counts.",
+            "Successful run stores predictions, campaign rows, mappings, and audit log summary.",
         ]),
         content_slide("Monthly Inference DAG Steps", [
             "Task 1: load configuration and month parameters.",
@@ -230,7 +230,7 @@ def build() -> None:
             "Task 3: build model-ready features.",
             "Task 4: run CatBoost prediction.",
             "Task 5: store output tables in Postgres.",
-            "Task 6: write audit summary and notify team.",
+            "Task 6: write API audit log row and notify team.",
         ]),
         content_slide("Retraining Pipeline", [
             "Retraining is separate from monthly prediction.",
@@ -257,10 +257,9 @@ def build() -> None:
         ], "Rows without enough history are safely returned as blank recommendations."),
         content_slide("Where Output Goes", [
             "Account-level predictions table: ai_ml_recommendations_data.",
-            "Feature snapshot table: ai_ml_recommendations_feature.",
             "Campaign scheduler table: ai_ml_campaign_recommendations.",
             "Campaign mapping table: ai_ml_campaign_mapping.",
-            "Audit table records run status and counts.",
+            "Audit table: api_audit_log with type AI-ML RECOMMENDATIONS.",
         ]),
         content_slide("Simple Takeaway", [
             "Model converts past communication behavior into next-month campaign guidance.",

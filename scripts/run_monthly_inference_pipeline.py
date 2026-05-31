@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import subprocess
+import uuid
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,7 +63,7 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Incremental monthly inference pipeline: fetch one source month from "
             "Postgres, rebuild local processed data, run inference, and store "
-            "feature/prediction snapshots back to Postgres."
+            "prediction and campaign outputs back to Postgres."
         )
     )
     parser.add_argument("--host", default=os.getenv("PGHOST"))
@@ -83,12 +84,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-schema",
         default=os.getenv("TARGET_SCHEMA", "digital_collections"),
-        help="Schema used for storing processed features and predictions.",
-    )
-    parser.add_argument(
-        "--feature-table",
-        default=os.getenv("FEATURE_TABLE", "ai_ml_recommendations_feature"),
-        help="Target table for processed source-month feature snapshots.",
+        help="Schema used for storing predictions, campaigns, and audit logs.",
     )
     parser.add_argument(
         "--prediction-table",
@@ -97,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--audit-table",
-        default=os.getenv("AUDIT_TABLE", "ai_ml_audit_table"),
+        default=os.getenv("AUDIT_TABLE", "api_audit_log"),
         help="Target table for pipeline audit records.",
     )
     parser.add_argument(
@@ -495,24 +491,6 @@ def download_mlflow_model_bundle(model_uri: str, target_file: Path, logger: logg
     return target_file
 
 
-def ensure_feature_table(conn, schema: str, table: str) -> None:
-    conn.execute(
-        sql.SQL(
-            """
-            CREATE TABLE IF NOT EXISTS {table_ref} (
-                apac_card_number TEXT NOT NULL,
-                source_month TEXT NOT NULL,
-                risk TEXT,
-                feature_payload JSONB NOT NULL,
-                pipeline_version TEXT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL,
-                PRIMARY KEY (apac_card_number, source_month)
-            )
-            """
-        ).format(table_ref=qualified_identifier(schema, table))
-    )
-
-
 def ensure_prediction_table(conn, schema: str, table: str) -> None:
     conn.execute(
         sql.SQL(
@@ -611,67 +589,50 @@ def ensure_campaign_mapping_table(conn, schema: str, table: str) -> None:
     )
 
 
-def ensure_audit_table(conn, schema: str, table: str) -> None:
+def ensure_api_audit_log_table(conn, schema: str, table: str) -> None:
+    sequence_name = f"{table}_seq"
+    conn.execute(
+        sql.SQL("CREATE SEQUENCE IF NOT EXISTS {sequence_ref}").format(
+            sequence_ref=qualified_identifier(schema, sequence_name)
+        )
+    )
     conn.execute(
         sql.SQL(
             """
             CREATE TABLE IF NOT EXISTS {table_ref} (
-                audit_id BIGSERIAL PRIMARY KEY,
-                audit_key TEXT NOT NULL,
-                audit_value TEXT NOT NULL,
-                model_name TEXT NOT NULL,
-                source_month TEXT,
-                prediction_month TEXT,
-                status TEXT NOT NULL,
-                prediction_completed_count INTEGER NOT NULL DEFAULT 0,
-                prediction_failed_count INTEGER NOT NULL DEFAULT 0,
-                failed_reason TEXT,
-                duration_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
-                feature_table TEXT,
-                prediction_table TEXT,
-                prediction_file TEXT,
-                created_at TIMESTAMPTZ NOT NULL,
-                modified_at TIMESTAMPTZ NOT NULL,
-                created_by TEXT NOT NULL,
-                modified_by TEXT NOT NULL
-            )
-            """
-        ).format(table_ref=qualified_identifier(schema, table))
-    )
-    conn.execute(
-        sql.SQL(
-            """
-            DELETE FROM {table_ref} older
-            USING {table_ref} newer
-            WHERE older.audit_id < newer.audit_id
-              AND older.audit_key = newer.audit_key
-              AND older.audit_value = newer.audit_value
-              AND older.model_name = newer.model_name
-              AND older.source_month = newer.source_month
-              AND older.prediction_month = newer.prediction_month
-            """
-        ).format(table_ref=qualified_identifier(schema, table))
-    )
-    conn.execute(
-        sql.SQL(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS {index_name}
-            ON {table_ref} (
-                audit_key,
-                audit_value,
-                model_name,
-                source_month,
-                prediction_month
+                id int8 DEFAULT nextval({sequence_regclass}::regclass) NOT NULL,
+                type varchar(255) NULL,
+                request_url varchar(500) NULL,
+                reference_number varchar(255) NULL,
+                message text NULL,
+                status varchar(255) NULL,
+                request_body text NULL,
+                response_body text NULL,
+                created_by varchar(20) NULL,
+                created_on timestamp NULL,
+                modified_by varchar(20) NULL,
+                modified_on timestamp NULL,
+                delete_flag varchar(20) NULL,
+                channel varchar(255) NULL,
+                tenant_id varchar(255) NULL,
+                module_name varchar(255) NULL,
+                client_name varchar(255) NULL,
+                total_records varchar(255) NULL,
+                success_count varchar(255) NULL,
+                failure_count varchar(255) NULL,
+                processing_time_ms varchar(255) NULL,
+                CONSTRAINT {constraint_name} PRIMARY KEY (id)
             )
             """
         ).format(
-            index_name=sql.Identifier(f"{table}_audit_unique_idx"),
             table_ref=qualified_identifier(schema, table),
+            sequence_regclass=sql.Literal(f"{schema}.{sequence_name}"),
+            constraint_name=sql.Identifier(f"{table}_pkey"),
         )
     )
 
 
-def store_audit_record(
+def store_api_audit_log(
     conn,
     schema: str,
     table: str,
@@ -684,74 +645,83 @@ def store_audit_record(
     prediction_failed_count: int,
     failed_reason: str | None,
     duration_seconds: float,
-    feature_table: str,
     prediction_table: str,
     prediction_file: Path | None,
 ) -> None:
-    ensure_audit_table(conn, schema, table)
-    now = datetime.now(timezone.utc)
+    ensure_api_audit_log_table(conn, schema, table)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     actor = "campaign-model"
+    total_records = int(prediction_completed_count) + int(prediction_failed_count)
+    reference_number = str(uuid.uuid4())
+    request_body = json.dumps(
+        {
+            "model_name": model_name,
+            "source_month": source_month,
+            "prediction_month": prediction_month,
+            "prediction_table": prediction_table,
+        }
+    )
+    response_body = json.dumps(
+        {
+            "prediction_file": str(prediction_file) if prediction_file else None,
+            "status": status,
+            "success_count": int(prediction_completed_count),
+            "failure_count": int(prediction_failed_count),
+            "processing_time_ms": int(duration_seconds * 1000),
+        }
+    )
+    message = failed_reason or (
+        f"Monthly inference {status.lower()} for {source_month} -> {prediction_month} using {model_name}."
+    )
     conn.execute(
         sql.SQL(
             """
             INSERT INTO {table_ref} (
-                audit_key,
-                audit_value,
-                model_name,
-                source_month,
-                prediction_month,
+                type,
+                request_url,
+                reference_number,
+                message,
                 status,
-                prediction_completed_count,
-                prediction_failed_count,
-                failed_reason,
-                duration_seconds,
-                feature_table,
-                prediction_table,
-                prediction_file,
-                created_at,
-                modified_at,
+                request_body,
+                response_body,
                 created_by,
-                modified_by
+                created_on,
+                modified_by,
+                modified_on,
+                delete_flag,
+                channel,
+                tenant_id,
+                module_name,
+                client_name,
+                total_records,
+                success_count,
+                failure_count,
+                processing_time_ms
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (
-                audit_key,
-                audit_value,
-                model_name,
-                source_month,
-                prediction_month
-            )
-            DO UPDATE SET
-                status = EXCLUDED.status,
-                prediction_completed_count = EXCLUDED.prediction_completed_count,
-                prediction_failed_count = EXCLUDED.prediction_failed_count,
-                failed_reason = EXCLUDED.failed_reason,
-                duration_seconds = EXCLUDED.duration_seconds,
-                feature_table = EXCLUDED.feature_table,
-                prediction_table = EXCLUDED.prediction_table,
-                prediction_file = EXCLUDED.prediction_file,
-                modified_at = EXCLUDED.modified_at,
-                modified_by = EXCLUDED.modified_by
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
         ).format(table_ref=qualified_identifier(schema, table)),
         (
-            "model",
-            "recommendation",
-            model_name,
-            source_month,
-            prediction_month,
+            "AI-ML RECOMMENDATIONS",
+            "scripts/run_monthly_inference_pipeline.py",
+            reference_number,
+            message,
             status,
-            int(prediction_completed_count),
-            int(prediction_failed_count),
-            failed_reason,
-            float(duration_seconds),
-            feature_table,
-            prediction_table,
-            str(prediction_file) if prediction_file else None,
-            now,
+            request_body,
+            response_body,
+            actor,
             now,
             actor,
-            actor,
+            now,
+            "F",
+            None,
+            None,
+            "digital",
+            "muthoot",
+            str(total_records),
+            str(int(prediction_completed_count)),
+            str(int(prediction_failed_count)),
+            str(int(duration_seconds * 1000)),
         ),
     )
 
@@ -776,7 +746,7 @@ def write_pipeline_audit(
             password=args.password,
         )
         with connect_db(config) as conn:
-            store_audit_record(
+            store_api_audit_log(
                 conn,
                 args.target_schema,
                 args.audit_table,
@@ -788,66 +758,12 @@ def write_pipeline_audit(
                 prediction_failed_count=prediction_failed_count,
                 failed_reason=failed_reason,
                 duration_seconds=duration_seconds,
-                feature_table=args.feature_table,
                 prediction_table=args.prediction_table,
                 prediction_file=prediction_file,
             )
             conn.commit()
     except Exception:
         logger.exception("Failed to write pipeline audit record.")
-
-
-def store_feature_snapshots(
-    conn,
-    schema: str,
-    table: str,
-    source_month_label: str,
-    pipeline_version: str,
-) -> int:
-    feature_file = FEATURE_DATA_DIR / "strategy_monthly_features.csv"
-    df = pd.read_csv(feature_file)
-    df = df[df["MONTH"] == source_month_label].copy()
-    if df.empty:
-        return 0
-
-    ensure_feature_table(conn, schema, table)
-    now = datetime.now(timezone.utc)
-    rows = []
-    for _, row in df.iterrows():
-        payload = row.drop(labels=["APAC_CARD_NUMBER", "MONTH", "RISK"]).to_dict()
-        rows.append(
-            (
-                str(row["APAC_CARD_NUMBER"]),
-                source_month_label,
-                row.get("RISK"),
-                Jsonb(payload),
-                pipeline_version,
-                now,
-            )
-        )
-
-    query = sql.SQL(
-        """
-        INSERT INTO {table_ref} (
-            apac_card_number,
-            source_month,
-            risk,
-            feature_payload,
-            pipeline_version,
-            created_at
-        )
-        VALUES (%s, %s, %s, %s, %s, %s)
-        ON CONFLICT (apac_card_number, source_month)
-        DO UPDATE SET
-            risk = EXCLUDED.risk,
-            feature_payload = EXCLUDED.feature_payload,
-            pipeline_version = EXCLUDED.pipeline_version,
-            created_at = EXCLUDED.created_at
-        """
-    ).format(table_ref=qualified_identifier(schema, table))
-    with conn.cursor() as cur:
-        cur.executemany(query, rows)
-    return len(rows)
 
 
 def store_prediction_snapshots(
@@ -1853,13 +1769,6 @@ def main() -> None:
                         fallback_vendor=args.campaign_vendor,
                         logger=logger,
                     )
-                    feature_rows = store_feature_snapshots(
-                        conn,
-                        args.target_schema,
-                        args.feature_table,
-                        source_month_label,
-                        pipeline_version="v1",
-                    )
                     prediction_rows = store_prediction_snapshots(
                         conn,
                         args.target_schema,
@@ -1896,7 +1805,6 @@ def main() -> None:
                         model_name=args.model,
                     )
                     conn.commit()
-                print(f"Stored {feature_rows:,} feature snapshots in Postgres")
                 print(f"Stored {prediction_rows:,} prediction snapshots in Postgres")
                 print(f"Stored {campaign_rows:,} campaign recommendation snapshots in Postgres")
                 print(f"Stored {mapping_rows:,} campaign mapping snapshots in Postgres")

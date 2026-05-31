@@ -74,6 +74,6 @@ Campaign recommendation ML pipeline with MCollect Digital scheduler integration.
 ## Last Context Snapshot
 - Monthly inference for `APR-2026 -> MAY-2026` completed successfully with `1` prediction row for `MOB-TEST-Sumit`.
 - Current staged campaign output for that run is `14` campaigns and `14` mappings.
-- Monthly inference stored `2,192` feature snapshots, `1` prediction snapshot, `14` campaign recommendations, and `14` campaign mappings in Postgres.
+- Monthly inference stored `1` prediction snapshot, `14` campaign recommendations, `14` campaign mappings, and one `api_audit_log` row in Postgres.
 - Export script now writes only `dataset`, `qrtz_job_details`, `qrtz_triggers`, and `qrtz_cron_triggers`. Existing `digital_rules` templates are referenced by name and remain manually managed.
 - Current export dry run for `APR-2026 -> MAY-2026`: `14` campaigns, `7` datasets, `4` template refs, `14` jobs, `14` triggers.
