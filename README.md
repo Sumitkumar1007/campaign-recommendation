@@ -218,8 +218,9 @@ The pipeline does this:
 11. Stores processed feature snapshots in Postgres.
 12. Stores prediction snapshots in Postgres table `ai_ml_recommendations_data`, including `prediction_payload` and rank-aware `prediction_reason`.
 13. Stores a pipeline audit record in Postgres table `ai_ml_audit_table`.
-14. Stores campaign scheduler rows in Postgres table `ai_ml_campaign_recommendations`.
-15. Stores per-loan campaign mapping rows in `ai_ml_campaign_mapping`, including the business-readable reason for each mapped campaign.
+14. Stores campaign scheduler staging rows in Postgres table `ai_ml_campaign_recommendations`.
+15. Stores per-loan campaign mapping staging rows in `ai_ml_campaign_mapping`, including the business-readable reason for each mapped campaign.
+16. Final MCollect tables `dataset`, `digital_rules`, `qrtz_job_details`, `qrtz_triggers`, and `qrtz_cron_triggers` are populated only when `scripts/export_mcollect_scheduler.py --write` is run.
 
 When omitted, `SOURCE_MONTH` defaults to the current month and `PREDICT_MONTH` defaults to the following month. If provided, `PREDICT_MONTH` must be exactly one month after `SOURCE_MONTH` for the current next-month model.
 
@@ -276,7 +277,7 @@ Example:
 
 ## Campaign Scheduler Output
 
-The pipeline creates campaign-level scheduler rows in `digital_collections.ai_ml_campaign_recommendations`. This table is separate from account-level recommendations in `digital_collections.ai_ml_recommendations_data` and per-loan scheduler mappings in `digital_collections.ai_ml_campaign_mapping`.
+The pipeline first creates campaign-level staging rows in `digital_collections.ai_ml_campaign_recommendations`. This table is separate from account-level recommendations in `digital_collections.ai_ml_recommendations_data` and per-loan scheduler mappings in `digital_collections.ai_ml_campaign_mapping`. The final MCollect tables are populated in a second step by `scripts/export_mcollect_scheduler.py --write`.
 
 Current campaign scheduler rules:
 
@@ -284,7 +285,6 @@ Current campaign scheduler rules:
 - `D+1,D+2,D+3,D+4,D+5` become `POST` / `POSTDUE`.
 - Channel mapping is `SMS -> SMS`, `WH -> WHATSAPP`, and `IVR -> VOICE`.
 - Risk mapping is `LOW -> LR`, `MEDIUM -> MR`, and `HIGH -> HR`.
-- Campaign type is currently `NORMAL` only.
 - Scheduler rows are unique campaign definitions, not per-customer rows.
 - If the same campaign definition has multiple model-selected hours, the `time` field stores comma-separated values such as `09:00:00,10:00:00`.
 - Metadata columns include `source_month`, `prediction_month`, `model_name`, `emi_cycle`, `risk`, `vertical`, `campaign_type`, `due_type`, `created_at`, `modified_at`, `created_by`, and `modified_by`.
@@ -292,25 +292,37 @@ Current campaign scheduler rules:
 Scheduler naming pattern:
 
 ```text
-{PRE/POST}_AIML_NORMAL_{IVR/SMS/WA}_{VERTICAL}_{LANGUAGE}_{EMI_DATE}TH_{VENDOR}_{LR/MR/HR}_{DDMMYY}
+{PREDUE/POSTDUE}_AIML_{SMS/WA/VOICE}_{VERTICAL}_{LANGUAGE}_{LR/MR/HR}_{EMI_DATE}TH_{VENDOR}_{DDMMYY}_{N}
 ```
 
 Example:
 
 ```text
-PRE_AIML_NORMAL_IVR_LAP_HINDI_5TH_PRUTECH_CPASS_HR_210426
+PREDUE_AIML_SMS_LAP_ENGLISH_MR_5TH_KALEYRA_200526_2
 ```
 
 Template name pattern:
 
 ```text
-{PREDUE/POSTDUE} AIML {SMS/WHATSAPP/VOICE} {VERTICAL} {LANGUAGE}
+{PREDUE/POSTDUE}_AIML_{SMS/WA/VOICE}_{LANGUAGE}
+```
+
+Example:
+
+```text
+PREDUE_AIML_SMS_ENGLISH
 ```
 
 Dataset name pattern:
 
 ```text
-{PREDUE/POSTDUE} AIML {LANGUAGE} {LR/MR/HR} {SMS/WHATSAPP/VOICE} {VERTICAL} NORMAL FOR EMI {EMI_DATE}TH
+{PREDUE/POSTDUE} AIML {SMS/WA/VOICE} {VERTICAL} {LANGUAGE} {LR/MR/HR} EMI {EMI_DATE}TH [{D-4,D-2}] {HH}
+```
+
+Example:
+
+```text
+PREDUE AIML SMS LAP ENGLISH MR EMI 5TH [D-4,D-2] 09
 ```
 
 ## Audit Output
@@ -445,7 +457,7 @@ Application logs:
 artifacts/logs/
 ```
 
-Postgres snapshot tables:
+Postgres snapshot and staging tables:
 
 ```text
 digital_collections.ai_ml_recommendations_feature
@@ -453,6 +465,16 @@ digital_collections.ai_ml_recommendations_data
 digital_collections.ai_ml_audit_table
 digital_collections.ai_ml_campaign_recommendations
 digital_collections.ai_ml_campaign_mapping
+```
+
+Final MCollect target tables after export:
+
+```text
+digital_collections.dataset
+digital_collections.digital_rules
+digital_collections.qrtz_job_details
+digital_collections.qrtz_triggers
+digital_collections.qrtz_cron_triggers
 ```
 
 ## Explainability
