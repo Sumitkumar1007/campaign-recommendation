@@ -21,7 +21,7 @@ from fetch_month_from_postgres import emi_cycle_dates, month_bounds, resolve_emi
 from generate_strategy_dataset import bucket_send_hour, candidate_hours as dataset_candidate_hours, process_chunk
 
 from quartz_job_data import build_mcollect_job_data, serialize_quartz_job_data_map
-from export_mcollect_scheduler import build_cron_trigger_specs, relative_campaign_day_to_date
+from export_mcollect_scheduler import build_cron_trigger_specs, dataset_query_for, relative_campaign_day_to_date
 from run_monthly_inference_pipeline import (
     build_campaign_mappings,
     build_campaign_recommendations,
@@ -352,6 +352,7 @@ def test_build_campaign_mappings_links_accounts_to_grouped_campaign_rows(tmp_pat
     assert set(mappings["loan_number"]) == {"L1", "L2"}
     assert set(mappings["date"]) == {"D-5,D-4"}
     assert set(mappings["time"]) == {"09:00:00,10:00:00"}
+    assert set(mappings["language"]) == {"HINDI"}
 
 
 
@@ -391,6 +392,7 @@ def test_build_campaign_mappings_includes_business_readable_reason(tmp_path: Pat
     )
 
     assert "prediction_reason" in mappings.columns
+    assert mappings.loc[0, "language"] == "HINDI"
     assert mappings.loc[0, "prediction_reason"].startswith("D-5: SMS at 9AM in Hindi is recommended")
     assert "early reminder" in mappings.loc[0, "prediction_reason"]
 
@@ -673,6 +675,38 @@ def test_build_prediction_reason_explains_no_history_blank_predictions() -> None
         "early-reminder evidence for this day."
     )
     assert set(reason) == set(DAY_COLUMNS)
+
+
+def test_dataset_query_for_uses_mapping_table_filters() -> None:
+    row = pd.Series({
+        "mode": "SMS",
+        "vertical": "LAP",
+        "template_name": "POSTDUE_AIML_SMS_ENGLISH",
+        "risk": "MR",
+        "emi_cycle": 5,
+        "date": "D+1",
+        "time": "16:00:00",
+    })
+
+    query = dataset_query_for(
+        row,
+        schema="digital_collections",
+        campaign_table="ai_ml_campaign_recommendations",
+        mapping_table="ai_ml_campaign_mapping",
+    )
+
+    assert query == (
+        "select distinct dc.* "
+        "from digital_collections.digital_cases dc "
+        "join digital_collections.ai_ml_campaign_mapping amcm on dc.apac_card_number = amcm.loan_number "
+        "where amcm.\"mode\" = 'SMS' "
+        "and amcm.vertical = 'LAP' "
+        "and amcm.\"language\" = 'ENGLISH' "
+        "and amcm.risk = 'MR' "
+        "and amcm.emi_cycle = 5 "
+        "and amcm.\"date\" = 'D+1' "
+        "and amcm.\"time\" = '16:00:00'"
+    )
 
 
 def test_serialize_quartz_job_data_map_matches_existing_sms_job_data() -> None:

@@ -206,20 +206,25 @@ def placeholder_verbiage(row: pd.Series) -> str:
 
 
 def dataset_query_for(row: pd.Series, *, schema: str, campaign_table: str, mapping_table: str) -> str:
-    dataset_name = str(row["dataset_name"]).replace("'", "''")
-    source_month = str(row["source_month"]).replace("'", "''")
-    prediction_month = str(row["prediction_month"]).replace("'", "''")
-    model_name = str(row["model_name"]).replace("'", "''")
+    mode = str(row["mode"]).replace("'", "''")
+    vertical = str(row["vertical"]).replace("'", "''")
+    language = language_from_template(str(row["template_name"])).upper().replace("'", "''")
+    risk = str(row["risk"]).replace("'", "''")
+    emi_cycle = int(row["emi_cycle"])
+    date_value = str(row["date"]).replace("'", "''")
+    time_value = str(row["time"]).replace("'", "''")
     schema_prefix = f"{schema}." if schema else ""
     return (
         "select distinct dc.* "
         f"from {schema_prefix}digital_cases dc "
-        f"join {schema_prefix}{mapping_table} aiml_map on aiml_map.loan_number = dc.apac_card_number "
-        f"join {schema_prefix}{campaign_table} aiml_campaign on aiml_campaign.name = aiml_map.campaign_name "
-        f"where aiml_campaign.dataset_name = '{dataset_name}' "
-        f"and aiml_campaign.source_month = '{source_month}' "
-        f"and aiml_campaign.prediction_month = '{prediction_month}' "
-        f"and aiml_campaign.model_name = '{model_name}'"
+        f"join {schema_prefix}{mapping_table} amcm on dc.apac_card_number = amcm.loan_number "
+        f"where amcm.\"mode\" = '{mode}' "
+        f"and amcm.vertical = '{vertical}' "
+        f"and amcm.\"language\" = '{language}' "
+        f"and amcm.risk = '{risk}' "
+        f"and amcm.emi_cycle = {emi_cycle} "
+        f"and amcm.\"date\" = '{date_value}' "
+        f"and amcm.\"time\" = '{time_value}'"
     )
 
 
