@@ -220,7 +220,7 @@ The pipeline does this:
 13. Stores a pipeline audit record in Postgres table `ai_ml_audit_table`.
 14. Stores campaign scheduler staging rows in Postgres table `ai_ml_campaign_recommendations`.
 15. Stores per-loan campaign mapping staging rows in `ai_ml_campaign_mapping`, including the business-readable reason for each mapped campaign.
-16. Final MCollect tables `dataset`, `digital_rules`, `qrtz_job_details`, `qrtz_triggers`, and `qrtz_cron_triggers` are populated only when `scripts/export_mcollect_scheduler.py --write` is run.
+16. Final MCollect export writes `dataset`, `qrtz_job_details`, `qrtz_triggers`, and `qrtz_cron_triggers` when `scripts/export_mcollect_scheduler.py --write` is run. `digital_rules` templates/verbiages are predefined, managed manually in MCollect, and only referenced by template name from campaign rows.
 
 When omitted, `SOURCE_MONTH` defaults to the current month and `PREDICT_MONTH` defaults to the following month. If provided, `PREDICT_MONTH` must be exactly one month after `SOURCE_MONTH` for the current next-month model.
 
@@ -471,10 +471,15 @@ Final MCollect target tables after export:
 
 ```text
 digital_collections.dataset
-digital_collections.digital_rules
 digital_collections.qrtz_job_details
 digital_collections.qrtz_triggers
 digital_collections.qrtz_cron_triggers
+```
+
+Manually managed MCollect template table:
+
+```text
+digital_collections.digital_rules
 ```
 
 ## Explainability

@@ -21,7 +21,12 @@ from fetch_month_from_postgres import emi_cycle_dates, month_bounds, resolve_emi
 from generate_strategy_dataset import bucket_send_hour, candidate_hours as dataset_candidate_hours, process_chunk
 
 from quartz_job_data import build_mcollect_job_data, serialize_quartz_job_data_map
-from export_mcollect_scheduler import build_cron_trigger_specs, dataset_query_for, relative_campaign_day_to_date
+from export_mcollect_scheduler import (
+    DirectDatabaseMcollectPublisher,
+    build_cron_trigger_specs,
+    dataset_query_for,
+    relative_campaign_day_to_date,
+)
 from run_monthly_inference_pipeline import (
     build_campaign_mappings,
     build_campaign_recommendations,
@@ -707,6 +712,67 @@ def test_dataset_query_for_uses_mapping_table_filters() -> None:
         "and amcm.\"date\" = 'D+1' "
         "and amcm.\"time\" = '16:00:00'"
     )
+
+
+class _RecordingCursor:
+    def __init__(self, log: list[tuple[str, str]]) -> None:
+        self.log = log
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+    def execute(self, query, params=None) -> None:
+        self.log.append(("execute", str(query)))
+
+    def executemany(self, query, params_seq) -> None:
+        self.log.append(("executemany", str(query)))
+
+
+class _RecordingConn:
+    def __init__(self) -> None:
+        self.log: list[tuple[str, str]] = []
+
+    def execute(self, query, params=None) -> None:
+        self.log.append(("execute", str(query)))
+
+    def cursor(self) -> _RecordingCursor:
+        return _RecordingCursor(self.log)
+
+
+def test_mcollect_publish_skips_digital_rules_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    campaigns = pd.DataFrame(
+        [
+            {
+                "name": "camp-1",
+                "mode": "SMS",
+                "date": "D+1",
+                "time": "16:00:00",
+                "template_name": "POSTDUE_AIML_SMS_ENGLISH",
+                "dataset_name": "dataset-1",
+                "vendor": "kaleyra",
+                "vertical": "LAP",
+                "risk": "MR",
+                "emi_cycle": 5,
+            }
+        ]
+    )
+    conn = _RecordingConn()
+    publisher = DirectDatabaseMcollectPublisher(
+        conn,
+        schema="digital_collections",
+        campaign_table="ai_ml_campaign_recommendations",
+        mapping_table="ai_ml_campaign_mapping",
+        trigger_state="PAUSED",
+    )
+    monkeypatch.setattr(publisher, "_replace_quartz_jobs", lambda campaigns: 2)
+
+    summary = publisher.publish(campaigns)
+
+    assert summary.templates == 1
+    assert all("digital_rules" not in query.lower() for _, query in conn.log)
 
 
 def test_serialize_quartz_job_data_map_matches_existing_sms_job_data() -> None:
