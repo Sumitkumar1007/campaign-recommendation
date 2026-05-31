@@ -33,11 +33,6 @@ JOB_GROUP_BY_MODE = {
     "WHATSAPP": "WHATSAPP",
     "VOICE": "VOICE",
 }
-DIGITAL_RULE_MODE_BY_MODE = {
-    "SMS": "SMS",
-    "WHATSAPP": "WHATSAPP",
-    "VOICE": "VOICE",
-}
 
 
 @dataclass(frozen=True)
@@ -64,7 +59,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Export ai_ml_campaign_recommendations into MCollect Digital dataset, "
-            "digital_rules, and Quartz scheduler tables. Dry-run by default."
+            "reusing existing template names and writing dataset and Quartz scheduler tables. "
+            "Dry-run by default."
         )
     )
     parser.add_argument("--host", default=os.getenv("PGHOST"))
@@ -184,31 +180,10 @@ def build_cron_trigger_specs(row: pd.Series, *, trigger_state: str) -> list[Cron
     return specs
 
 
-def language_from_template(template_name: str) -> str:
-    tokenized = re.split(r"[ _]+", template_name.strip())
-    if not tokenized:
-        return "English"
-    language = tokenized[-1].title()
-    if language.upper() == "ENGLISH":
-        return "English"
-    return language
-
-
-def placeholder_verbiage(row: pd.Series) -> str:
-    mode = str(row["mode"]).upper()
-    language = language_from_template(str(row["template_name"]))
-    if mode == "VOICE":
-        return "NA"
-    return (
-        f"AIML generated {str(row['due_type']).lower()} {mode.lower()} template "
-        f"for {str(row['vertical']).title()} in {language}."
-    )
-
-
 def dataset_query_for(row: pd.Series, *, schema: str, campaign_table: str, mapping_table: str) -> str:
     mode = str(row["mode"]).replace("'", "''")
     vertical = str(row["vertical"]).replace("'", "''")
-    language = language_from_template(str(row["template_name"])).upper().replace("'", "''")
+    language = str(row["template_name"]).rsplit("_", 1)[-1].upper().replace("'", "''")
     risk = str(row["risk"]).replace("'", "''")
     emi_cycle = int(row["emi_cycle"])
     date_value = str(row["date"]).replace("'", "''")
@@ -264,7 +239,6 @@ class DirectDatabaseMcollectPublisher:
         now = datetime.now(timezone.utc)
         self._sync_sequences()
         self._upsert_datasets(campaigns, now=now)
-        self._upsert_templates(campaigns, now=now)
         trigger_count = self._replace_quartz_jobs(campaigns)
         return ExportSummary(
             campaigns=len(campaigns),
@@ -275,7 +249,7 @@ class DirectDatabaseMcollectPublisher:
         )
 
     def _sync_sequences(self) -> None:
-        for table_name in ("dataset", "digital_rules"):
+        for table_name in ("dataset",):
             self.conn.execute(
                 sql.SQL(
                     """
@@ -328,56 +302,6 @@ class DirectDatabaseMcollectPublisher:
         with self.conn.cursor() as cur:
             cur.executemany(query, dataset_rows)
 
-    def _upsert_templates(self, campaigns: pd.DataFrame, *, now: datetime) -> None:
-        template_rows = []
-        for template_name, group in campaigns.groupby("template_name", sort=True):
-            row = group.iloc[0]
-            template_rows.append(
-                (
-                    template_name,
-                    DIGITAL_RULE_MODE_BY_MODE.get(str(row["mode"]).upper(), str(row["mode"]).upper()),
-                    "",
-                    "TEST_DLT_TEMPLATE_ID",
-                    placeholder_verbiage(row),
-                    "",
-                    language_from_template(str(template_name)),
-                    True,
-                    ACTOR,
-                    now,
-                    ACTOR,
-                    now,
-                    None,
-                    None,
-                    False,
-                    "",
-                    str(row["due_type"]),
-                    False,
-                    False,
-                )
-            )
-        query = sql.SQL(
-            """
-            INSERT INTO {table_ref} (
-                iteration, mode_, sender_id, dlt_temp_id, verbiage, params,
-                language, active, created_by, created_date, last_modified_by,
-                last_modified_date, deleted_by, deleted_date,
-                collectable_amount_active, collectable_amount_column,
-                campaign_identifier, media_attachment_active, multi_apac
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (iteration)
-            DO UPDATE SET
-                mode_ = EXCLUDED.mode_,
-                verbiage = EXCLUDED.verbiage,
-                language = EXCLUDED.language,
-                active = EXCLUDED.active,
-                last_modified_by = EXCLUDED.last_modified_by,
-                last_modified_date = EXCLUDED.last_modified_date,
-                campaign_identifier = EXCLUDED.campaign_identifier
-            """
-        ).format(table_ref=qualified_identifier(self.schema, "digital_rules"))
-        with self.conn.cursor() as cur:
-            cur.executemany(query, template_rows)
 
     def _replace_quartz_jobs(self, campaigns: pd.DataFrame) -> int:
         trigger_count = 0

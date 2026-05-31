@@ -25,10 +25,10 @@ Campaign recommendation ML pipeline with MCollect Digital scheduler integration.
    - `digital_collections.ai_ml_campaign_mapping`
 3. Export script converts staging rows into MCollect Digital tables:
    - `dataset`
-   - `digital_rules`
    - `qrtz_job_details`
    - `qrtz_triggers`
    - `qrtz_cron_triggers`
+4. `digital_rules` templates are managed manually as a one-time MCollect setup and are only referenced by template name from campaign rows.
 
 ## Important Decisions
 - Naming format now uses:
@@ -38,11 +38,11 @@ Campaign recommendation ML pipeline with MCollect Digital scheduler integration.
 - `qrtz_job_details.job_data` is Java serialized Quartz `JobDataMap`, not JSON/text.
 - Direct Quartz DB writing is temporary. Replace `DirectDatabaseMcollectPublisher` if/when MCollect provides an API.
 - `scripts/export_mcollect_scheduler.py` is dry-run by default; actual writes require `--write`.
+- `digital_rules` rows are not created by this repo. Templates/verbiages are predefined and created manually once in MCollect using names like `PREDUE_AIML_SMS_ENGLISH`.
 - Use `--trigger-state PAUSED` first for MCollect review before live scheduler execution.
 - Latest known monthly run: `APR-2026 -> MAY-2026`, model `catboost_3m`.
 
 ## Known Risks
-- `digital_rules` export currently uses generated placeholder verbiage/DLT values because model output has template names, not final DLT content.
 - Confirm MCollect job class mapping before production writes:
   - `SMS -> com.company.api_test.jobs.BatchSMSJob`
   - `WHATSAPP -> com.company.api_test.jobs.BatchWhatsappJob`
@@ -74,5 +74,6 @@ Campaign recommendation ML pipeline with MCollect Digital scheduler integration.
 ## Last Context Snapshot
 - Monthly inference for `APR-2026 -> MAY-2026` completed successfully with `1` prediction row for `MOB-TEST-Sumit`.
 - Current staged campaign output for that run is `14` campaigns and `14` mappings.
-- The five final MCollect tables are still written only by `scripts/export_mcollect_scheduler.py`, not by monthly inference itself.
-- Current export dry run for `APR-2026 -> MAY-2026`: `14` campaigns, `7` datasets, `4` templates, `14` jobs, `14` triggers.
+- Monthly inference stored `2,192` feature snapshots, `1` prediction snapshot, `14` campaign recommendations, and `14` campaign mappings in Postgres.
+- Export script now writes only `dataset`, `qrtz_job_details`, `qrtz_triggers`, and `qrtz_cron_triggers`. Existing `digital_rules` templates are referenced by name and remain manually managed.
+- Current export dry run for `APR-2026 -> MAY-2026`: `14` campaigns, `7` datasets, `4` template refs, `14` jobs, `14` triggers.
