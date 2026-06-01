@@ -154,17 +154,26 @@ All DB credentials and deployment-specific values should come from `.env`, a sec
 
 ## Python Setup
 
-Activate the existing environment:
+This repo is installed from `pyproject.toml`. There is no `requirements.txt`.
+
+Create and activate a virtual environment:
 
 ```bash
+python3 -m venv venv
 source venv/bin/activate
 ```
 
-Install project dependencies if needed:
+Install project dependencies from `pyproject.toml`:
 
 ```bash
+pip install -U pip
 pip install -e .
-pip install "psycopg[binary]" "catboost>=1.2,<2" "mlflow>=2.12,<3"
+```
+
+If you need test tools too:
+
+```bash
+pip install -e ".[dev]"
 ```
 
 ## End-To-End Monthly Inference
@@ -352,6 +361,40 @@ python scripts/run_monthly_inference_pipeline.py \
   --predict-month 2026-05 \
   --model catboost_3m
 ```
+
+## Standalone Target Writer
+
+Use this when source inference runs on one server but final DB writes must go to another Postgres host. The script reads an existing local prediction CSV and writes only target-side tables.
+
+Script:
+
+```text
+scripts/write_target_db_outputs.py
+```
+
+Example:
+
+```bash
+./venv/bin/python scripts/write_target_db_outputs.py \
+  --host mobi-con-uat-db-1.ct2a22a40juz.ap-south-1.rds.amazonaws.com \
+  --port 5432 \
+  --dbname Muthoot-mCollect-UAT \
+  --user muthoot-mcollect-uat \
+  --password muthoot-mcollect-ua \
+  --prediction-file artifacts/predictions/2026_05_strategy_predictions_catboost_3m.csv \
+  --source-month 2026-04 \
+  --predict-month 2026-05 \
+  --model catboost_3m
+```
+
+It writes:
+
+- `ai_ml_recommendations_data`
+- `ai_ml_campaign_recommendations`
+- `ai_ml_campaign_mapping`
+- `api_audit_log`
+
+It does not write MCollect Quartz tables. For those, run `scripts/export_mcollect_scheduler.py` after campaign staging rows exist.
 
 ## Inference Only
 
