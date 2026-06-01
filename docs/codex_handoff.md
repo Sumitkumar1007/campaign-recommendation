@@ -9,12 +9,13 @@ Campaign recommendation ML pipeline with MCollect Digital scheduler integration.
 ## Operating Rules
 - GitHub only. Do not push to or operate on the GitLab remote unless explicitly asked.
 - Prefer targeted `rg` searches and focused file reads; avoid broad repo analysis unless needed.
-- Use `./venv/bin/python` for project scripts/tests.
+- Use `./venv/bin/python` for project scripts/tests. Install repo from `pyproject.toml` via `pip install -e .`; no `requirements.txt`.
 - Keep generated data, model files, logs, predictions, and `.env` out of commits.
 
 ## Key Entry Points
 - Monthly inference: `scripts/run_monthly_inference_pipeline.py`
 - MCollect export: `scripts/export_mcollect_scheduler.py`
+- Standalone target writer: `scripts/write_target_db_outputs.py`
 - Quartz job data serializer: `scripts/quartz_job_data.py`
 - Main tests: `tests/test_monthly_pipeline.py`
 
@@ -69,6 +70,17 @@ Campaign recommendation ML pipeline with MCollect Digital scheduler integration.
   --write
 
 ./venv/bin/python -m pytest -q tests/test_monthly_pipeline.py
+
+./venv/bin/python scripts/write_target_db_outputs.py \
+  --host mobi-con-uat-db-1.ct2a22a40juz.ap-south-1.rds.amazonaws.com \
+  --port 5432 \
+  --dbname Muthoot-mCollect-UAT \
+  --user muthoot-mcollect-uat \
+  --password muthoot-mcollect-ua \
+  --prediction-file artifacts/predictions/2026_05_strategy_predictions_catboost_3m.csv \
+  --source-month 2026-04 \
+  --predict-month 2026-05 \
+  --model catboost_3m
 ```
 
 ## Last Context Snapshot
