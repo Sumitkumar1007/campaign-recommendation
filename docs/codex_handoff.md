@@ -72,11 +72,11 @@ Campaign recommendation ML pipeline with MCollect Digital scheduler integration.
 ./venv/bin/python -m pytest -q tests/test_monthly_pipeline.py
 
 ./venv/bin/python scripts/write_target_db_outputs.py \
-  --host mobi-con-uat-db-1.ct2a22a40juz.ap-south-1.rds.amazonaws.com \
+  --host <target_db_host> \
   --port 5432 \
-  --dbname Muthoot-mCollect-UAT \
-  --user muthoot-mcollect-uat \
-  --password muthoot-mcollect-ua \
+  --dbname <target_db_name> \
+  --user <target_db_user> \
+  --password <target_db_password> \
   --prediction-file artifacts/predictions/2026_05_strategy_predictions_catboost_3m.csv \
   --source-month 2026-04 \
   --predict-month 2026-05 \

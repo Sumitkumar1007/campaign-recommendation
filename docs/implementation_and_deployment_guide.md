@@ -560,3 +560,229 @@ This project now supports:
 - CatBoost 3-month next-month model as the current production default
 - batch inference, account-level explanation, and rank-aware prediction reasons
 - saved model artifact and reproducible CLI workflow
+
+## 24. New Server Setup
+
+Use this when moving project to another Linux server for one-time or recurring monthly runs.
+
+### 24.1 Clone Repository
+
+```bash
+git clone <github_repo_url>
+cd recommendation
+git checkout feat/integration-with-digital
+```
+
+If repository already exists:
+
+```bash
+git fetch
+git checkout feat/integration-with-digital
+git pull
+```
+
+### 24.2 Python Environment
+
+This project is installed from `pyproject.toml`. There is no `requirements.txt`.
+
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -U pip
+pip install -e .
+```
+
+If test tools are needed too:
+
+```bash
+pip install -e ".[dev]"
+```
+
+### 24.3 Model Artifact To Copy
+
+Copy this file to same relative path on new server:
+
+```text
+artifacts/models/next_month_strategy_catboost_3m.joblib
+```
+
+Optional related files:
+
+```text
+artifacts/metrics/next_month_strategy_catboost_3m_metrics.json
+config/default_config.json
+```
+
+### 24.4 Environment Variables
+
+Create `.env` on new server.
+
+Source read database example:
+
+```bash
+PGHOST=<source_db_host>
+PGPORT=5432
+PGDATABASE=<source_db_name>
+PGUSER=<source_db_user>
+PGPASSWORD=<source_db_password>
+SOURCE_SCHEMA=digital_collections
+SOURCE_TABLE=communications
+```
+
+Common target/output variables:
+
+```bash
+TARGET_SCHEMA=digital_collections
+PREDICTION_TABLE=ai_ml_recommendations_data
+AUDIT_TABLE=api_audit_log
+CAMPAIGN_TABLE=ai_ml_campaign_recommendations
+CAMPAIGN_MAPPING_TABLE=ai_ml_campaign_mapping
+MODEL_NAME=catboost_3m
+FEATURE_MONTH_SOURCE=emi_date
+CAMPAIGN_VERTICAL=LAP
+CAMPAIGN_VENDOR=prutech-cpass
+```
+
+Optional target-only writer variables:
+
+```bash
+TARGET_PGHOST=<target_db_host>
+TARGET_PGPORT=5432
+TARGET_PGDATABASE=<target_db_name>
+TARGET_PGUSER=<target_db_user>
+TARGET_PGPASSWORD=<target_db_password>
+TARGET_PGCONNECT_TIMEOUT=10
+```
+
+### 24.5 Network Checks
+
+Before running pipeline, confirm both source and target DB endpoints are reachable from new server.
+
+```bash
+python3 - <<'PY'
+import socket
+for host, port in [
+    ("<source_db_host>", 5432),
+    ("<target_db_host>", 5432),
+]:
+    try:
+        s = socket.create_connection((host, port), timeout=5)
+        print(host, "ok")
+        s.close()
+    except Exception as exc:
+        print(host, "fail", exc)
+PY
+```
+
+### 24.6 One-Time Inference From Source DB
+
+If source and target DBs are different, safest flow is two-step:
+
+1. run inference from source DB with `--skip-db-store`
+2. write local prediction output to target DB using standalone writer
+
+Example:
+
+```bash
+./venv/bin/python scripts/run_monthly_inference_pipeline.py \
+  --source-month 2026-04 \
+  --predict-month 2026-05 \
+  --model catboost_3m \
+  --skip-db-store
+```
+
+This produces local file such as:
+
+```text
+artifacts/predictions/2026_05_strategy_predictions_catboost_3m.csv
+```
+
+### 24.7 Write Outputs To Target DB
+
+Use standalone script after inference finishes successfully:
+
+```bash
+./venv/bin/python scripts/write_target_db_outputs.py \
+  --host <target_db_host> \
+  --port 5432 \
+  --dbname <target_db_name> \
+  --user <target_db_user> \
+  --password <target_db_password> \
+  --prediction-file artifacts/predictions/2026_05_strategy_predictions_catboost_3m.csv \
+  --source-month 2026-04 \
+  --predict-month 2026-05 \
+  --model catboost_3m
+```
+
+This writes:
+
+- `ai_ml_recommendations_data`
+- `ai_ml_campaign_recommendations`
+- `ai_ml_campaign_mapping`
+- `api_audit_log`
+
+### 24.8 Export Quartz And Dataset Tables
+
+Quartz and MCollect dataset tables are not written by inference or target writer. Run export separately after campaign staging rows exist.
+
+Dry run first:
+
+```bash
+./venv/bin/python scripts/export_mcollect_scheduler.py \
+  --host <target_db_host> \
+  --port 5432 \
+  --dbname <target_db_name> \
+  --user <target_db_user> \
+  --password <target_db_password> \
+  --schema digital_collections \
+  --source-month 2026-04 \
+  --prediction-month 2026-05 \
+  --model catboost_3m
+```
+
+Actual write:
+
+```bash
+./venv/bin/python scripts/export_mcollect_scheduler.py \
+  --host <target_db_host> \
+  --port 5432 \
+  --dbname <target_db_name> \
+  --user <target_db_user> \
+  --password <target_db_password> \
+  --schema digital_collections \
+  --source-month 2026-04 \
+  --prediction-month 2026-05 \
+  --model catboost_3m \
+  --trigger-state PAUSED \
+  --write
+```
+
+This writes:
+
+- `dataset`
+- `qrtz_job_details`
+- `qrtz_triggers`
+- `qrtz_cron_triggers`
+
+It does not create `digital_rules`. Templates there must already exist manually.
+
+### 24.9 Post-Run Verification
+
+```sql
+select count(*) from digital_collections.ai_ml_recommendations_data;
+select count(*) from digital_collections.ai_ml_campaign_recommendations;
+select count(*) from digital_collections.ai_ml_campaign_mapping;
+select id, reference_number, status, created_on
+from digital_collections.api_audit_log
+order by id desc
+limit 5;
+select count(*) from digital_collections.dataset;
+select count(*) from digital_collections.qrtz_job_details;
+select count(*) from digital_collections.qrtz_triggers;
+select count(*) from digital_collections.qrtz_cron_triggers;
+```
+
+### 24.10 Common Failure Mode
+
+If source inference succeeds but target write fails with connection timeout, issue is usually network access, security group, route, or DB allowlist on target host, not model logic.
+
