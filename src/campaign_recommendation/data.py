@@ -46,7 +46,7 @@ def _prepare_chunk(
     success_statuses: dict[str, list[str]],
     success_scores: dict[str, dict[str, float]],
     positive_boost: float,
-    emi_day_filter: int,
+    emi_cycles: list[int],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     prepared = chunk.copy()
     prepared["created_date"] = pd.to_datetime(prepared["created_date"], errors="coerce")
@@ -62,7 +62,8 @@ def _prepare_chunk(
             "collectable_amount",
         ]
     )
-    prepared = prepared[prepared["emi_date"].dt.day == emi_day_filter].copy()
+    emi_cycle_set = {int(day) for day in emi_cycles}
+    prepared = prepared[prepared["emi_date"].dt.day.isin(emi_cycle_set)].copy()
     if prepared.empty:
         return prepared, prepared
 
@@ -207,7 +208,7 @@ def build_modeling_dataset(
     success_statuses: dict[str, list[str]],
     success_scores: dict[str, dict[str, float]],
     positive_boost: float,
-    emi_day_filter: int,
+    emi_cycles: list[int],
 ) -> tuple[pd.DataFrame, dict[str, list[str]]]:
     path = Path(csv_path)
     history_chunks: list[pd.DataFrame] = []
@@ -221,7 +222,7 @@ def build_modeling_dataset(
             success_statuses=success_statuses,
             success_scores=success_scores,
             positive_boost=positive_boost,
-            emi_day_filter=emi_day_filter,
+            emi_cycles=emi_cycles,
         )
         if not history.empty:
             history_chunks.append(history)

@@ -2,24 +2,38 @@
   "training_data_path": "training-data/mfl_last_6_months_communication_data.csv",
   "model_output_dir": "outputs/model",
   "recommendation_output_path": "outputs/recommendations.csv",
-  "emi_day_filter": 5,
   "emi_cycle": ["5"],
-  "allowed_day_offsets": [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5],
+  "allowed_day_offsets": [-5,-4,-3,-2,-1,1,2,3,4,5],
   "risk_quota": {
     "low": 1,
     "medium": 2,
     "high": 3
   },
-  "channel_priority": ["SMS", "WHATSAPP", "VOICE"],
+  "channel_priority": [
+    "SMS",
+    "WHATSAPP",
+    "VOICE"
+  ],
   "send_hour_window": {
     "start_hour": 9,
     "end_hour": 18,
     "step_hours": 1
   },
   "success_statuses": {
-    "SMS": ["DELIVERED", "READ", "CLICKED"],
-    "WHATSAPP": ["DELIVERED", "READ", "CLICKED"],
-    "VOICE": ["CALL_CONNECTED", "CONNECTED"]
+    "SMS": [
+      "DELIVERED",
+      "READ",
+      "CLICKED"
+    ],
+    "WHATSAPP": [
+      "DELIVERED",
+      "READ",
+      "CLICKED"
+    ],
+    "VOICE": [
+      "CALL_CONNECTED",
+      "CONNECTED"
+    ]
   },
   "success_scores": {
     "SMS": {

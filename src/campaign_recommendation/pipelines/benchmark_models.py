@@ -234,7 +234,7 @@ def run_model_benchmarks(config: AppConfig, max_rows: int | None = None) -> dict
         success_statuses=config.raw["success_statuses"],
         success_scores=config.raw["success_scores"],
         positive_boost=training_cfg["sample_weight_positive_boost"],
-        emi_day_filter=config.raw["emi_day_filter"],
+        emi_cycles=config.raw["emi_cycle"],
     )
 
     train_frame = modeling_frame[modeling_frame["dataset_split"] == "train"].copy()

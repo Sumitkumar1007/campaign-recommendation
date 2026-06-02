@@ -94,7 +94,7 @@ def load_base_population(base_population_file: Path, source_month_label: str) ->
     base["collectable_amount"] = pd.to_numeric(base["collectable_amount"], errors="coerce").fillna(0.0)
     base["emi_date"] = _normalize_text(base["emi_date"], default="")
     base = base[base["APAC_CARD_NUMBER"].ne("")].copy()
-    base = base.drop_duplicates(subset=["APAC_CARD_NUMBER"], keep="first").reset_index(drop=True)
+    base = base.drop_duplicates(subset=["APAC_CARD_NUMBER", "emi_date"], keep="first").reset_index(drop=True)
     return base[["APAC_CARD_NUMBER", "SOURCE_MONTH", "RISK", "VERTICAL", "collectable_amount", "emi_date"]]
 
 
@@ -388,13 +388,14 @@ def main() -> None:
                 logger.info("Prediction matrix | shape=%s", X_pred.shape)
 
             with log_step(logger, "predict_day_columns", rows=len(X_pred)):
-                prediction_output = prediction_rows[["APAC_CARD_NUMBER", "SOURCE_MONTH", "RISK", "VERTICAL"]].copy()
+                prediction_output = prediction_rows[["APAC_CARD_NUMBER", "SOURCE_MONTH", "RISK", "VERTICAL", "emi_date"]].copy()
                 prediction_output = prediction_output.rename(
                     columns={
                         "APAC_CARD_NUMBER": "Loan_number",
                         "SOURCE_MONTH": "SOURCE_MONTH_USED",
                         "RISK": "SOURCE_RISK",
                         "VERTICAL": "SOURCE_VERTICAL",
+                        "emi_date": "EMI_DATE",
                     }
                 )
 
@@ -423,13 +424,14 @@ def main() -> None:
                 prediction_outputs.append(prediction_output)
 
         if not blank_rows.empty:
-            blank_output = blank_rows[["APAC_CARD_NUMBER", "SOURCE_MONTH", "RISK", "VERTICAL"]].copy()
+            blank_output = blank_rows[["APAC_CARD_NUMBER", "SOURCE_MONTH", "RISK", "VERTICAL", "emi_date"]].copy()
             blank_output = blank_output.rename(
                 columns={
                     "APAC_CARD_NUMBER": "Loan_number",
                     "SOURCE_MONTH": "SOURCE_MONTH_USED",
                     "RISK": "SOURCE_RISK",
                     "VERTICAL": "SOURCE_VERTICAL",
+                    "emi_date": "EMI_DATE",
                 }
             )
             source_period = month_to_period(blank_output["SOURCE_MONTH_USED"])
@@ -454,6 +456,7 @@ def main() -> None:
                 columns=[
                     "SOURCE_RISK",
                     "SOURCE_VERTICAL",
+                    "EMI_DATE",
                     "Loan_number",
                     "SOURCE_MONTH_USED",
                     "MONTH",
@@ -468,6 +471,7 @@ def main() -> None:
                 [
                     "SOURCE_RISK",
                     "SOURCE_VERTICAL",
+                    "EMI_DATE",
                     "Loan_number",
                     "SOURCE_MONTH_USED",
                     "MONTH",
