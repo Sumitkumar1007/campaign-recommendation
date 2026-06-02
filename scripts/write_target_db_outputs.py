@@ -72,7 +72,7 @@ def main() -> None:
     source_month_label = month_label(args.source_month)
     prediction_month_label = month_label(args.predict_month)
     model_name = args.model
-    emi_cycle = resolve_emi_cycle(args.config_file, os.getenv("EMI_CYCLE", ""))[0]
+    emi_cycles = resolve_emi_cycle(args.config_file, os.getenv("EMI_CYCLE", ""))
     vendors = _extract_campaign_vendors(args.campaign_vendor) or [args.campaign_vendor]
     started = time.time()
 
@@ -81,7 +81,7 @@ def main() -> None:
         source_month_label=source_month_label,
         prediction_month_label=prediction_month_label,
         model_name=model_name,
-        emi_cycle=emi_cycle,
+        emi_cycles=emi_cycles,
         vertical=args.campaign_vertical,
         vendors=vendors,
     )

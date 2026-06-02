@@ -193,6 +193,7 @@ def test_build_campaign_recommendations_groups_unique_scheduler_rows(tmp_path: P
             "Loan_number": ["L1"],
             "SOURCE_MONTH_USED": ["APR-2026"],
             "MONTH": ["MAY-2026"],
+            "EMI_DATE": ["05/04/2026"],
             "D-5": ["SMS-9AM-HINDI|WH-5PM-HINDI|IVR-2PM-HINDI"],
             "D-4": ["SMS-10AM-HINDI"],
             "D-3": ["-"],
@@ -212,7 +213,7 @@ def test_build_campaign_recommendations_groups_unique_scheduler_rows(tmp_path: P
         source_month_label="APR-2026",
         prediction_month_label="MAY-2026",
         model_name="catboost_3m",
-        emi_cycle=5,
+        emi_cycles=[5],
         vertical="LAP",
         vendors=["prutech", "kaleyra"],
         run_date=pd.Timestamp("2026-04-08").to_pydatetime(),
@@ -249,6 +250,7 @@ def test_build_campaign_recommendations_groups_same_time_across_days(tmp_path: P
             "Loan_number": ["L1"],
             "SOURCE_MONTH_USED": ["APR-2026"],
             "MONTH": ["MAY-2026"],
+            "EMI_DATE": ["05/04/2026"],
             "D-5": ["SMS-9AM-HINDI"],
             "D-4": ["-"],
             "D-3": ["SMS-9AM-HINDI"],
@@ -268,7 +270,7 @@ def test_build_campaign_recommendations_groups_same_time_across_days(tmp_path: P
         source_month_label="APR-2026",
         prediction_month_label="MAY-2026",
         model_name="catboost_3m",
-        emi_cycle=5,
+        emi_cycles=[5],
         vertical="LAP",
         vendors=["prutech"],
         run_date=pd.Timestamp("2026-04-08").to_pydatetime(),
@@ -289,6 +291,7 @@ def test_build_campaign_recommendations_groups_same_day_set_across_times(tmp_pat
             "Loan_number": ["L1"],
             "SOURCE_MONTH_USED": ["APR-2026"],
             "MONTH": ["MAY-2026"],
+            "EMI_DATE": ["05/04/2026"],
             "D-5": ["SMS-9AM-HINDI|SMS-10AM-HINDI"],
             "D-4": ["SMS-9AM-HINDI|SMS-10AM-HINDI"],
             "D-3": ["-"],
@@ -308,7 +311,7 @@ def test_build_campaign_recommendations_groups_same_day_set_across_times(tmp_pat
         source_month_label="APR-2026",
         prediction_month_label="MAY-2026",
         model_name="catboost_3m",
-        emi_cycle=5,
+        emi_cycles=[5],
         vertical="LAP",
         vendors=["prutech"],
         run_date=pd.Timestamp("2026-04-08").to_pydatetime(),
@@ -329,6 +332,7 @@ def test_build_campaign_mappings_links_accounts_to_grouped_campaign_rows(tmp_pat
             "Loan_number": ["L1", "L2"],
             "SOURCE_MONTH_USED": ["APR-2026", "APR-2026"],
             "MONTH": ["MAY-2026", "MAY-2026"],
+            "EMI_DATE": ["05/04/2026", "05/04/2026"],
             "D-5": ["SMS-9AM-HINDI|SMS-10AM-HINDI", "SMS-9AM-HINDI|SMS-10AM-HINDI"],
             "D-4": ["SMS-9AM-HINDI|SMS-10AM-HINDI", "SMS-9AM-HINDI|SMS-10AM-HINDI"],
             "D-3": ["-", "-"],
@@ -348,7 +352,7 @@ def test_build_campaign_mappings_links_accounts_to_grouped_campaign_rows(tmp_pat
         source_month_label="APR-2026",
         prediction_month_label="MAY-2026",
         model_name="catboost_3m",
-        emi_cycle=5,
+        emi_cycles=[5],
         vertical="LAP",
         vendors=["prutech"],
         run_date=pd.Timestamp("2026-04-08").to_pydatetime(),
@@ -372,6 +376,7 @@ def test_build_campaign_mappings_includes_business_readable_reason(tmp_path: Pat
             "Loan_number": ["L1"],
             "SOURCE_MONTH_USED": ["APR-2026"],
             "MONTH": ["MAY-2026"],
+            "EMI_DATE": ["05/04/2026"],
             "D-5": ["SMS-9AM-HINDI"],
             "D-4": ["-"],
             "D-3": ["-"],
@@ -392,7 +397,7 @@ def test_build_campaign_mappings_includes_business_readable_reason(tmp_path: Pat
         source_month_label="APR-2026",
         prediction_month_label="MAY-2026",
         model_name="catboost_3m",
-        emi_cycle=5,
+        emi_cycles=[5],
         vertical="LAP",
         vendors=["prutech"],
         run_date=pd.Timestamp("2026-04-08").to_pydatetime(),
@@ -412,6 +417,7 @@ def test_build_campaign_recommendations_skips_regional_language(tmp_path: Path) 
             "Loan_number": ["L1"],
             "SOURCE_MONTH_USED": ["APR-2026"],
             "MONTH": ["MAY-2026"],
+            "EMI_DATE": ["05/04/2026"],
             "D-5": ["SMS-9AM-REGIONAL|SMS-10AM-HINDI"],
             "D-4": ["-"],
             "D-3": ["-"],
@@ -431,7 +437,7 @@ def test_build_campaign_recommendations_skips_regional_language(tmp_path: Path) 
         source_month_label="APR-2026",
         prediction_month_label="MAY-2026",
         model_name="catboost_3m",
-        emi_cycle=5,
+        emi_cycles=[5],
         vertical="LAP",
         vendors=["prutech"],
         run_date=pd.Timestamp("2026-04-08").to_pydatetime(),
@@ -537,6 +543,81 @@ def test_predict_top_k_by_risk_uses_bucket_quota() -> None:
         "SMS-9AM-ENGLISH|WH-10AM-HINDI",
         "WH-10AM-HINDI|SMS-9AM-ENGLISH|-",
     ]
+
+
+def test_build_campaign_recommendations_derives_emi_cycle_from_emi_date(tmp_path: Path) -> None:
+    prediction_file = tmp_path / "predictions_multi_cycle.csv"
+    pd.DataFrame(
+        {
+            "SOURCE_RISK": ["HIGH"],
+            "Loan_number": ["L1"],
+            "SOURCE_MONTH_USED": ["APR-2026"],
+            "MONTH": ["MAY-2026"],
+            "EMI_DATE": ["10/04/2026"],
+            "D-5": ["SMS-9AM-HINDI"],
+            "D-4": ["-"],
+            "D-3": ["-"],
+            "D-2": ["-"],
+            "D-1": ["-"],
+            "D": ["-"],
+            "D+1": ["-"],
+            "D+2": ["-"],
+            "D+3": ["-"],
+            "D+4": ["-"],
+            "D+5": ["-"],
+        }
+    ).to_csv(prediction_file, index=False)
+
+    output = build_campaign_recommendations(
+        prediction_file,
+        source_month_label="APR-2026",
+        prediction_month_label="MAY-2026",
+        model_name="catboost_3m",
+        emi_cycles=[5, 10, 12],
+        vertical="LAP",
+        vendors=["prutech"],
+        run_date=pd.Timestamp("2026-04-08").to_pydatetime(),
+    )
+
+    assert output.loc[0, "emi_cycle"] == 10
+    assert "10TH" in output.loc[0, "name"]
+    assert "EMI 10TH" in output.loc[0, "dataset_name"]
+
+
+def test_build_prediction_population_keeps_same_account_multiple_emi_dates() -> None:
+    dataset = pd.DataFrame(
+        {
+            "APAC_CARD_NUMBER": ["A1"],
+            "SOURCE_MONTH": ["APR-2026"],
+            "SOURCE_MONTH_PERIOD": [pd.Period("2026-04", freq="M")],
+            "RISK": ["HIGH"],
+            "VERTICAL": ["LAP"],
+            "SMS_TOTAL_INTENSITY": [3],
+            "TARGET_MONTH": [pd.NA],
+            "TARGET_MONTH_PERIOD": [pd.Period("2026-05", freq="M")],
+            "TARGET_RISK": [pd.NA],
+            "D-5": [pd.NA],
+        }
+    )
+    base_population = pd.DataFrame(
+        {
+            "APAC_CARD_NUMBER": ["A1", "A1"],
+            "SOURCE_MONTH": ["APR-2026", "APR-2026"],
+            "RISK": ["HIGH", "HIGH"],
+            "VERTICAL": ["LAP", "LAP"],
+            "collectable_amount": [100.0, 100.0],
+            "emi_date": ["05/04/2026", "10/04/2026"],
+        }
+    )
+
+    with_history, without_history = build_prediction_population(
+        dataset=dataset,
+        base_population=base_population,
+        prediction_source_month="APR-2026",
+    )
+
+    assert without_history.empty
+    assert sorted(with_history["emi_date"].tolist()) == ["05/04/2026", "10/04/2026"]
 
 
 def test_build_prediction_population_keeps_base_accounts_without_history() -> None:

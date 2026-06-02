@@ -73,13 +73,17 @@ Important raw columns used:
 
 ## 5. Data Filtering Rules
 
-### EMI Day Filter
+### EMI Cycle Filter
 
-Only rows where `emi_date` is the `5th` are used.
+Only rows where `emi_date` day is present in the configured `emi_cycle` list are used.
 
 This is controlled by:
 
-- `emi_day_filter = 5` in [default_config.json](../config/default_config.json)
+- `emi_cycle = ["5"]` in [default_config.json](../config/default_config.json)
+
+Example multi-cycle setup:
+
+- `emi_cycle = ["5", "10", "12"]`
 
 ### Allowed Strategy Days
 

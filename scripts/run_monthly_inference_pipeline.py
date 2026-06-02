@@ -1049,6 +1049,42 @@ def _join_campaign_times(values: pd.Series) -> str:
     return ",".join(sorted(set(values)))
 
 
+def _coerce_emi_cycle_from_value(value: object) -> int | None:
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        # Prediction EMI dates are emitted as DD/MM/YYYY; parse that first so
+        # multi-cycle runs keep the actual EMI day instead of the month number.
+        timestamp = pd.to_datetime(text, format="%d/%m/%Y", errors="coerce")
+    except Exception:
+        timestamp = pd.NaT
+    if pd.isna(timestamp):
+        try:
+            timestamp = pd.to_datetime(text, dayfirst=True, errors="coerce")
+        except Exception:
+            timestamp = pd.NaT
+    if not pd.isna(timestamp):
+        return int(timestamp.day)
+    match = re.search(r"(\d{1,2})", text)
+    if match:
+        day = int(match.group(1))
+        if 1 <= day <= 31:
+            return day
+    return None
+
+
+def _resolve_row_emi_cycle(row: pd.Series, default_cycles: list[int]) -> int:
+    derived = _coerce_emi_cycle_from_value(row.get("EMI_DATE"))
+    if derived is not None:
+        return derived
+    if len(default_cycles) == 1:
+        return int(default_cycles[0])
+    raise ValueError("Could not derive emi_cycle from prediction row EMI_DATE for multi-cycle config.")
+
+
 def _load_prediction_context_lookup(prediction_file: Path, prediction_month_label: str) -> dict[str, dict[str, object]]:
     df = pd.read_csv(prediction_file)
     df = df[df["MONTH"] == prediction_month_label].copy()
@@ -1088,7 +1124,7 @@ def _build_campaign_assignment_groups(
     source_month_label: str,
     prediction_month_label: str,
     model_name: str,
-    emi_cycle: int,
+    emi_cycles: list[int],
     vertical: str,
     vendors: list[str],
     run_token: str,
@@ -1116,6 +1152,7 @@ def _build_campaign_assignment_groups(
                     mode=mode,
                     language=language,
                 )
+                emi_cycle = _resolve_row_emi_cycle(row, emi_cycles)
                 dataset_name = f"{due_type}|{NAME_CHANNEL_BY_MODE[mode]}|{vertical_value}|{language}|{risk_code}|{emi_cycle}"
                 for vendor in vendors:
                     base_name = _scheduler_name(
@@ -1196,7 +1233,7 @@ def _prepare_campaign_outputs(
     source_month_label: str,
     prediction_month_label: str,
     model_name: str,
-    emi_cycle: int,
+    emi_cycles: list[int],
     vertical: str,
     vendors: list[str],
     run_date: datetime | None = None,
@@ -1207,7 +1244,7 @@ def _prepare_campaign_outputs(
         source_month_label=source_month_label,
         prediction_month_label=prediction_month_label,
         model_name=model_name,
-        emi_cycle=emi_cycle,
+        emi_cycles=emi_cycles,
         vertical=vertical,
         vendors=vendors,
         run_token=run_token,
@@ -1351,7 +1388,7 @@ def build_campaign_recommendations(
     source_month_label: str,
     prediction_month_label: str,
     model_name: str,
-    emi_cycle: int,
+    emi_cycles: list[int],
     vertical: str,
     vendors: list[str],
     run_date: datetime | None = None,
@@ -1361,7 +1398,7 @@ def build_campaign_recommendations(
         source_month_label=source_month_label,
         prediction_month_label=prediction_month_label,
         model_name=model_name,
-        emi_cycle=emi_cycle,
+        emi_cycles=emi_cycles,
         vertical=vertical,
         vendors=vendors,
         run_date=run_date,
@@ -1375,7 +1412,7 @@ def build_campaign_mappings(
     source_month_label: str,
     prediction_month_label: str,
     model_name: str,
-    emi_cycle: int,
+    emi_cycles: list[int],
     vertical: str,
     vendors: list[str],
     run_date: datetime | None = None,
@@ -1385,7 +1422,7 @@ def build_campaign_mappings(
         source_month_label=source_month_label,
         prediction_month_label=prediction_month_label,
         model_name=model_name,
-        emi_cycle=emi_cycle,
+        emi_cycles=emi_cycles,
         vertical=vertical,
         vendors=vendors,
         run_date=run_date,
@@ -1782,7 +1819,7 @@ def main() -> None:
                         source_month_label=source_month_label,
                         prediction_month_label=prediction_month_label,
                         model_name=args.model,
-                        emi_cycle=resolve_emi_cycle(args.config_file, os.getenv("EMI_CYCLE", ""))[0],
+                        emi_cycles=resolve_emi_cycle(args.config_file, os.getenv("EMI_CYCLE", "")),
                         vertical=args.campaign_vertical,
                         vendors=campaign_vendors,
                     )
@@ -1815,7 +1852,7 @@ def main() -> None:
                 source_month_label=source_month_label,
                 prediction_month_label=prediction_month_label,
                 model_name=args.model,
-                emi_cycle=resolve_emi_cycle(args.config_file, os.getenv("EMI_CYCLE", ""))[0],
+                emi_cycles=resolve_emi_cycle(args.config_file, os.getenv("EMI_CYCLE", "")),
                 vertical=args.campaign_vertical,
                 vendors=_extract_campaign_vendors(args.campaign_vendor) or [args.campaign_vendor],
             )
