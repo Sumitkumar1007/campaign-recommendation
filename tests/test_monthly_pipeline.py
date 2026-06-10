@@ -33,6 +33,7 @@ from run_monthly_inference_pipeline import (
     build_campaign_recommendations,
     month_label,
     resolve_campaign_vendors,
+    parse_args,
     selected_history_files,
     store_api_audit_log,
     validate_month_pair,
@@ -45,6 +46,18 @@ from train_next_month_strategy_model_catboost import (
 from pipeline_common import DAY_COLUMNS
 from predict_next_month_strategy_catboost import build_prediction_population, build_prediction_reason
 from campaign_recommendation.recommend import RecommendationPolicy, candidate_hours, generate_candidates
+
+
+def test_parse_args_supports_skip_audit_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PGHOST", "localhost")
+    monkeypatch.setenv("PGDATABASE", "testdb")
+    monkeypatch.setenv("PGUSER", "testuser")
+    monkeypatch.setenv("PGPASSWORD", "testpass")
+    monkeypatch.setattr(sys, "argv", ["run_monthly_inference_pipeline.py", "--skip-audit-log"])
+
+    args = parse_args()
+
+    assert args.skip_audit_log is True
 
 
 def test_validate_month_pair_accepts_adjacent_months() -> None:
@@ -226,7 +239,7 @@ def test_build_campaign_recommendations_groups_unique_scheduler_rows(tmp_path: P
     assert sms_pre_one["date"] == "D-5"
     assert sms_pre_one["time"] == "09:00:00"
     assert sms_pre_one["template_name"] == "PREDUE_AIML_SMS_HINDI"
-    assert sms_pre_one["dataset_name"] == "PREDUE AIML SMS LAP HINDI HR EMI 5TH [D-5] 09"
+    assert sms_pre_one["dataset_name"] == "PREDUE AIML SMS LAP HINDI HR EMI 5TH DM5 09"
     assert sms_pre_one["vendor"] == "prutech"
     assert sms_pre_one["active"] == "T"
 

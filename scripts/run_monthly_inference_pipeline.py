@@ -11,14 +11,17 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import joblib
 import pandas as pd
 from psycopg import errors, sql
 from psycopg.types.json import Jsonb
 
 from app_logging import log_step, setup_logging
+from drift_utils import compute_drift_report
 from env_utils import load_dotenv
-from pipeline_common import resolve_emi_cycle
+from pipeline_common import build_feature_matrix, prepare_next_month_dataset, resolve_emi_cycle, split_by_source_month
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
+from predict_next_month_strategy_catboost import build_prediction_population, load_base_population
 from project_paths import (
     CASE_DATA_DIR,
     COMMUNICATION_DATA_DIR,
@@ -166,6 +169,11 @@ def parse_args() -> argparse.Namespace:
         "--log-file",
         default=str(LOG_DIR / "monthly_inference_pipeline.log"),
         help="Application log file.",
+    )
+    parser.add_argument(
+        "--skip-audit-log",
+        action="store_true",
+        help="Skip standalone pipeline audit writes when invoked from the API service.",
     )
     args = parser.parse_args()
     missing = [
@@ -630,6 +638,16 @@ def ensure_api_audit_log_table(conn, schema: str, table: str) -> None:
             constraint_name=sql.Identifier(f"{table}_pkey"),
         )
     )
+    conn.execute(
+        sql.SQL('ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS "currentAccuracy" DOUBLE PRECISION').format(
+            table_ref=qualified_identifier(schema, table)
+        )
+    )
+    conn.execute(
+        sql.SQL('ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS "driftPercentage" DOUBLE PRECISION').format(
+            table_ref=qualified_identifier(schema, table)
+        )
+    )
 
 
 def store_api_audit_log(
@@ -647,6 +665,9 @@ def store_api_audit_log(
     duration_seconds: float,
     prediction_table: str,
     prediction_file: Path | None,
+    current_accuracy: float | None = None,
+    drift_percentage: float | None = None,
+    drift_summary: dict[str, object] | None = None,
 ) -> None:
     ensure_api_audit_log_table(conn, schema, table)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -661,15 +682,18 @@ def store_api_audit_log(
             "prediction_table": prediction_table,
         }
     )
-    response_body = json.dumps(
-        {
-            "prediction_file": str(prediction_file) if prediction_file else None,
-            "status": status,
-            "success_count": int(prediction_completed_count),
-            "failure_count": int(prediction_failed_count),
-            "processing_time_ms": int(duration_seconds * 1000),
-        }
-    )
+    response_payload = {
+        "prediction_file": str(prediction_file) if prediction_file else None,
+        "status": status,
+        "success_count": int(prediction_completed_count),
+        "failure_count": int(prediction_failed_count),
+        "processing_time_ms": int(duration_seconds * 1000),
+        "currentAccuracy": current_accuracy,
+        "driftPercentage": drift_percentage,
+    }
+    if drift_summary:
+        response_payload["driftSummary"] = drift_summary
+    response_body = json.dumps(response_payload)
     message = failed_reason or (
         f"Monthly inference {status.lower()} for {source_month} -> {prediction_month} using {model_name}."
     )
@@ -696,9 +720,11 @@ def store_api_audit_log(
                 total_records,
                 success_count,
                 failure_count,
-                processing_time_ms
+                processing_time_ms,
+                "currentAccuracy",
+                "driftPercentage"
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """
         ).format(table_ref=qualified_identifier(schema, table)),
         (
@@ -722,6 +748,8 @@ def store_api_audit_log(
             str(int(prediction_completed_count)),
             str(int(prediction_failed_count)),
             str(int(duration_seconds * 1000)),
+            current_accuracy,
+            drift_percentage,
         ),
     )
 
@@ -735,6 +763,9 @@ def write_pipeline_audit(
     failed_reason: str | None,
     duration_seconds: float,
     prediction_file: Path | None,
+    current_accuracy: float | None,
+    drift_percentage: float | None,
+    drift_summary: dict[str, object] | None,
     logger: logging.Logger,
 ) -> None:
     try:
@@ -760,6 +791,9 @@ def write_pipeline_audit(
                 duration_seconds=duration_seconds,
                 prediction_table=args.prediction_table,
                 prediction_file=prediction_file,
+                current_accuracy=current_accuracy,
+                drift_percentage=drift_percentage,
+                drift_summary=drift_summary,
             )
             conn.commit()
     except Exception:
@@ -902,10 +936,25 @@ def _dataset_time_label(value: str) -> str:
     return ",".join(labels)
 
 
+def _dataset_day_token(day_label: str) -> str:
+    day_label = str(day_label).strip().upper()
+    if day_label == "D":
+        return "D"
+    if day_label.startswith("D+"):
+        return f"DP{day_label[2:]}"
+    if day_label.startswith("D-"):
+        return f"DM{day_label[2:]}"
+    return day_label.replace(",", "-")
+
+
+def _dataset_day_label(value: str) -> str:
+    return "-".join(_dataset_day_token(part) for part in str(value).split(",") if part.strip())
+
+
 def _dataset_name(*, due_type: str, mode: str, vertical: str, language: str, risk_code: str, emi_cycle: int, date_value: str, time_value: str) -> str:
     return (
         f"{due_type} AIML {NAME_CHANNEL_BY_MODE[mode]} {vertical.upper()} {language} {risk_code} "
-        f"EMI {emi_cycle}TH [{date_value}] {_dataset_time_label(time_value)}"
+        f"EMI {emi_cycle}TH {_dataset_day_label(date_value)} {_dataset_time_label(time_value)}"
     )
 
 
@@ -1638,11 +1687,71 @@ def store_campaign_mappings(
         cur.executemany(query, rows)
     return len(rows)
 
+def _load_metrics_metadata(metrics_file: Path) -> dict[str, object]:
+    if not metrics_file.exists():
+        return {}
+    try:
+        return json.loads(metrics_file.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def compute_model_drift_metrics(
+    *,
+    feature_file: Path,
+    schedule_file: Path,
+    base_population_file: Path,
+    model_file: Path,
+    metrics_file: Path,
+    source_month_label: str,
+) -> dict[str, object]:
+    bundle = joblib.load(model_file)
+    target_offset_months = int(bundle.get("target_offset_months", 1))
+    history_window_months = int(bundle.get("history_window_months", 1))
+
+    dataset = prepare_next_month_dataset(
+        feature_file=feature_file,
+        schedule_file=schedule_file,
+        target_offset_months=target_offset_months,
+        history_window_months=history_window_months,
+    )
+    base_population = load_base_population(base_population_file, source_month_label)
+    prediction_rows, blank_rows = build_prediction_population(
+        dataset=dataset,
+        base_population=base_population,
+        prediction_source_month=source_month_label,
+    )
+
+    metrics_metadata = _load_metrics_metadata(metrics_file)
+    baseline_source_months = [str(value) for value in metrics_metadata.get("train_source_months", []) if str(value).strip()]
+    if baseline_source_months:
+        baseline_rows = split_by_source_month(dataset, baseline_source_months, require_target=True)
+    else:
+        baseline_rows = dataset[dataset["TARGET_MONTH"].notna()].copy()
+        baseline_source_months = sorted(baseline_rows["SOURCE_MONTH"].dropna().astype(str).unique().tolist())
+
+    baseline_matrix = build_feature_matrix(baseline_rows).reindex(columns=bundle["feature_columns"], fill_value=0)
+    inference_matrix = build_feature_matrix(prediction_rows).reindex(columns=bundle["feature_columns"], fill_value=0)
+    report = compute_drift_report(
+        baseline_df=baseline_matrix,
+        inference_df=inference_matrix,
+        feature_columns=bundle["feature_columns"],
+        blank_inference_rows=len(blank_rows),
+    )
+    report["baseline_source_months"] = baseline_source_months
+    report["history_window_months"] = history_window_months
+    return report
+
+
+
+
+
 def main() -> None:
     args = parse_args()
     run_started_at = datetime.now(timezone.utc)
     prediction_file: Path | None = None
     prediction_rows = 0
+    drift_report: dict[str, object] | None = None
     logger = setup_logging(args.log_file, "monthly_inference_pipeline")
     logger.info(
         "Monthly inference args: %s",
@@ -1672,16 +1781,20 @@ def main() -> None:
         if not csv_has_rows(source_extract_file):
             logger.warning("No latest communication rows found. Skipping prediction run.")
             print(f"No latest communication rows found in {source_extract_file}; skipped prediction run.")
-            write_pipeline_audit(
-                args,
-                status="SKIPPED",
-                prediction_completed_count=0,
-                prediction_failed_count=0,
-                failed_reason=f"No latest communication rows found in {source_extract_file}",
-                duration_seconds=(datetime.now(timezone.utc) - run_started_at).total_seconds(),
-                prediction_file=None,
-                logger=logger,
-            )
+            if not args.skip_audit_log:
+                write_pipeline_audit(
+                    args,
+                    status="SKIPPED",
+                    prediction_completed_count=0,
+                    prediction_failed_count=0,
+                    failed_reason=f"No latest communication rows found in {source_extract_file}",
+                    duration_seconds=(datetime.now(timezone.utc) - run_started_at).total_seconds(),
+                    prediction_file=None,
+                    current_accuracy=None,
+                    drift_percentage=None,
+                    drift_summary=None,
+                    logger=logger,
+                )
             return
 
         history_files = selected_history_files(args.source_month, source_extract_file)
@@ -1789,6 +1902,35 @@ def main() -> None:
                     logger=logger,
                 )
 
+        with log_step(logger, "compute_model_drift", model_file=model_file, metrics_file=metrics_file):
+            drift_report = compute_model_drift_metrics(
+                feature_file=FEATURE_DATA_DIR / "strategy_monthly_features.csv",
+                schedule_file=SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv",
+                base_population_file=source_cases_file,
+                model_file=model_file,
+                metrics_file=metrics_file,
+                source_month_label=source_month_label,
+            )
+            metrics_payload = _load_metrics_metadata(metrics_file)
+            accuracy_value = None
+            validation_metrics = metrics_payload.get("validation_metrics") if isinstance(metrics_payload, dict) else None
+            train_metrics = metrics_payload.get("train_metrics") if isinstance(metrics_payload, dict) else None
+            accuracy_source = validation_metrics if isinstance(validation_metrics, dict) and validation_metrics.get("average_day_accuracy") is not None else train_metrics
+            if isinstance(accuracy_source, dict) and accuracy_source.get("average_day_accuracy") is not None:
+                accuracy_value = round(float(accuracy_source["average_day_accuracy"]) * 100, 2)
+            drift_report["current_accuracy"] = accuracy_value
+            logger.info(
+                "Drift summary | baseline_rows=%s inference_rows=%s blank_inference_rows=%s feature_count=%s drift_percentage=%s overall_psi=%s max_feature_psi=%s status=%s",
+                drift_report["baseline_rows"],
+                drift_report["inference_rows"],
+                drift_report["blank_inference_rows"],
+                drift_report["feature_count"],
+                drift_report["drift_percentage"],
+                drift_report["overall_psi"],
+                drift_report["max_feature_psi"],
+                drift_report["status"],
+            )
+
         if not args.skip_db_store:
             with log_step(logger, "store_snapshots", target_schema=args.target_schema):
                 config = PostgresConfig(
@@ -1865,6 +2007,12 @@ def main() -> None:
             campaign_df=campaign_df,
             mapping_df=mapping_df,
         )
+        if drift_report is not None:
+            summary["drift"] = {
+                key: value
+                for key, value in drift_report.items()
+                if key != "feature_metrics"
+            }
         summary_path = write_prediction_summary(
             summary=summary,
             output_path=prediction_summary_path(args.predict_month),
@@ -1874,29 +2022,37 @@ def main() -> None:
         print(f"Prediction file: {prediction_file}")
         print(f"Metrics file: {metrics_file}")
         print(f"Prediction summary: {summary_path}")
-        write_pipeline_audit(
-            args,
-            status="SUCCESS",
-            prediction_completed_count=prediction_rows,
-            prediction_failed_count=0,
-            failed_reason=None,
-            duration_seconds=(datetime.now(timezone.utc) - run_started_at).total_seconds(),
-            prediction_file=prediction_file,
-            logger=logger,
-        )
+        if not args.skip_audit_log:
+            write_pipeline_audit(
+                args,
+                status="SUCCESS",
+                prediction_completed_count=prediction_rows,
+                prediction_failed_count=0,
+                failed_reason=None,
+                duration_seconds=(datetime.now(timezone.utc) - run_started_at).total_seconds(),
+                prediction_file=prediction_file,
+                current_accuracy=(drift_report or {}).get("current_accuracy"),
+                drift_percentage=(drift_report or {}).get("drift_percentage"),
+                drift_summary=({k: v for k, v in (drift_report or {}).items() if k != "feature_metrics"} if drift_report else None),
+                logger=logger,
+            )
         logger.info("Monthly inference completed successfully.")
     except Exception as exc:
         logger.exception("Monthly inference failed.")
-        write_pipeline_audit(
-            args,
-            status="FAILED",
-            prediction_completed_count=prediction_rows,
-            prediction_failed_count=1,
-            failed_reason=str(exc),
-            duration_seconds=(datetime.now(timezone.utc) - run_started_at).total_seconds(),
-            prediction_file=prediction_file,
-            logger=logger,
-        )
+        if not args.skip_audit_log:
+            write_pipeline_audit(
+                args,
+                status="FAILED",
+                prediction_completed_count=prediction_rows,
+                prediction_failed_count=1,
+                failed_reason=str(exc),
+                duration_seconds=(datetime.now(timezone.utc) - run_started_at).total_seconds(),
+                prediction_file=prediction_file,
+                current_accuracy=(drift_report or {}).get("current_accuracy"),
+                drift_percentage=(drift_report or {}).get("drift_percentage"),
+                drift_summary=({k: v for k, v in (drift_report or {}).items() if k != "feature_metrics"} if drift_report else None),
+                logger=logger,
+            )
         raise
 
 

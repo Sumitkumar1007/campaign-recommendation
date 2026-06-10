@@ -139,6 +139,42 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+
+
+def _sorted_month_labels(labels: list[str]) -> list[str]:
+    if not labels:
+        return []
+    periods = pd.to_datetime(pd.Series(labels), format="%b-%Y", errors="coerce")
+    pairs = [(label, period) for label, period in zip(labels, periods, strict=False) if not pd.isna(period)]
+    pairs.sort(key=lambda item: item[1])
+    return [label for label, _ in pairs]
+
+
+def resolve_source_month_splits(
+    dataset: pd.DataFrame,
+    train_source_months: list[str],
+    validation_source_months: list[str],
+    test_source_months: list[str],
+    prediction_source_months: list[str],
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    targetable_months = _sorted_month_labels(
+        dataset.loc[dataset["TARGET_MONTH"].notna(), "SOURCE_MONTH"].dropna().astype(str).unique().tolist()
+    )
+    all_months = _sorted_month_labels(dataset["SOURCE_MONTH"].dropna().astype(str).unique().tolist())
+
+    if split_by_source_month(dataset, train_source_months, require_target=True).empty and targetable_months:
+        if len(targetable_months) >= 2:
+            effective_train = targetable_months[:-1]
+            effective_validation = targetable_months[-1:]
+        else:
+            effective_train = targetable_months
+            effective_validation = []
+        effective_test = []
+        effective_prediction = [all_months[-1]] if all_months else []
+        return effective_train, effective_validation, effective_test, effective_prediction
+
+    return train_source_months, validation_source_months, test_source_months, prediction_source_months
+
 def prepare_dataset(
     feature_file: Path,
     schedule_file: Path,
@@ -288,16 +324,30 @@ def main() -> None:
             )
 
         with log_step(logger, "split_dataset"):
-            train_df = split_by_source_month(dataset, args.train_source_months, require_target=True)
-            validation_df = split_by_source_month(dataset, args.validation_source_months, require_target=True)
-            test_df = split_by_source_month(dataset, args.test_source_months, require_target=True)
-            prediction_df = split_by_source_month(dataset, args.prediction_source_months, require_target=False)
+            effective_train_source_months, effective_validation_source_months, effective_test_source_months, effective_prediction_source_months = resolve_source_month_splits(
+                dataset,
+                args.train_source_months,
+                args.validation_source_months,
+                args.test_source_months,
+                args.prediction_source_months,
+            )
+            train_df = split_by_source_month(dataset, effective_train_source_months, require_target=True)
+            validation_df = split_by_source_month(dataset, effective_validation_source_months, require_target=True)
+            test_df = split_by_source_month(dataset, effective_test_source_months, require_target=True)
+            prediction_df = split_by_source_month(dataset, effective_prediction_source_months, require_target=False)
             logger.info(
                 "Split rows | train=%s validation=%s test=%s prediction_candidates=%s",
                 len(train_df),
                 len(validation_df),
                 len(test_df),
                 len(prediction_df),
+            )
+            logger.info(
+                "Effective source months | train=%s validation=%s test=%s prediction=%s",
+                effective_train_source_months,
+                effective_validation_source_months,
+                effective_test_source_months,
+                effective_prediction_source_months,
             )
 
         if train_df.empty:
@@ -315,6 +365,9 @@ def main() -> None:
                 len(X_train.columns),
             )
 
+        if len(train_df) < 2:
+            raise ValueError(f"Training data insufficient. Found {len(train_df)} training row(s) after month split.")
+
         y_train = train_df[DAY_COLUMNS].fillna("-")
         y_validation = validation_df[DAY_COLUMNS].fillna("-")
         y_test = test_df[DAY_COLUMNS].fillna("-")
@@ -325,7 +378,7 @@ def main() -> None:
             checkpoint_metadata = {
                 "target_offset_months": args.target_offset_months,
                 "history_window_months": args.history_window_months,
-                "train_source_months": args.train_source_months,
+                "train_source_months": effective_train_source_months,
                 "train_rows": int(len(train_df)),
             }
             logger.info(
@@ -365,10 +418,10 @@ def main() -> None:
             ),
             "target_offset_months": args.target_offset_months,
             "history_window_months": args.history_window_months,
-            "train_source_months": args.train_source_months,
-            "validation_source_months": args.validation_source_months,
-            "test_source_months": args.test_source_months,
-            "prediction_source_months": args.prediction_source_months,
+            "train_source_months": effective_train_source_months,
+            "validation_source_months": effective_validation_source_months,
+            "test_source_months": effective_test_source_months,
+            "prediction_source_months": effective_prediction_source_months,
             "n_jobs": args.n_jobs,
             "iterations": args.iterations,
             "learning_rate": args.learning_rate,
