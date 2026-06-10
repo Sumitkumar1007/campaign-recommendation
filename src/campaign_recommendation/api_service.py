@@ -58,7 +58,6 @@ class ApiConfig:
     db_user: str
     db_password: str
     target_schema: str
-    audit_table: str
     model_name: str
     auth_username: str
     auth_password: str
@@ -72,7 +71,7 @@ class ApiConfig:
     export_write: bool
     log_file: Path
     ai_config_table: str = "ai_configurations"
-    api_model_version: str = "v1.2"
+    api_model_base_version: str = "v1.1.0"
     sftp_export_path: Path = DEFAULT_SFTP_EXPORT_PATH
 
     @classmethod
@@ -87,7 +86,6 @@ class ApiConfig:
             db_user=os.getenv("PGUSER", ""),
             db_password=os.getenv("PGPASSWORD", ""),
             target_schema=os.getenv("TARGET_SCHEMA", "digital_collections"),
-            audit_table=os.getenv("AUDIT_TABLE", "api_audit_log"),
             model_name=os.getenv("MODEL_NAME", "catboost_3m"),
             auth_username=os.getenv("API_AUTH_USERNAME", "aiml"),
             auth_password=os.getenv("API_AUTH_PASSWORD", "aiml"),
@@ -101,7 +99,7 @@ class ApiConfig:
             export_write=os.getenv("API_EXPORT_WRITE", "false").strip().lower() == "true",
             log_file=Path(os.getenv("API_LOG_FILE", str(LOG_DIR / "aiml_api.log"))),
             ai_config_table=os.getenv("AI_CONFIG_TABLE", "ai_configurations"),
-            api_model_version=os.getenv("API_MODEL_VERSION", "v1.2"),
+            api_model_base_version=os.getenv("API_MODEL_BASE_VERSION", "v1.1.0"),
             sftp_export_path=Path(os.getenv("API_SFTP_EXPORT_PATH", os.getenv("SFTP_EXPORT_PATH", str(DEFAULT_SFTP_EXPORT_PATH)))),
         )
 
@@ -169,6 +167,29 @@ def model_status_from_accuracy(accuracy: float | None) -> str:
     if accuracy is None:
         return "Unknown"
     return "Healthy" if accuracy >= 70.0 else "Not Healthy"
+
+
+def parse_model_version(value: str | None) -> tuple[int, int, int] | None:
+    if not value:
+        return None
+    cleaned = value.strip()
+    if cleaned.startswith(("v", "V")):
+        cleaned = cleaned[1:]
+    parts = cleaned.split(".")
+    if len(parts) != 3 or not all(part.isdigit() for part in parts):
+        return None
+    return int(parts[0]), int(parts[1]), int(parts[2])
+
+
+def format_model_version(version: tuple[int, int, int]) -> str:
+    return f"v{version[0]}.{version[1]}.{version[2]}"
+
+
+def bump_model_version(value: str | None, *, fallback: str) -> str:
+    parsed = parse_model_version(value) or parse_model_version(fallback)
+    if parsed is None:
+        return fallback
+    return format_model_version((parsed[0], parsed[1], parsed[2] + 1))
 
 
 def extract_metrics_snapshot(metrics: dict[str, Any], *, model_name: str) -> dict[str, Any]:
@@ -278,235 +299,6 @@ class AuthManager:
         if int(payload["exp"]) < int(time.time()):
             raise PermissionError("Token expired.")
         return payload
-
-
-class AuditLogRepository:
-    def __init__(self, config: ApiConfig):
-        self.config = config
-
-    def connect(self) -> psycopg.Connection:
-        return psycopg.connect(
-            host=self.config.db_host,
-            port=self.config.db_port,
-            dbname=self.config.db_name,
-            user=self.config.db_user,
-            password=self.config.db_password,
-            autocommit=False,
-        )
-
-    def ensure_table(self, conn: psycopg.Connection) -> None:
-        sequence_name = f"{self.config.audit_table}_seq"
-        conn.execute(
-            sql.SQL("CREATE SEQUENCE IF NOT EXISTS {sequence_ref}").format(
-                sequence_ref=qualified_identifier(self.config.target_schema, sequence_name)
-            )
-        )
-        conn.execute(
-            sql.SQL(
-                """
-                CREATE TABLE IF NOT EXISTS {table_ref} (
-                    id int8 DEFAULT nextval({sequence_regclass}::regclass) NOT NULL,
-                    type varchar(255) NULL,
-                    request_url varchar(500) NULL,
-                    reference_number varchar(255) NULL,
-                    message text NULL,
-                    status varchar(255) NULL,
-                    request_body text NULL,
-                    response_body text NULL,
-                    created_by varchar(20) NULL,
-                    created_on timestamp NULL,
-                    modified_by varchar(20) NULL,
-                    modified_on timestamp NULL,
-                    delete_flag varchar(20) NULL,
-                    channel varchar(255) NULL,
-                    tenant_id varchar(255) NULL,
-                    module_name varchar(255) NULL,
-                    client_name varchar(255) NULL,
-                    total_records varchar(255) NULL,
-                    success_count varchar(255) NULL,
-                    failure_count varchar(255) NULL,
-                    processing_time_ms varchar(255) NULL,
-                    CONSTRAINT {constraint_name} PRIMARY KEY (id)
-                )
-                """
-            ).format(
-                table_ref=qualified_identifier(self.config.target_schema, self.config.audit_table),
-                sequence_regclass=sql.Literal(f"{self.config.target_schema}.{sequence_name}"),
-                constraint_name=sql.Identifier(f"{self.config.audit_table}_pkey"),
-            )
-        )
-        conn.execute(
-            sql.SQL('ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS "currentAccuracy" DOUBLE PRECISION').format(
-                table_ref=qualified_identifier(self.config.target_schema, self.config.audit_table)
-            )
-        )
-        conn.execute(
-            sql.SQL('ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS "driftPercentage" DOUBLE PRECISION').format(
-                table_ref=qualified_identifier(self.config.target_schema, self.config.audit_table)
-            )
-        )
-
-    def create_entry(
-        self,
-        *,
-        audit_type: str,
-        request_url: str,
-        reference_number: str,
-        request_body: dict[str, Any],
-        response_body: dict[str, Any],
-        status: str,
-        message: str,
-        current_accuracy: float | None = None,
-        drift_percentage: float | None = None,
-    ) -> None:
-        with self.connect() as conn:
-            self.ensure_table(conn)
-            now = utcnow_naive()
-            conn.execute(
-                sql.SQL(
-                    """
-                    INSERT INTO {table_ref} (
-                        type, request_url, reference_number, message, status,
-                        request_body, response_body, created_by, created_on,
-                        modified_by, modified_on, delete_flag, channel, tenant_id,
-                        module_name, client_name, total_records, success_count,
-                        failure_count, processing_time_ms, "currentAccuracy", "driftPercentage"
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """
-                ).format(table_ref=qualified_identifier(self.config.target_schema, self.config.audit_table)),
-                (
-                    audit_type,
-                    request_url,
-                    reference_number,
-                    message,
-                    status,
-                    json.dumps(request_body),
-                    json.dumps(response_body),
-                    "DIGITAL",
-                    now,
-                    "DIGITAL",
-                    now,
-                    "F",
-                    "DIGITAL",
-                    None,
-                    "AIML",
-                    "DIGITAL",
-                    None,
-                    None,
-                    None,
-                    None,
-                    current_accuracy,
-                    drift_percentage,
-                ),
-            )
-            conn.commit()
-
-    def update_entry(
-        self,
-        *,
-        reference_number: str,
-        audit_type: str,
-        status: str,
-        message: str,
-        response_body: dict[str, Any],
-        processing_time_ms: int | None = None,
-        current_accuracy: float | None = None,
-        drift_percentage: float | None = None,
-    ) -> None:
-        with self.connect() as conn:
-            self.ensure_table(conn)
-            conn.execute(
-                sql.SQL(
-                    """
-                    UPDATE {table_ref}
-                    SET status = %s,
-                        message = %s,
-                        response_body = %s,
-                        modified_by = %s,
-                        modified_on = %s,
-                        processing_time_ms = %s,
-                        "currentAccuracy" = %s,
-                        "driftPercentage" = %s
-                    WHERE reference_number = %s
-                      AND type = %s
-                    """
-                ).format(table_ref=qualified_identifier(self.config.target_schema, self.config.audit_table)),
-                (
-                    status,
-                    message,
-                    json.dumps(response_body),
-                    "AIML",
-                    utcnow_naive(),
-                    str(processing_time_ms) if processing_time_ms is not None else None,
-                    current_accuracy,
-                    drift_percentage,
-                    reference_number,
-                    audit_type,
-                ),
-            )
-            conn.commit()
-
-    def _serialize_row(self, row: Any) -> dict[str, Any]:
-        return {
-            "type": row[0],
-            "request_url": row[1],
-            "reference_number": row[2],
-            "message": row[3],
-            "status": row[4],
-            "request_body": json.loads(row[5]) if row[5] else None,
-            "response_body": json.loads(row[6]) if row[6] else None,
-            "created_on": row[7].isoformat() if row[7] else None,
-            "modified_on": row[8].isoformat() if row[8] else None,
-            "currentAccuracy": row[9],
-            "driftPercentage": row[10],
-        }
-
-    def fetch_latest(self, *, audit_type: str, completed_only: bool = False) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            self.ensure_table(conn)
-            conditions = ["type = %s"]
-            params: list[Any] = [audit_type]
-            if completed_only:
-                conditions.append("status = %s")
-                params.append("COMPLETED")
-            query = sql.SQL(
-                """
-                SELECT type, request_url, reference_number, message, status, request_body,
-                       response_body, created_on, modified_on, "currentAccuracy", "driftPercentage"
-                FROM {table_ref}
-                WHERE {conditions}
-                ORDER BY COALESCE(modified_on, created_on) DESC
-                LIMIT 1
-                """
-            ).format(
-                table_ref=qualified_identifier(self.config.target_schema, self.config.audit_table),
-                conditions=sql.SQL(" AND ").join(sql.SQL(part) for part in conditions),
-            )
-            row = conn.execute(query, params).fetchone()
-            if row is None:
-                return None
-            return self._serialize_row(row)
-
-    def fetch_by_reference_number(self, reference_number: str) -> dict[str, Any] | None:
-        with self.connect() as conn:
-            self.ensure_table(conn)
-            query = sql.SQL(
-                """
-                SELECT type, request_url, reference_number, message, status, request_body,
-                       response_body, created_on, modified_on, "currentAccuracy", "driftPercentage"
-                FROM {table_ref}
-                WHERE reference_number = %s
-                ORDER BY COALESCE(modified_on, created_on) DESC
-                LIMIT 1
-                """
-            ).format(table_ref=qualified_identifier(self.config.target_schema, self.config.audit_table))
-            row = conn.execute(query, (reference_number,)).fetchone()
-            if row is None:
-                return None
-            return self._serialize_row(row)
-
-
 
 
 
@@ -634,6 +426,46 @@ class AIConfigurationRepository:
                 "training_window": row[10],
             }
 
+    def fetch_latest(self, *, entry_type: str, status: str | None = None) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            self.ensure_table(conn)
+            conditions = ['"type" = %s']
+            params: list[Any] = [entry_type]
+            if status is not None:
+                conditions.append("status = %s")
+                params.append(status)
+            row = conn.execute(
+                sql.SQL(
+                    """
+                    SELECT "type", transaction_id, status, message, model_version, accuracy, drift,
+                           processing_time_ms, created_on, modified_on, training_window
+                    FROM {table_ref}
+                    WHERE {conditions}
+                    ORDER BY COALESCE(modified_on, created_on) DESC, id DESC
+                    LIMIT 1
+                    """
+                ).format(
+                    table_ref=qualified_identifier(self.config.target_schema, self.config.ai_config_table),
+                    conditions=sql.SQL(" AND ").join(sql.SQL(part) for part in conditions),
+                ),
+                params,
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "type": row[0],
+                "transaction_id": row[1],
+                "status": row[2],
+                "message": row[3],
+                "model_version": row[4],
+                "accuracy": row[5],
+                "drift": row[6],
+                "processing_time_ms": row[7],
+                "created_on": row[8].isoformat() if row[8] else None,
+                "modified_on": row[9].isoformat() if row[9] else None,
+                "training_window": row[10],
+            }
+
 
 class NoopAIConfigurationRepository:
     def create_entry(self, **kwargs) -> None:
@@ -643,6 +475,9 @@ class NoopAIConfigurationRepository:
         return None
 
     def fetch_by_transaction_id(self, transaction_id: str) -> dict[str, Any] | None:
+        return None
+
+    def fetch_latest(self, *, entry_type: str, status: str | None = None) -> dict[str, Any] | None:
         return None
 
 
@@ -688,14 +523,12 @@ class AIMLApiService:
         *,
         config: ApiConfig,
         auth_manager: AuthManager,
-        audit_repo: AuditLogRepository,
         job_runner: BackgroundJobRunner,
         logger: logging.Logger,
         ai_config_repo: AIConfigurationRepository | NoopAIConfigurationRepository | None = None,
     ) -> None:
         self.config = config
         self.auth_manager = auth_manager
-        self.audit_repo = audit_repo
         self.job_runner = job_runner
         self.logger = logger
         self.ai_config_repo = ai_config_repo or NoopAIConfigurationRepository()
@@ -705,7 +538,7 @@ class AIMLApiService:
         db_error = None
         if self.config.db_host and self.config.db_name and self.config.db_user and self.config.db_password:
             try:
-                with self.audit_repo.connect() as conn:
+                with self.ai_config_repo.connect() as conn:
                     conn.execute("SELECT 1")
                 db_status = "ok"
             except Exception as exc:  # noqa: BLE001
@@ -717,7 +550,7 @@ class AIMLApiService:
             "service": "aiml-integration-api",
             "dbStatus": db_status,
             "dbError": db_error,
-            "modelVersion": self.config.api_model_version,
+            "modelVersion": self.current_model_version(),
         }
 
     def issue_auth_token(self, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -728,18 +561,17 @@ class AIMLApiService:
         return HTTPStatus.OK, self.auth_manager.issue_token(username)
 
     def model_status(self) -> tuple[int, dict[str, Any]]:
-        training = self.audit_repo.fetch_latest(audit_type="TRAINING", completed_only=True)
-        inference = self.audit_repo.fetch_latest(audit_type="INFERENCE", completed_only=True)
+        training = self.ai_config_repo.fetch_latest(entry_type="TRAINING", status="COMPLETED")
+        inference = self.ai_config_repo.fetch_latest(entry_type="INFERENCE", status="COMPLETED")
         metrics = read_metrics_snapshot(self.config.model_name)
-        inference_response = (inference or {}).get("response_body") or {}
-        accuracy = (inference or {}).get("currentAccuracy")
+        accuracy = self._coerce_float((inference or {}).get("accuracy"))
         if accuracy is None:
-            accuracy = inference_response.get("currentAccuracy", metrics.get("currentAccuracy"))
-        drift = (inference or {}).get("driftPercentage")
+            accuracy = metrics.get("currentAccuracy")
+        drift = self._coerce_float((inference or {}).get("drift"))
         if drift is None:
-            drift = inference_response.get("driftPercentage", metrics.get("driftPercentage"))
+            drift = metrics.get("driftPercentage")
         payload = {
-            "modelVersion": inference_response.get("modelVersion", self.config.api_model_version),
+            "modelVersion": self.current_model_version(),
             "lastTrainingDate": (training or {}).get("modified_on") or (training or {}).get("created_on"),
             "lastInferenceDate": (inference or {}).get("modified_on") or (inference or {}).get("created_on"),
             "currentAccuracy": accuracy,
@@ -751,35 +583,42 @@ class AIMLApiService:
         return HTTPStatus.OK, payload
 
     def get_transaction_status(self, reference_number: str) -> tuple[int, dict[str, Any]]:
-        entry = self.audit_repo.fetch_by_reference_number(reference_number)
-        if entry is None:
-            config_entry = self.ai_config_repo.fetch_by_transaction_id(reference_number)
-            if config_entry is None:
-                return HTTPStatus.NOT_FOUND, {"message": f"Transaction {reference_number} not found."}
-            return HTTPStatus.OK, {
-                "transactionId": config_entry["transaction_id"],
-                "type": config_entry["type"],
-                "status": config_entry["status"],
-                "message": config_entry["message"],
-                "modelVersion": config_entry["model_version"],
-                "accuracy": config_entry["accuracy"],
-                "drift": config_entry["drift"],
-                "createdOn": config_entry["created_on"],
-                "modifiedOn": config_entry["modified_on"],
-                "trainingWindow": config_entry["training_window"],
-            }
+        config_entry = self.ai_config_repo.fetch_by_transaction_id(reference_number)
+        if config_entry is None:
+            return HTTPStatus.NOT_FOUND, {"message": f"Transaction {reference_number} not found."}
         payload = {
-            "transactionId": entry["reference_number"],
-            "type": entry["type"],
-            "status": entry["status"],
-            "message": entry["message"],
-            "requestUrl": entry["request_url"],
-            "requestBody": entry["request_body"],
-            "responseBody": entry["response_body"],
-            "createdOn": entry["created_on"],
-            "modifiedOn": entry["modified_on"],
+            "transactionId": config_entry.get("transaction_id"),
+            "type": config_entry.get("type"),
+            "status": config_entry.get("status"),
+            "message": config_entry.get("message"),
+            "modelVersion": config_entry.get("model_version"),
+            "accuracy": config_entry.get("accuracy"),
+            "drift": config_entry.get("drift"),
+            "createdOn": config_entry.get("created_on"),
+            "modifiedOn": config_entry.get("modified_on"),
+            "trainingWindow": config_entry.get("training_window"),
         }
         return HTTPStatus.OK, payload
+
+    def current_model_version(self) -> str:
+        latest_training = self.ai_config_repo.fetch_latest(entry_type="TRAINING", status="COMPLETED")
+        model_version = (latest_training or {}).get("model_version")
+        parsed = parse_model_version(model_version)
+        if parsed is None:
+            return self.config.api_model_base_version
+        return format_model_version(parsed)
+
+    def next_model_version(self) -> str:
+        return bump_model_version(self.current_model_version(), fallback=self.config.api_model_base_version)
+
+    @staticmethod
+    def _coerce_float(value: Any) -> float | None:
+        if value in (None, ""):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def trigger_training(self, payload: dict[str, Any], request_url: str) -> tuple[int, dict[str, Any]]:
         transaction_id = str(payload.get("transactionId", "")).strip()
@@ -800,33 +639,26 @@ class AIMLApiService:
             return HTTPStatus.BAD_REQUEST, failure_response(transaction_id, "months is required.")
         months = int(payload.get("months", 3))
         model_name = self.config.model_name
+        next_model_version = self.next_model_version()
         accepted = {
             "transactionId": transaction_id,
             "status": "ACCEPTED",
-            "modelVersion": self.config.api_model_version,
+            "modelVersion": next_model_version,
             "message": "Request accepted for processing.",
         }
         request_body = {
             "transactionId": transaction_id,
             "months": months,
             "model": model_name,
+            "modelVersion": next_model_version,
         }
-        self.audit_repo.create_entry(
-            audit_type="TRAINING",
-            request_url=request_url,
-            reference_number=transaction_id,
-            request_body=request_body,
-            response_body=accepted,
-            status="ACCEPTED",
-            message="Request accepted for processing.",
-        )
         self.ai_config_repo.update_entry(
             transaction_id=transaction_id,
             entry_type="TRAINING",
             status="ACCEPTED",
             message="Request accepted for processing.",
             training_window=str(months),
-            model_version=self.config.api_model_version,
+            model_version=next_model_version,
         )
         self.job_runner.submit(
             transaction_id,
@@ -859,11 +691,13 @@ class AIMLApiService:
             return HTTPStatus.BAD_REQUEST, failure_response(transaction_id, str(exc))
         model_name = self.config.model_name
         metrics = read_metrics_snapshot(model_name)
+        current_model_version = self.current_model_version()
         accepted = {
             "transactionId": transaction_id,
             "status": "ACCEPTED",
             "driftPercentage": metrics.get("driftPercentage"),
             "currentAccuracy": metrics.get("currentAccuracy"),
+            "modelVersion": current_model_version,
             "message": "Request accepted for processing.",
         }
         request_body = {
@@ -872,21 +706,12 @@ class AIMLApiService:
             "predictMonth": predict_month,
             "model": model_name,
         }
-        self.audit_repo.create_entry(
-            audit_type="INFERENCE",
-            request_url=request_url,
-            reference_number=transaction_id,
-            request_body=request_body,
-            response_body=accepted,
-            status="ACCEPTED",
-            message="Request accepted for processing.",
-        )
         self.ai_config_repo.update_entry(
             transaction_id=transaction_id,
             entry_type="INFERENCE",
             status="ACCEPTED",
             message="Request accepted for processing.",
-            model_version=self.config.api_model_version,
+            model_version=current_model_version,
             training_window="10 days",
         )
         self.job_runner.submit(
@@ -899,6 +724,7 @@ class AIMLApiService:
         started_at = time.perf_counter()
         model_name = str(payload["model"])
         months = int(payload["months"])
+        target_model_version = str(payload.get("modelVersion") or self.next_model_version())
         metrics_file = METRICS_DIR / f"next_month_strategy_{model_name}_metrics.json"
         model_file = MODEL_DIR / f"next_month_strategy_{model_name}.joblib"
         prediction_file = PREDICTIONS_DIR / f"{current_month_yyyy_mm().replace('-', '_')}_strategy_predictions_{model_name}.csv"
@@ -923,27 +749,17 @@ class AIMLApiService:
                 "transactionId": transaction_id,
                 "status": "COMPLETED",
                 "message": "Processing completed.",
-                "modelVersion": self.config.api_model_version,
+                "modelVersion": target_model_version,
                 "currentAccuracy": snapshot.get("currentAccuracy"),
                 "driftPercentage": snapshot.get("driftPercentage"),
                 "metricsFile": str(metrics_file),
                 "modelFile": str(model_file),
             }
-            self.audit_repo.update_entry(
-                reference_number=transaction_id,
-                audit_type="TRAINING",
-                status="COMPLETED",
-                message="Processing completed.",
-                response_body=response_body,
-                processing_time_ms=int((time.perf_counter() - started_at) * 1000),
-                current_accuracy=snapshot.get("currentAccuracy"),
-                drift_percentage=snapshot.get("driftPercentage"),
-            )
             self.ai_config_repo.update_entry(
                 transaction_id=transaction_id,
                 status="COMPLETED",
                 message="Processing completed.",
-                model_version=self.config.api_model_version,
+                model_version=target_model_version,
                 accuracy=snapshot.get("currentAccuracy"),
                 drift=snapshot.get("driftPercentage"),
                 processing_time_ms=int((time.perf_counter() - started_at) * 1000),
@@ -953,23 +769,11 @@ class AIMLApiService:
         except Exception as exc:  # noqa: BLE001
             self.logger.exception("Training job failed | transaction_id=%s", transaction_id)
             error_message = subprocess_error_message(exc) if isinstance(exc, subprocess.CalledProcessError) else str(exc)
-            self.audit_repo.update_entry(
-                reference_number=transaction_id,
-                audit_type="TRAINING",
-                status="FAILED",
-                message=error_message,
-                response_body={
-                    "transactionId": transaction_id,
-                    "status": "FAILED",
-                    "message": error_message,
-                },
-                processing_time_ms=int((time.perf_counter() - started_at) * 1000),
-            )
             self.ai_config_repo.update_entry(
                 transaction_id=transaction_id,
                 status="FAILED",
                 message=error_message,
-                model_version=self.config.api_model_version,
+                model_version=target_model_version,
                 processing_time_ms=int((time.perf_counter() - started_at) * 1000),
                 entry_type="TRAINING",
                 training_window=str(months),
@@ -980,6 +784,7 @@ class AIMLApiService:
         source_month = str(payload["sourceMonth"])
         predict_month = str(payload["predictMonth"])
         model_name = str(payload["model"])
+        model_version = self.current_model_version()
         command = self._build_inference_command(
             source_month=source_month,
             predict_month=predict_month,
@@ -1007,7 +812,7 @@ class AIMLApiService:
                 "transactionId": transaction_id,
                 "status": "COMPLETED",
                 "message": "Metrics generated successfully",
-                "modelVersion": self.config.api_model_version,
+                "modelVersion": model_version,
                 "currentAccuracy": snapshot.get("currentAccuracy"),
                 "driftPercentage": drift_summary.get("drift_percentage", snapshot.get("driftPercentage")),
                 "overallPsi": drift_summary.get("overall_psi"),
@@ -1019,21 +824,11 @@ class AIMLApiService:
                 "schedulerExportWrite": self.config.export_write if self.config.export_after_inference else None,
                 "schedulerExportTriggerState": self.config.export_trigger_state if self.config.export_after_inference else None,
             }
-            self.audit_repo.update_entry(
-                reference_number=transaction_id,
-                audit_type="INFERENCE",
-                status="COMPLETED",
-                message="Metrics generated successfully",
-                response_body=response_body,
-                processing_time_ms=int((time.perf_counter() - started_at) * 1000),
-                current_accuracy=response_body.get("currentAccuracy"),
-                drift_percentage=response_body.get("driftPercentage"),
-            )
             self.ai_config_repo.update_entry(
                 transaction_id=transaction_id,
                 status="COMPLETED",
                 message="Metrics generated successfully",
-                model_version=self.config.api_model_version,
+                model_version=model_version,
                 accuracy=response_body.get("currentAccuracy"),
                 drift=response_body.get("driftPercentage"),
                 processing_time_ms=int((time.perf_counter() - started_at) * 1000),
@@ -1043,23 +838,11 @@ class AIMLApiService:
         except Exception as exc:  # noqa: BLE001
             self.logger.exception("Inference job failed | transaction_id=%s", transaction_id)
             error_message = subprocess_error_message(exc) if isinstance(exc, subprocess.CalledProcessError) else str(exc)
-            self.audit_repo.update_entry(
-                reference_number=transaction_id,
-                audit_type="INFERENCE",
-                status="FAILED",
-                message=error_message,
-                response_body={
-                    "transactionId": transaction_id,
-                    "status": "FAILED",
-                    "message": error_message,
-                },
-                processing_time_ms=int((time.perf_counter() - started_at) * 1000),
-            )
             self.ai_config_repo.update_entry(
                 transaction_id=transaction_id,
                 status="FAILED",
                 message=error_message,
-                model_version=self.config.api_model_version,
+                model_version=model_version,
                 processing_time_ms=int((time.perf_counter() - started_at) * 1000),
                 entry_type="INFERENCE",
                 training_window="10 days",
@@ -1142,7 +925,6 @@ class AIMLApiService:
             self.config.campaign_vertical,
             "--campaign-vendor",
             self.config.campaign_vendor,
-            "--skip-audit-log",
         ]
 
     def _build_export_command(self, *, source_month: str, predict_month: str, model_name: str) -> list[str]:
@@ -1251,7 +1033,6 @@ def build_app(config: ApiConfig | None = None) -> AIMLApiApp:
             secret=resolved.auth_secret,
             ttl_seconds=resolved.token_ttl_seconds,
         ),
-        audit_repo=AuditLogRepository(resolved),
         job_runner=BackgroundJobRunner(),
         logger=logger,
         ai_config_repo=AIConfigurationRepository(resolved),

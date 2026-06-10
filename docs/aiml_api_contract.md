@@ -100,6 +100,7 @@
   "status": "ACCEPTED",
   "driftPercentage": 4.8,
   "currentAccuracy": 78.5,
+  "modelVersion": "v1.1.3",
   "message": "Request accepted for processing."
 }
 ```
@@ -118,7 +119,7 @@
 
 - `transactionId` must already exist in `digital_collections.ai_configurations`.
 - API updates that existing row to `ACCEPTED`, then later to `COMPLETED` or `FAILED`.
-- Drift + accuracy persist in `api_audit_log`.`currentAccuracy` and `api_audit_log`.`driftPercentage`.
+- Drift + accuracy persist in `digital_collections.ai_configurations`.`drift` and `digital_collections.ai_configurations`.`accuracy`.
 
 ## Model Status API
 
@@ -131,7 +132,7 @@
 
 ```json
 {
-  "modelVersion": "v1.2",
+  "modelVersion": "v1.1.3",
   "lastTrainingDate": "2026-06-10T09:30:00",
   "lastInferenceDate": "2026-06-10T09:45:00",
   "currentAccuracy": 78.5,
@@ -144,10 +145,10 @@
 
 Rules:
 
-- `lastTrainingDate` = latest completed `TRAINING` `modified_on` in `api_audit_log`
-- `lastInferenceDate` = latest completed `INFERENCE` `modified_on` in `api_audit_log`
-- `currentAccuracy` = latest completed inference `currentAccuracy`
-- `currentDrift` = latest completed inference `driftPercentage`
+- `lastTrainingDate` = latest completed `TRAINING` `modified_on` in `ai_configurations`
+- `lastInferenceDate` = latest completed `INFERENCE` `modified_on` in `ai_configurations`
+- `currentAccuracy` = latest completed inference `accuracy`
+- `currentDrift` = latest completed inference `drift`
 
 ## Health API
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import sys
-import uuid
 from pathlib import Path
 
 import numpy as np
@@ -33,9 +32,7 @@ from run_monthly_inference_pipeline import (
     build_campaign_recommendations,
     month_label,
     resolve_campaign_vendors,
-    parse_args,
     selected_history_files,
-    store_api_audit_log,
     validate_month_pair,
 )
 from train_next_month_strategy_model_catboost import (
@@ -46,18 +43,6 @@ from train_next_month_strategy_model_catboost import (
 from pipeline_common import DAY_COLUMNS
 from predict_next_month_strategy_catboost import build_prediction_population, build_prediction_reason
 from campaign_recommendation.recommend import RecommendationPolicy, candidate_hours, generate_candidates
-
-
-def test_parse_args_supports_skip_audit_log(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("PGHOST", "localhost")
-    monkeypatch.setenv("PGDATABASE", "testdb")
-    monkeypatch.setenv("PGUSER", "testuser")
-    monkeypatch.setenv("PGPASSWORD", "testpass")
-    monkeypatch.setattr(sys, "argv", ["run_monthly_inference_pipeline.py", "--skip-audit-log"])
-
-    args = parse_args()
-
-    assert args.skip_audit_log is True
 
 
 def test_validate_month_pair_accepts_adjacent_months() -> None:
@@ -869,51 +854,6 @@ def test_mcollect_publish_skips_digital_rules_writes(monkeypatch: pytest.MonkeyP
 
     assert summary.templates == 1
     assert all("digital_rules" not in query.lower() for _, query in conn.log)
-
-
-class _ExecRecordingConn:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, str, object]] = []
-
-    def execute(self, query, params=None) -> None:
-        self.calls.append(("execute", str(query), params))
-
-
-def test_store_api_audit_log_writes_new_table() -> None:
-    conn = _ExecRecordingConn()
-
-    store_api_audit_log(
-        conn,
-        "digital_collections",
-        "api_audit_log",
-        model_name="catboost_3m",
-        source_month="APR-2026",
-        prediction_month="MAY-2026",
-        status="SUCCESS",
-        prediction_completed_count=14,
-        prediction_failed_count=0,
-        failed_reason=None,
-        duration_seconds=1.25,
-        prediction_table="ai_ml_recommendations_data",
-        prediction_file=Path("artifacts/predictions/out.csv"),
-    )
-
-    queries = [query.lower() for _, query, _ in conn.calls]
-    assert any("create sequence if not exists" in query and "api_audit_log_seq" in query for query in queries)
-    assert any("create table if not exists" in query and "api_audit_log" in query for query in queries)
-    insert_params = conn.calls[-1][2]
-    assert insert_params[0] == "AI-ML RECOMMENDATIONS"
-    assert insert_params[4] == "SUCCESS"
-    assert str(uuid.UUID(insert_params[2])) == insert_params[2]
-    assert insert_params[11] == "F"
-    assert insert_params[12] is None
-    assert insert_params[13] is None
-    assert insert_params[14] == "digital"
-    assert insert_params[15] == "muthoot"
-    assert insert_params[16] == "14"
-    assert insert_params[17] == "14"
-    assert insert_params[18] == "0"
-
 
 
 
