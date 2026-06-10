@@ -10,7 +10,6 @@ Archived under `legacy/api_unused_scripts/`:
 - `register_catboost_model_mlflow.py`
 - `train_strategy_model.py`
 - `train_strategy_model_low_ram.py`
-- `write_target_db_outputs.py`
 
 Not archived yet:
 - `scripts/export_mcollect_scheduler.py`: conditional API dependency when export is enabled.

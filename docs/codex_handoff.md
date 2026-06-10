@@ -15,7 +15,6 @@ Campaign recommendation ML pipeline with MCollect Digital scheduler integration.
 ## Key Entry Points
 - Monthly inference: `scripts/run_monthly_inference_pipeline.py`
 - MCollect export: `scripts/export_mcollect_scheduler.py`
-- Standalone target writer: `legacy/api_unused_scripts/write_target_db_outputs.py`
 - Quartz job data serializer: `scripts/quartz_job_data.py`
 - Main tests: `tests/test_monthly_pipeline.py`
 
@@ -71,21 +70,11 @@ Campaign recommendation ML pipeline with MCollect Digital scheduler integration.
 
 ./venv/bin/python -m pytest -q tests/test_monthly_pipeline.py
 
-./venv/bin/python legacy/api_unused_scripts/write_target_db_outputs.py \
-  --host <target_db_host> \
-  --port 5432 \
-  --dbname <target_db_name> \
-  --user <target_db_user> \
-  --password <target_db_password> \
-  --prediction-file artifacts/predictions/2026_05_strategy_predictions_catboost_3m.csv \
-  --source-month 2026-04 \
-  --predict-month 2026-05 \
-  --model catboost_3m
 ```
 
 ## Last Context Snapshot
 - Monthly inference for `APR-2026 -> MAY-2026` completed successfully with `1` prediction row for `MOB-TEST-Sumit`.
 - Current staged campaign output for that run is `14` campaigns and `14` mappings.
-- Monthly inference stored `1` prediction snapshot, `14` campaign recommendations, `14` campaign mappings, and one `api_audit_log` row in Postgres.
+- Monthly inference stored `1` prediction snapshot, `14` campaign recommendations, `14` campaign mappings, and updated one `ai_configurations` row in Postgres.
 - Export script now writes only `dataset`, `qrtz_job_details`, `qrtz_triggers`, and `qrtz_cron_triggers`. Existing `digital_rules` templates are referenced by name and remain manually managed.
 - Current export dry run for `APR-2026 -> MAY-2026`: `14` campaigns, `7` datasets, `4` template refs, `14` jobs, `14` triggers.

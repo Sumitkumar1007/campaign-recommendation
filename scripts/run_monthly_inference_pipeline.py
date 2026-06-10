@@ -87,17 +87,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--target-schema",
         default=os.getenv("TARGET_SCHEMA", "digital_collections"),
-        help="Schema used for storing predictions, campaigns, and audit logs.",
+        help="Schema used for storing predictions and campaign outputs.",
     )
     parser.add_argument(
         "--prediction-table",
         default=os.getenv("PREDICTION_TABLE", "ai_ml_recommendations_data"),
         help="Target table for model prediction snapshots.",
-    )
-    parser.add_argument(
-        "--audit-table",
-        default=os.getenv("AUDIT_TABLE", "api_audit_log"),
-        help="Target table for pipeline audit records.",
     )
     parser.add_argument(
         "--campaign-table",
@@ -169,11 +164,6 @@ def parse_args() -> argparse.Namespace:
         "--log-file",
         default=str(LOG_DIR / "monthly_inference_pipeline.log"),
         help="Application log file.",
-    )
-    parser.add_argument(
-        "--skip-audit-log",
-        action="store_true",
-        help="Skip standalone pipeline audit writes when invoked from the API service.",
     )
     args = parser.parse_args()
     missing = [
@@ -595,209 +585,6 @@ def ensure_campaign_mapping_table(conn, schema: str, table: str) -> None:
             table_ref=qualified_identifier(schema, table)
         )
     )
-
-
-def ensure_api_audit_log_table(conn, schema: str, table: str) -> None:
-    sequence_name = f"{table}_seq"
-    conn.execute(
-        sql.SQL("CREATE SEQUENCE IF NOT EXISTS {sequence_ref}").format(
-            sequence_ref=qualified_identifier(schema, sequence_name)
-        )
-    )
-    conn.execute(
-        sql.SQL(
-            """
-            CREATE TABLE IF NOT EXISTS {table_ref} (
-                id int8 DEFAULT nextval({sequence_regclass}::regclass) NOT NULL,
-                type varchar(255) NULL,
-                request_url varchar(500) NULL,
-                reference_number varchar(255) NULL,
-                message text NULL,
-                status varchar(255) NULL,
-                request_body text NULL,
-                response_body text NULL,
-                created_by varchar(20) NULL,
-                created_on timestamp NULL,
-                modified_by varchar(20) NULL,
-                modified_on timestamp NULL,
-                delete_flag varchar(20) NULL,
-                channel varchar(255) NULL,
-                tenant_id varchar(255) NULL,
-                module_name varchar(255) NULL,
-                client_name varchar(255) NULL,
-                total_records varchar(255) NULL,
-                success_count varchar(255) NULL,
-                failure_count varchar(255) NULL,
-                processing_time_ms varchar(255) NULL,
-                CONSTRAINT {constraint_name} PRIMARY KEY (id)
-            )
-            """
-        ).format(
-            table_ref=qualified_identifier(schema, table),
-            sequence_regclass=sql.Literal(f"{schema}.{sequence_name}"),
-            constraint_name=sql.Identifier(f"{table}_pkey"),
-        )
-    )
-    conn.execute(
-        sql.SQL('ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS "currentAccuracy" DOUBLE PRECISION').format(
-            table_ref=qualified_identifier(schema, table)
-        )
-    )
-    conn.execute(
-        sql.SQL('ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS "driftPercentage" DOUBLE PRECISION').format(
-            table_ref=qualified_identifier(schema, table)
-        )
-    )
-
-
-def store_api_audit_log(
-    conn,
-    schema: str,
-    table: str,
-    *,
-    model_name: str,
-    source_month: str,
-    prediction_month: str,
-    status: str,
-    prediction_completed_count: int,
-    prediction_failed_count: int,
-    failed_reason: str | None,
-    duration_seconds: float,
-    prediction_table: str,
-    prediction_file: Path | None,
-    current_accuracy: float | None = None,
-    drift_percentage: float | None = None,
-    drift_summary: dict[str, object] | None = None,
-) -> None:
-    ensure_api_audit_log_table(conn, schema, table)
-    now = datetime.now(timezone.utc).replace(tzinfo=None)
-    actor = "campaign-model"
-    total_records = int(prediction_completed_count) + int(prediction_failed_count)
-    reference_number = str(uuid.uuid4())
-    request_body = json.dumps(
-        {
-            "model_name": model_name,
-            "source_month": source_month,
-            "prediction_month": prediction_month,
-            "prediction_table": prediction_table,
-        }
-    )
-    response_payload = {
-        "prediction_file": str(prediction_file) if prediction_file else None,
-        "status": status,
-        "success_count": int(prediction_completed_count),
-        "failure_count": int(prediction_failed_count),
-        "processing_time_ms": int(duration_seconds * 1000),
-        "currentAccuracy": current_accuracy,
-        "driftPercentage": drift_percentage,
-    }
-    if drift_summary:
-        response_payload["driftSummary"] = drift_summary
-    response_body = json.dumps(response_payload)
-    message = failed_reason or (
-        f"Monthly inference {status.lower()} for {source_month} -> {prediction_month} using {model_name}."
-    )
-    conn.execute(
-        sql.SQL(
-            """
-            INSERT INTO {table_ref} (
-                type,
-                request_url,
-                reference_number,
-                message,
-                status,
-                request_body,
-                response_body,
-                created_by,
-                created_on,
-                modified_by,
-                modified_on,
-                delete_flag,
-                channel,
-                tenant_id,
-                module_name,
-                client_name,
-                total_records,
-                success_count,
-                failure_count,
-                processing_time_ms,
-                "currentAccuracy",
-                "driftPercentage"
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """
-        ).format(table_ref=qualified_identifier(schema, table)),
-        (
-            "AI-ML RECOMMENDATIONS",
-            "scripts/run_monthly_inference_pipeline.py",
-            reference_number,
-            message,
-            status,
-            request_body,
-            response_body,
-            actor,
-            now,
-            actor,
-            now,
-            "F",
-            None,
-            None,
-            "digital",
-            "muthoot",
-            str(total_records),
-            str(int(prediction_completed_count)),
-            str(int(prediction_failed_count)),
-            str(int(duration_seconds * 1000)),
-            current_accuracy,
-            drift_percentage,
-        ),
-    )
-
-
-def write_pipeline_audit(
-    args: argparse.Namespace,
-    *,
-    status: str,
-    prediction_completed_count: int,
-    prediction_failed_count: int,
-    failed_reason: str | None,
-    duration_seconds: float,
-    prediction_file: Path | None,
-    current_accuracy: float | None,
-    drift_percentage: float | None,
-    drift_summary: dict[str, object] | None,
-    logger: logging.Logger,
-) -> None:
-    try:
-        config = PostgresConfig(
-            host=args.host,
-            port=args.port,
-            dbname=args.dbname,
-            user=args.user,
-            password=args.password,
-        )
-        with connect_db(config) as conn:
-            store_api_audit_log(
-                conn,
-                args.target_schema,
-                args.audit_table,
-                model_name=args.model,
-                source_month=month_label(args.source_month),
-                prediction_month=month_label(args.predict_month),
-                status=status,
-                prediction_completed_count=prediction_completed_count,
-                prediction_failed_count=prediction_failed_count,
-                failed_reason=failed_reason,
-                duration_seconds=duration_seconds,
-                prediction_table=args.prediction_table,
-                prediction_file=prediction_file,
-                current_accuracy=current_accuracy,
-                drift_percentage=drift_percentage,
-                drift_summary=drift_summary,
-            )
-            conn.commit()
-    except Exception:
-        logger.exception("Failed to write pipeline audit record.")
 
 
 def store_prediction_snapshots(
@@ -1781,20 +1568,6 @@ def main() -> None:
         if not csv_has_rows(source_extract_file):
             logger.warning("No latest communication rows found. Skipping prediction run.")
             print(f"No latest communication rows found in {source_extract_file}; skipped prediction run.")
-            if not args.skip_audit_log:
-                write_pipeline_audit(
-                    args,
-                    status="SKIPPED",
-                    prediction_completed_count=0,
-                    prediction_failed_count=0,
-                    failed_reason=f"No latest communication rows found in {source_extract_file}",
-                    duration_seconds=(datetime.now(timezone.utc) - run_started_at).total_seconds(),
-                    prediction_file=None,
-                    current_accuracy=None,
-                    drift_percentage=None,
-                    drift_summary=None,
-                    logger=logger,
-                )
             return
 
         history_files = selected_history_files(args.source_month, source_extract_file)
@@ -2022,37 +1795,9 @@ def main() -> None:
         print(f"Prediction file: {prediction_file}")
         print(f"Metrics file: {metrics_file}")
         print(f"Prediction summary: {summary_path}")
-        if not args.skip_audit_log:
-            write_pipeline_audit(
-                args,
-                status="SUCCESS",
-                prediction_completed_count=prediction_rows,
-                prediction_failed_count=0,
-                failed_reason=None,
-                duration_seconds=(datetime.now(timezone.utc) - run_started_at).total_seconds(),
-                prediction_file=prediction_file,
-                current_accuracy=(drift_report or {}).get("current_accuracy"),
-                drift_percentage=(drift_report or {}).get("drift_percentage"),
-                drift_summary=({k: v for k, v in (drift_report or {}).items() if k != "feature_metrics"} if drift_report else None),
-                logger=logger,
-            )
         logger.info("Monthly inference completed successfully.")
     except Exception as exc:
         logger.exception("Monthly inference failed.")
-        if not args.skip_audit_log:
-            write_pipeline_audit(
-                args,
-                status="FAILED",
-                prediction_completed_count=prediction_rows,
-                prediction_failed_count=1,
-                failed_reason=str(exc),
-                duration_seconds=(datetime.now(timezone.utc) - run_started_at).total_seconds(),
-                prediction_file=prediction_file,
-                current_accuracy=(drift_report or {}).get("current_accuracy"),
-                drift_percentage=(drift_report or {}).get("drift_percentage"),
-                drift_summary=({k: v for k, v in (drift_report or {}).items() if k != "feature_metrics"} if drift_report else None),
-                logger=logger,
-            )
         raise
 
 

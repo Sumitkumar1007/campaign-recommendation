@@ -8,7 +8,6 @@ import socket
 import sys
 import threading
 import urllib.request
-import uuid
 from pathlib import Path
 
 import pytest
@@ -24,7 +23,6 @@ from campaign_recommendation.api_service import (  # noqa: E402
     AIMLApiApp,
     AIMLApiService,
     ApiConfig,
-    AuditLogRepository,
     AuthManager,
     BackgroundJobRunner,
     extract_metrics_snapshot,
@@ -32,41 +30,6 @@ from campaign_recommendation.api_service import (  # noqa: E402
     read_prediction_summary,
 )
 import campaign_recommendation.api_service as api_service_module  # noqa: E402
-
-
-class DummyAuditRepo:
-    def __init__(self) -> None:
-        self.created: list[dict] = []
-        self.updated: list[dict] = []
-        self.latest: dict[tuple[str, bool], dict] = {}
-
-    def create_entry(self, **kwargs) -> None:
-        self.created.append(kwargs)
-
-    def update_entry(self, **kwargs) -> None:
-        self.updated.append(kwargs)
-
-    def fetch_latest(self, *, audit_type: str, completed_only: bool = False):
-        return self.latest.get((audit_type, completed_only))
-
-    def fetch_by_reference_number(self, reference_number: str):
-        for payload in self.latest.values():
-            if payload and payload.get("reference_number") == reference_number:
-                return payload
-        for payload in self.created:
-            if payload.get("reference_number") == reference_number:
-                return {
-                    "type": payload["audit_type"],
-                    "request_url": payload["request_url"],
-                    "reference_number": payload["reference_number"],
-                    "message": payload["message"],
-                    "status": payload["status"],
-                    "request_body": payload["request_body"],
-                    "response_body": payload["response_body"],
-                    "created_on": None,
-                    "modified_on": None,
-                }
-        return None
 
 
 
@@ -96,6 +59,15 @@ class DummyAIConfigRepo:
 
     def fetch_by_transaction_id(self, transaction_id: str):
         return self.entries.get(transaction_id)
+
+    def fetch_latest(self, *, entry_type: str, status: str | None = None):
+        candidates = [entry for entry in self.entries.values() if entry.get("type") == entry_type]
+        if status is not None:
+            candidates = [entry for entry in candidates if entry.get("status") == status]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda entry: (entry.get("modified_on") or entry.get("created_on") or "", entry.get("transaction_id") or ""))
+        return candidates[-1]
 
 
 class CapturingService(AIMLApiService):
@@ -138,7 +110,6 @@ def build_config(*, export_after_inference: bool = False, export_write: bool = F
         db_user="",
         db_password="",
         target_schema="digital_collections",
-        audit_table="api_audit_log",
         model_name="catboost_3m",
         auth_username="aiml",
         auth_password="secret",
@@ -151,6 +122,7 @@ def build_config(*, export_after_inference: bool = False, export_write: bool = F
         export_trigger_state="PAUSED",
         export_write=export_write,
         log_file=REPO_ROOT / "artifacts" / "logs" / "test_aiml_api.log",
+        api_model_base_version="v1.1.0",
     )
 
 
@@ -165,7 +137,6 @@ def build_service(*, export_after_inference: bool = False, export_write: bool = 
     return AIMLApiService(
         config=config,
         auth_manager=AuthManager("aiml", "secret", "top-secret", 60),
-        audit_repo=DummyAuditRepo(),
         job_runner=DummyJobRunner(),
         logger=logging.getLogger("test_aiml_api"),
         ai_config_repo=ai_config_repo,
@@ -225,7 +196,6 @@ def live_db_config() -> ApiConfig | None:
         db_user=str(os.getenv("PGUSER")),
         db_password=str(os.getenv("PGPASSWORD")),
         target_schema=os.getenv("TARGET_SCHEMA", "digital_collections"),
-        audit_table=os.getenv("AUDIT_TABLE", "api_audit_log"),
         model_name="catboost_3m",
         auth_username="aiml",
         auth_password="secret",
@@ -238,6 +208,7 @@ def live_db_config() -> ApiConfig | None:
         export_trigger_state="PAUSED",
         export_write=False,
         log_file=REPO_ROOT / "artifacts" / "logs" / "test_aiml_api_live.log",
+        api_model_base_version="v1.1.0",
     )
 
 
@@ -261,13 +232,21 @@ def test_extract_metrics_snapshot_uses_validation_accuracy_and_gap() -> None:
 
 def test_auth_and_status_route() -> None:
     service = build_service()
-    repo = service.audit_repo
-    repo.latest[("TRAINING", True)] = {"status": "COMPLETED", "modified_on": "2026-06-09T10:00:00"}
-    repo.latest[("INFERENCE", True)] = {
+    service.ai_config_repo.entries["TRN_STATUS_1"] = {
+        "transaction_id": "TRN_STATUS_1",
+        "type": "TRAINING",
         "status": "COMPLETED",
+        "model_version": "v1.1.1",
+        "modified_on": "2026-06-09T10:00:00",
+    }
+    service.ai_config_repo.entries["TRN_STATUS_2"] = {
+        "transaction_id": "TRN_STATUS_2",
+        "type": "INFERENCE",
+        "status": "COMPLETED",
+        "model_version": "v1.1.1",
+        "accuracy": "78.5",
+        "drift": "4.8",
         "modified_on": "2026-06-09T11:00:00",
-        "driftPercentage": 4.8,
-        "response_body": {"currentAccuracy": 78.5, "driftPercentage": 4.8, "modelVersion": "catboost_3m"},
     }
     app = AIMLApiApp(service)
 
@@ -297,27 +276,24 @@ def test_training_route_creates_audit_and_submits_job() -> None:
 
     assert status.startswith("202")
     assert payload["status"] == "ACCEPTED"
-    assert payload["modelVersion"] == service.config.api_model_version
-    assert service.audit_repo.created[0]["audit_type"] == "TRAINING"
-    assert service.audit_repo.created[0]["request_body"]["model"] == service.config.model_name
+    assert payload["modelVersion"] == "v1.1.1"
     assert service.ai_config_repo.updated[0]["transaction_id"] == "TRN1"
     assert service.ai_config_repo.updated[0]["training_window"] == "3"
+    assert service.ai_config_repo.updated[0]["model_version"] == "v1.1.1"
     assert service.job_runner.submitted == ["TRN1"]
 
 
 def test_transaction_lookup_route() -> None:
     service = build_service()
-    repo = service.audit_repo
-    repo.latest[("TRAINING", True)] = {
+    service.ai_config_repo.entries["TRNLOOKUP"] = {
+        "transaction_id": "TRNLOOKUP",
         "type": "TRAINING",
-        "request_url": "/api/v1/training",
-        "reference_number": "TRNLOOKUP",
+        "model_version": "v1.1.1",
         "message": "completed",
         "status": "COMPLETED",
-        "request_body": {"transactionId": "TRNLOOKUP", "months": 3},
-        "response_body": {"transactionId": "TRNLOOKUP", "status": "COMPLETED"},
         "created_on": "2026-06-09T10:00:00",
         "modified_on": "2026-06-09T10:10:00",
+        "training_window": "3",
     }
     app = AIMLApiApp(service)
     token = service.auth_manager.issue_token("aiml")["access_token"]
@@ -327,6 +303,7 @@ def test_transaction_lookup_route() -> None:
     assert status.startswith("200")
     assert payload["transactionId"] == "TRNLOOKUP"
     assert payload["status"] == "COMPLETED"
+    assert payload["modelVersion"] == "v1.1.1"
 
 
 def test_training_requires_existing_ai_configuration_row() -> None:
@@ -334,7 +311,6 @@ def test_training_requires_existing_ai_configuration_row() -> None:
     service = AIMLApiService(
         config=config,
         auth_manager=AuthManager("aiml", "secret", "top-secret", 60),
-        audit_repo=DummyAuditRepo(),
         job_runner=DummyJobRunner(),
         logger=logging.getLogger("test_aiml_api"),
         ai_config_repo=DummyAIConfigRepo(),
@@ -377,7 +353,6 @@ def test_inference_requires_existing_ai_configuration_row() -> None:
     service = AIMLApiService(
         config=config,
         auth_manager=AuthManager("aiml", "secret", "top-secret", 60),
-        audit_repo=DummyAuditRepo(),
         job_runner=DummyJobRunner(),
         logger=logging.getLogger("test_aiml_api"),
         ai_config_repo=DummyAIConfigRepo(),
@@ -432,14 +407,12 @@ def test_inference_rejects_non_spec_fields() -> None:
     assert payload == {"transactionId": "TRN2", "status": "FAILED", "message": "Unexpected fields: predictMonth, sourceMonth"}
 
 
-def test_inference_command_skips_pipeline_audit_logging() -> None:
+def test_inference_command_uses_pipeline_without_audit_flag() -> None:
     config = build_config()
-    repo = DummyAuditRepo()
     runner = ImmediateJobRunner()
     service = CapturingService(
         config=config,
         auth_manager=AuthManager("aiml", "secret", "top-secret", 60),
-        audit_repo=repo,
         job_runner=runner,
         logger=logging.getLogger("test_aiml_api"),
         ai_config_repo=DummyAIConfigRepo(),
@@ -459,7 +432,7 @@ def test_inference_command_skips_pipeline_audit_logging() -> None:
     assert status.startswith("202")
     assert payload["status"] == "ACCEPTED"
     assert service.inference_commands
-    assert "--skip-audit-log" in service.inference_commands[0]
+    assert "--skip-audit-log" not in service.inference_commands[0]
 
 
 def test_read_prediction_summary_missing_file_returns_empty_payload(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -469,16 +442,21 @@ def test_read_prediction_summary_missing_file_returns_empty_payload(tmp_path: Pa
 
 
 def test_run_inference_job_completes_when_summary_reader_is_available(monkeypatch: pytest.MonkeyPatch) -> None:
-    repo = DummyAuditRepo()
     service = AIMLApiService(
         config=build_config(),
         auth_manager=AuthManager("aiml", "secret", "top-secret", 60),
-        audit_repo=repo,
         job_runner=DummyJobRunner(),
         logger=logging.getLogger("test_aiml_api"),
         ai_config_repo=DummyAIConfigRepo(),
     )
     service.ai_config_repo.entries["TRN_FIX"] = {"transaction_id": "TRN_FIX"}
+    service.ai_config_repo.entries["TRN_MODEL"] = {
+        "transaction_id": "TRN_MODEL",
+        "type": "TRAINING",
+        "status": "COMPLETED",
+        "model_version": "v1.1.3",
+        "modified_on": "2026-06-09T11:00:00",
+    }
 
     monkeypatch.setattr(api_service_module.subprocess, "run", lambda *args, **kwargs: None)
     monkeypatch.setattr(api_service_module, "read_metrics_snapshot", lambda model_name: {"modelVersion": model_name, "currentAccuracy": 78.5, "driftPercentage": 4.8})
@@ -489,21 +467,17 @@ def test_run_inference_job_completes_when_summary_reader_is_available(monkeypatc
         payload={"sourceMonth": "2026-06", "predictMonth": "2026-07", "model": "catboost_3m"},
     )
 
-    assert repo.updated
-    assert repo.updated[0]["status"] == "COMPLETED"
-    assert repo.updated[0]["response_body"]["driftPercentage"] == 4.8
     assert service.ai_config_repo.updated[0]["drift"] == 4.8
     assert service.ai_config_repo.updated[0]["training_window"] == "10 days"
+    assert service.ai_config_repo.updated[0]["model_version"] == "v1.1.3"
 
 
 def test_inference_export_command_enabled() -> None:
     config = build_config(export_after_inference=True, export_write=True)
-    repo = DummyAuditRepo()
     runner = ImmediateJobRunner()
     service = CapturingService(
         config=config,
         auth_manager=AuthManager("aiml", "secret", "top-secret", 60),
-        audit_repo=repo,
         job_runner=runner,
         logger=logging.getLogger("test_aiml_api"),
         ai_config_repo=DummyAIConfigRepo(),
@@ -527,49 +501,16 @@ def test_inference_export_command_enabled() -> None:
     assert "--write" in service.export_commands[0]
 
 
-@pytest.mark.skipif(live_db_config() is None, reason="Live Postgres env not configured")
-def test_audit_log_repository_round_trip_live_db() -> None:
-    config = live_db_config()
-    assert config is not None
-    repo = AuditLogRepository(config)
-    reference_number = f"TEST-{uuid.uuid4()}"
-
-    repo.create_entry(
-        audit_type="TRAINING",
-        request_url="/api/v1/training",
-        reference_number=reference_number,
-        request_body={"transactionId": reference_number, "months": 3},
-        response_body={"transactionId": reference_number, "status": "ACCEPTED"},
-        status="ACCEPTED",
-        message="accepted",
-    )
-    repo.update_entry(
-        reference_number=reference_number,
-        audit_type="TRAINING",
-        status="COMPLETED",
-        message="completed",
-        response_body={"transactionId": reference_number, "status": "COMPLETED"},
-        processing_time_ms=123,
-    )
-
-    latest = repo.fetch_latest(audit_type="TRAINING", completed_only=True)
-    assert latest is not None
-    assert latest["status"] == "COMPLETED"
-    assert latest["response_body"]["transactionId"] == reference_number
-
-
 def test_http_server_end_to_end_routes() -> None:
     service = build_service()
-    repo = service.audit_repo
-    repo.latest[("TRAINING", True)] = {"status": "COMPLETED", "modified_on": "2026-06-09T10:00:00"}
-    repo.latest[("INFERENCE", True)] = {
+    service.ai_config_repo.entries["TRNHTTP"] = {
+        "transaction_id": "TRNHTTP",
         "type": "INFERENCE",
-        "request_url": "/api/v1/inference",
-        "reference_number": "TRNHTTP",
+        "model_version": "v1.1.1",
         "message": "completed",
         "status": "COMPLETED",
-        "request_body": {"transactionId": "TRNHTTP"},
-        "response_body": {"transactionId": "TRNHTTP", "status": "COMPLETED", "currentAccuracy": 78.5, "driftPercentage": 4.8, "modelVersion": "catboost_3m"},
+        "accuracy": "78.5",
+        "drift": "4.8",
         "created_on": "2026-06-09T10:00:00",
         "modified_on": "2026-06-09T10:10:00",
     }

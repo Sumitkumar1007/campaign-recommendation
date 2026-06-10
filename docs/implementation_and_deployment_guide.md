@@ -637,8 +637,6 @@ Common target/output variables:
 
 ```bash
 TARGET_SCHEMA=digital_collections
-PREDICTION_TABLE=ai_ml_recommendations_data
-AUDIT_TABLE=api_audit_log
 CAMPAIGN_TABLE=ai_ml_campaign_recommendations
 CAMPAIGN_MAPPING_TABLE=ai_ml_campaign_mapping
 MODEL_NAME=catboost_3m
@@ -647,20 +645,9 @@ CAMPAIGN_VERTICAL=LAP
 CAMPAIGN_VENDOR=prutech-cpass
 ```
 
-Optional target-only writer variables:
-
-```bash
-TARGET_PGHOST=<target_db_host>
-TARGET_PGPORT=5432
-TARGET_PGDATABASE=<target_db_name>
-TARGET_PGUSER=<target_db_user>
-TARGET_PGPASSWORD=<target_db_password>
-TARGET_PGCONNECT_TIMEOUT=10
-```
-
 ### 24.5 Network Checks
 
-Before running pipeline, confirm both source and target DB endpoints are reachable from new server.
+Before running pipeline, confirm required DB endpoints are reachable from the server.
 
 ```bash
 python3 - <<'PY'
@@ -678,56 +665,9 @@ for host, port in [
 PY
 ```
 
-### 24.6 One-Time Inference From Source DB
+### 24.6 Export Quartz And Dataset Tables
 
-If source and target DBs are different, safest flow is two-step:
-
-1. run inference from source DB with `--skip-db-store`
-2. write local prediction output to target DB using standalone writer
-
-Example:
-
-```bash
-./venv/bin/python scripts/run_monthly_inference_pipeline.py \
-  --source-month 2026-04 \
-  --predict-month 2026-05 \
-  --model catboost_3m \
-  --skip-db-store
-```
-
-This produces local file such as:
-
-```text
-artifacts/predictions/2026_05_strategy_predictions_catboost_3m.csv
-```
-
-### 24.7 Write Outputs To Target DB
-
-Use standalone script after inference finishes successfully:
-
-```bash
-./venv/bin/python legacy/api_unused_scripts/write_target_db_outputs.py \
-  --host <target_db_host> \
-  --port 5432 \
-  --dbname <target_db_name> \
-  --user <target_db_user> \
-  --password <target_db_password> \
-  --prediction-file artifacts/predictions/2026_05_strategy_predictions_catboost_3m.csv \
-  --source-month 2026-04 \
-  --predict-month 2026-05 \
-  --model catboost_3m
-```
-
-This writes:
-
-- `ai_ml_recommendations_data`
-- `ai_ml_campaign_recommendations`
-- `ai_ml_campaign_mapping`
-- `api_audit_log`
-
-### 24.8 Export Quartz And Dataset Tables
-
-Quartz and MCollect dataset tables are not written by inference or target writer. Run export separately after campaign staging rows exist.
+Quartz and MCollect dataset tables are not written by inference. Run export separately after campaign staging rows exist.
 
 Dry run first:
 
@@ -776,8 +716,8 @@ It does not create `digital_rules`. Templates there must already exist manually.
 select count(*) from digital_collections.ai_ml_recommendations_data;
 select count(*) from digital_collections.ai_ml_campaign_recommendations;
 select count(*) from digital_collections.ai_ml_campaign_mapping;
-select id, reference_number, status, created_on
-from digital_collections.api_audit_log
+select transaction_id, type, status, modified_on
+from digital_collections.ai_configurations
 order by id desc
 limit 5;
 select count(*) from digital_collections.dataset;
