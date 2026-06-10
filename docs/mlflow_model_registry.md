@@ -26,7 +26,7 @@ This is best for first testing on the server.
 
 ```bash
 source venv/bin/activate
-python scripts/register_catboost_model_mlflow.py \
+python legacy/api_unused_scripts/register_catboost_model_mlflow.py \
   --tracking-uri artifacts/mlruns \
   --experiment-name campaign-recommendation \
   --registered-model-name campaign_next_month_catboost_3m \
@@ -48,7 +48,7 @@ Use this for production or a shared team registry.
 export MLFLOW_TRACKING_URI=http://your-mlflow-host:5000
 
 source venv/bin/activate
-python scripts/register_catboost_model_mlflow.py \
+python legacy/api_unused_scripts/register_catboost_model_mlflow.py \
   --experiment-name campaign-recommendation \
   --registered-model-name campaign_next_month_catboost_3m \
   --run-name catboost-3m-may-2026-v1
@@ -77,7 +77,7 @@ catboost-3m-may-2026-v1
 ## Production Flow
 
 1. Train model and write the `.joblib` bundle plus metrics JSON.
-2. Register the model with `scripts/register_catboost_model_mlflow.py`.
+2. Register the model with `legacy/api_unused_scripts/register_catboost_model_mlflow.py`.
 3. Promote the MLflow model version to `Staging` or `Production`.
 4. In the inference service, load the model by version or alias from MLflow.
 5. Fetch only the latest source month from Postgres.

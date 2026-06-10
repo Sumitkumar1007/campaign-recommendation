@@ -706,7 +706,7 @@ artifacts/predictions/2026_05_strategy_predictions_catboost_3m.csv
 Use standalone script after inference finishes successfully:
 
 ```bash
-./venv/bin/python scripts/write_target_db_outputs.py \
+./venv/bin/python legacy/api_unused_scripts/write_target_db_outputs.py \
   --host <target_db_host> \
   --port 5432 \
   --dbname <target_db_name> \
