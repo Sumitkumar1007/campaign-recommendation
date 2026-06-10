@@ -15,7 +15,7 @@ Campaign recommendation ML pipeline with MCollect Digital scheduler integration.
 ## Key Entry Points
 - Monthly inference: `scripts/run_monthly_inference_pipeline.py`
 - MCollect export: `scripts/export_mcollect_scheduler.py`
-- Standalone target writer: `scripts/write_target_db_outputs.py`
+- Standalone target writer: `legacy/api_unused_scripts/write_target_db_outputs.py`
 - Quartz job data serializer: `scripts/quartz_job_data.py`
 - Main tests: `tests/test_monthly_pipeline.py`
 
@@ -71,7 +71,7 @@ Campaign recommendation ML pipeline with MCollect Digital scheduler integration.
 
 ./venv/bin/python -m pytest -q tests/test_monthly_pipeline.py
 
-./venv/bin/python scripts/write_target_db_outputs.py \
+./venv/bin/python legacy/api_unused_scripts/write_target_db_outputs.py \
   --host <target_db_host> \
   --port 5432 \
   --dbname <target_db_name> \
