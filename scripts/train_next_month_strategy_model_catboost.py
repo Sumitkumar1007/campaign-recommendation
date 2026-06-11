@@ -189,6 +189,17 @@ def prepare_dataset(
     )
 
 
+def validate_day_target_variation(day: str, y_train: pd.DataFrame) -> None:
+    value_counts = y_train[day].astype(str).value_counts().sort_index()
+    if len(value_counts) < 2:
+        only_value = value_counts.index[0] if not value_counts.empty else "<empty>"
+        only_count = int(value_counts.iloc[0]) if not value_counts.empty else 0
+        raise ValueError(
+            f"Training target for {day} contains only one unique value: {only_value!r} "
+            f"(rows={only_count})."
+        )
+
+
 def fit_day_model(
     day: str,
     X_train: pd.DataFrame,
@@ -227,6 +238,7 @@ def fit_day_model(
         learning_rate,
         depth,
     )
+    validate_day_target_variation(day, y_train)
     train_dir = CATBOOST_INFO_DIR / day
     train_dir.mkdir(parents=True, exist_ok=True)
     encoder = LabelEncoder()
