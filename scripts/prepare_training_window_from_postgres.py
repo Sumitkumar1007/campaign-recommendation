@@ -5,7 +5,6 @@ import logging
 import os
 from pathlib import Path
 
-import pandas as pd
 from psycopg import sql
 
 from app_logging import log_step, setup_logging
@@ -88,83 +87,128 @@ def fetch_month_extracts(args: argparse.Namespace, logger: logging.Logger, month
     )
     files: list[Path] = []
     query = build_query(args.schema, args.table)
+    logger.info(
+        "Opening source DB connection for training extract | host=%s port=%s dbname=%s schema=%s table=%s months=%s",
+        args.host,
+        args.port,
+        args.dbname,
+        args.schema,
+        args.table,
+        months,
+    )
     with connect_db(config) as conn:
+        logger.info("Source DB connection established for training extract")
         for month in months:
             output_file = default_output_file(month)
             output_file.parent.mkdir(parents=True, exist_ok=True)
-            params = {
-                "emi_dates": [pd.Timestamp(f"{month}-01").replace(day=5).date()],
-            }
             # Reuse the existing month fetch SQL by substituting the configured EMI-cycle day dates.
             # The fetch utility itself is still the source of truth for monthly communication snapshots.
             from fetch_month_from_postgres import emi_cycle_dates, resolve_emi_cycle  # local import to avoid CLI coupling
             emi_cycle = resolve_emi_cycle(args.config_file, os.getenv("EMI_CYCLE", ""))
             params = {"emi_dates": [date.date() for date in emi_cycle_dates(emi_cycle, fetch_month=month)]}
+            logger.info(
+                "Resolved EMI dates for training month | month=%s emi_cycle=%s emi_dates=%s output_file=%s",
+                month,
+                emi_cycle,
+                params["emi_dates"],
+                output_file,
+            )
             with log_step(logger, "fetch_training_month", month=month, output_file=output_file):
                 row_count = write_query_to_csv(conn, query, params, output_file, args.fetch_size)
-                logger.info("Fetched training month | month=%s rows=%s output_file=%s", month, row_count, output_file)
+                file_size = output_file.stat().st_size if output_file.exists() else 0
+                logger.info(
+                    "Fetched training month | month=%s rows=%s output_file=%s file_size_bytes=%s",
+                    month,
+                    row_count,
+                    output_file,
+                    file_size,
+                )
             files.append(output_file)
+    logger.info("Completed monthly extract fetch | file_count=%s files=%s", len(files), files)
     return files
 
 
 def build_training_artifacts(input_files: list[Path], month_source: str, logger: logging.Logger) -> None:
+    training_output = TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"
+    schedule_output = SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv"
+    feature_output = FEATURE_DATA_DIR / "strategy_monthly_features.csv"
     with log_step(logger, "generate_strategy_dataset", input_files=','.join(str(path) for path in input_files)):
         run_python_script(
             "generate_strategy_dataset.py",
             "--output-file",
-            str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+            str(training_output),
             "--month-source",
             month_source,
             "--input-files",
             *[str(path) for path in input_files],
             logger=logger,
         )
+        logger.info("Generated training dataset | output_file=%s exists=%s", training_output, training_output.exists())
     with log_step(logger, "build_schedule_dataset"):
         run_python_script(
             "build_strategy_schedule_dataset.py",
             "--input-file",
-            str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+            str(training_output),
             "--output-file",
-            str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv"),
+            str(schedule_output),
             logger=logger,
         )
+        logger.info("Generated schedule dataset | output_file=%s exists=%s", schedule_output, schedule_output.exists())
     with log_step(logger, "build_monthly_features"):
         run_python_script(
             "build_monthly_feature_dataset.py",
             "--input-file",
-            str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+            str(training_output),
             "--output-file",
-            str(FEATURE_DATA_DIR / "strategy_monthly_features.csv"),
+            str(feature_output),
             logger=logger,
         )
+        logger.info("Generated feature dataset | output_file=%s exists=%s", feature_output, feature_output.exists())
 
 
 def main() -> None:
     args = parse_args()
     logger = setup_logging(args.log_file, "prepare_training_window")
-    raw_month_count = args.months + 1
-    config = PostgresConfig(
-        host=args.host,
-        port=args.port,
-        dbname=args.dbname,
-        user=args.user,
-        password=args.password,
-    )
-    with connect_db(config) as conn:
-        months = latest_available_source_months(conn, args.schema, args.table, raw_month_count)
-    if len(months) < 3:
-        raise ValueError(
-            f"Need at least 3 source months to prepare training data, but found only {len(months)} month(s): {months}"
+    try:
+        raw_month_count = args.months + 1
+        config = PostgresConfig(
+            host=args.host,
+            port=args.port,
+            dbname=args.dbname,
+            user=args.user,
+            password=args.password,
         )
-    logger.info(
-        "Resolved training month window | requested_months=%s raw_month_count=%s fetched_source_months=%s",
-        args.months,
-        raw_month_count,
-        months,
-    )
-    input_files = fetch_month_extracts(args, logger, months)
-    build_training_artifacts(input_files, args.month_source, logger)
-    print(f"Prepared training data for requested months={args.months} using raw source months={months}")
+        logger.info(
+            "Preparing training window | months=%s host=%s dbname=%s schema=%s table=%s month_source=%s",
+            args.months,
+            args.host,
+            args.dbname,
+            args.schema,
+            args.table,
+            args.month_source,
+        )
+        logger.info("Connecting to source DB to resolve latest available source months")
+        with connect_db(config) as conn:
+            months = latest_available_source_months(conn, args.schema, args.table, raw_month_count)
+        logger.info("Resolved latest available source months from DB | months=%s", months)
+        if len(months) < 3:
+            raise ValueError(
+                f"Need at least 3 source months to prepare training data, but found only {len(months)} month(s): {months}"
+            )
+        logger.info(
+            "Resolved training month window | requested_months=%s raw_month_count=%s fetched_source_months=%s",
+            args.months,
+            raw_month_count,
+            months,
+        )
+        input_files = fetch_month_extracts(args, logger, months)
+        logger.info("Fetched all month extracts successfully | input_files=%s", input_files)
+        build_training_artifacts(input_files, args.month_source, logger)
+        logger.info("Training window preparation completed successfully | requested_months=%s raw_source_months=%s", args.months, months)
+        print(f"Prepared training data for requested months={args.months} using raw source months={months}")
+    except Exception:
+        logger.exception("Training window preparation failed.")
+        raise
 
 
 if __name__ == "__main__":

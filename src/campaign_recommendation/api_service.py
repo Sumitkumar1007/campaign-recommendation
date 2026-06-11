@@ -250,6 +250,72 @@ def subprocess_error_message(exc: subprocess.CalledProcessError) -> str:
     return str(exc)
 
 
+def summarize_subprocess_failure(exc: subprocess.CalledProcessError, *, step_name: str, limit: int = 500) -> str:
+    detail = subprocess_error_message(exc)
+    summary = f"{step_name} failed: {detail}"
+    if len(summary) <= limit:
+        return summary
+    return summary[: limit - 3].rstrip() + "..."
+
+
+def _log_subprocess_stream(
+    logger: logging.Logger,
+    *,
+    transaction_id: str,
+    step_name: str,
+    stream_name: str,
+    content: str | None,
+) -> None:
+    if not isinstance(content, str) or not content.strip():
+        logger.info("%s %s empty | transaction_id=%s", step_name, stream_name, transaction_id)
+        return
+    for line in content.strip().splitlines():
+        logger.info("%s %s | transaction_id=%s | %s", step_name, stream_name, transaction_id, line)
+
+
+def run_logged_subprocess(
+    command: list[str],
+    *,
+    logger: logging.Logger,
+    transaction_id: str,
+    step_name: str,
+    cwd: Path,
+) -> subprocess.CompletedProcess[str]:
+    logger.info(
+        "Starting subprocess step | transaction_id=%s step=%s cwd=%s command=%s",
+        transaction_id,
+        step_name,
+        cwd,
+        command,
+    )
+    started_at = time.perf_counter()
+    try:
+        result = subprocess.run(command, check=True, cwd=cwd, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+        logger.error(
+            "Failed subprocess step | transaction_id=%s step=%s returncode=%s duration_ms=%s",
+            transaction_id,
+            step_name,
+            exc.returncode,
+            duration_ms,
+        )
+        _log_subprocess_stream(logger, transaction_id=transaction_id, step_name=step_name, stream_name="stdout", content=exc.stdout)
+        _log_subprocess_stream(logger, transaction_id=transaction_id, step_name=step_name, stream_name="stderr", content=exc.stderr)
+        raise
+    duration_ms = int((time.perf_counter() - started_at) * 1000)
+    logger.info(
+        "Completed subprocess step | transaction_id=%s step=%s returncode=%s duration_ms=%s",
+        transaction_id,
+        step_name,
+        result.returncode,
+        duration_ms,
+    )
+    _log_subprocess_stream(logger, transaction_id=transaction_id, step_name=step_name, stream_name="stdout", content=result.stdout)
+    _log_subprocess_stream(logger, transaction_id=transaction_id, step_name=step_name, stream_name="stderr", content=result.stderr)
+    return result
+
+
 def read_prediction_summary(predict_month: str) -> dict[str, Any]:
     path = prediction_summary_path(predict_month)
     if not path.exists():
@@ -742,22 +808,41 @@ class AIMLApiService:
             validation_source_months=payload.get("validationSourceMonths"),
             prediction_source_months=payload.get("predictionSourceMonths"),
         )
-        self.logger.info("Starting training-data preparation | transaction_id=%s command=%s", transaction_id, prepare_command)
-        self.logger.info("Starting training job | transaction_id=%s command=%s", transaction_id, command)
+        self.logger.info(
+            "Queued training pipeline | transaction_id=%s months=%s model=%s target_model_version=%s metrics_file=%s model_file=%s prediction_file=%s checkpoint_dir=%s",
+            transaction_id,
+            months,
+            model_name,
+            target_model_version,
+            metrics_file,
+            model_file,
+            prediction_file,
+            checkpoint_dir,
+        )
         try:
-            subprocess.run(prepare_command, check=True, cwd=REPO_ROOT, capture_output=True, text=True)
-            subprocess.run(command, check=True, cwd=REPO_ROOT, capture_output=True, text=True)
+            run_logged_subprocess(
+                prepare_command,
+                logger=self.logger,
+                transaction_id=transaction_id,
+                step_name="prepare_training_window",
+                cwd=REPO_ROOT,
+            )
+            run_logged_subprocess(
+                command,
+                logger=self.logger,
+                transaction_id=transaction_id,
+                step_name="train_model",
+                cwd=REPO_ROOT,
+            )
             snapshot = read_metrics_snapshot(model_name)
-            response_body = {
-                "transactionId": transaction_id,
-                "status": "COMPLETED",
-                "message": "Processing completed.",
-                "modelVersion": target_model_version,
-                "currentAccuracy": snapshot.get("currentAccuracy"),
-                "driftPercentage": snapshot.get("driftPercentage"),
-                "metricsFile": str(metrics_file),
-                "modelFile": str(model_file),
-            }
+            self.logger.info(
+                "Training completed | transaction_id=%s current_accuracy=%s drift_percentage=%s metrics_file=%s model_file=%s",
+                transaction_id,
+                snapshot.get("currentAccuracy"),
+                snapshot.get("driftPercentage"),
+                metrics_file,
+                model_file,
+            )
             self.ai_config_repo.update_entry(
                 transaction_id=transaction_id,
                 status="COMPLETED",
@@ -771,7 +856,11 @@ class AIMLApiService:
             )
         except Exception as exc:  # noqa: BLE001
             self.logger.exception("Training job failed | transaction_id=%s", transaction_id)
-            error_message = subprocess_error_message(exc) if isinstance(exc, subprocess.CalledProcessError) else str(exc)
+            if isinstance(exc, subprocess.CalledProcessError):
+                failed_step = "prepare_training_window" if exc.cmd == prepare_command else "train_model"
+                error_message = summarize_subprocess_failure(exc, step_name=failed_step)
+            else:
+                error_message = str(exc)
             self.ai_config_repo.update_entry(
                 transaction_id=transaction_id,
                 status="FAILED",
@@ -793,21 +882,36 @@ class AIMLApiService:
             predict_month=predict_month,
             model_name=model_name,
         )
-        self.logger.info("Starting inference job | transaction_id=%s command=%s", transaction_id, command)
+        self.logger.info(
+            "Queued inference pipeline | transaction_id=%s source_month=%s predict_month=%s model=%s export_after_inference=%s export_write=%s",
+            transaction_id,
+            source_month,
+            predict_month,
+            model_name,
+            self.config.export_after_inference,
+            self.config.export_write,
+        )
         try:
-            subprocess.run(command, check=True, cwd=REPO_ROOT, capture_output=True, text=True)
+            run_logged_subprocess(
+                command,
+                logger=self.logger,
+                transaction_id=transaction_id,
+                step_name="run_inference_pipeline",
+                cwd=REPO_ROOT,
+            )
             if self.config.export_after_inference:
                 export_command = self._build_export_command(
                     source_month=source_month,
                     predict_month=predict_month,
                     model_name=model_name,
                 )
-                self.logger.info(
-                    "Starting export job after inference | transaction_id=%s command=%s",
-                    transaction_id,
+                run_logged_subprocess(
                     export_command,
+                    logger=self.logger,
+                    transaction_id=transaction_id,
+                    step_name="export_recommendation_workbooks",
+                    cwd=REPO_ROOT,
                 )
-                subprocess.run(export_command, check=True, cwd=REPO_ROOT, capture_output=True, text=True)
             snapshot = read_metrics_snapshot(model_name)
             summary = read_prediction_summary(predict_month)
             drift_summary = summary.get("drift") if isinstance(summary.get("drift"), dict) else {}
@@ -840,7 +944,11 @@ class AIMLApiService:
             )
         except Exception as exc:  # noqa: BLE001
             self.logger.exception("Inference job failed | transaction_id=%s", transaction_id)
-            error_message = subprocess_error_message(exc) if isinstance(exc, subprocess.CalledProcessError) else str(exc)
+            if isinstance(exc, subprocess.CalledProcessError):
+                failed_step = "export_recommendation_workbooks" if self.config.export_after_inference and exc.cmd != command else "run_inference_pipeline"
+                error_message = summarize_subprocess_failure(exc, step_name=failed_step)
+            else:
+                error_message = str(exc)
             self.ai_config_repo.update_entry(
                 transaction_id=transaction_id,
                 status="FAILED",

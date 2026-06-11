@@ -463,8 +463,35 @@ def run_python_script(
     if env_updates:
         env.update(env_updates)
     if logger:
-        logger.info("Running child script | script=%s args=%s", script_name, list(script_args))
-    subprocess.run(cmd, check=True, cwd=SCRIPTS_DIR.parent, env=env)
+        logger.info("Running child script | script=%s args=%s cwd=%s", script_name, list(script_args), SCRIPTS_DIR.parent)
+    try:
+        result = subprocess.run(cmd, check=True, cwd=SCRIPTS_DIR.parent, env=env, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        if logger:
+            logger.error("Child script failed | script=%s returncode=%s", script_name, exc.returncode)
+            if isinstance(exc.stdout, str) and exc.stdout.strip():
+                for line in exc.stdout.strip().splitlines():
+                    logger.error("Child script stdout | script=%s | %s", script_name, line)
+            else:
+                logger.info("Child script stdout empty | script=%s", script_name)
+            if isinstance(exc.stderr, str) and exc.stderr.strip():
+                for line in exc.stderr.strip().splitlines():
+                    logger.error("Child script stderr | script=%s | %s", script_name, line)
+            else:
+                logger.info("Child script stderr empty | script=%s", script_name)
+        raise
+    if logger:
+        logger.info("Child script completed | script=%s returncode=%s", script_name, result.returncode)
+        if isinstance(result.stdout, str) and result.stdout.strip():
+            for line in result.stdout.strip().splitlines():
+                logger.info("Child script stdout | script=%s | %s", script_name, line)
+        else:
+            logger.info("Child script stdout empty | script=%s", script_name)
+        if isinstance(result.stderr, str) and result.stderr.strip():
+            for line in result.stderr.strip().splitlines():
+                logger.info("Child script stderr | script=%s | %s", script_name, line)
+        else:
+            logger.info("Child script stderr empty | script=%s", script_name)
 
 
 def download_mlflow_model_bundle(model_uri: str, target_file: Path, logger: logging.Logger) -> Path:
