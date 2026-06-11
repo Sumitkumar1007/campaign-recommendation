@@ -12,7 +12,7 @@ Implemented endpoints:
 Run service:
 
 ```bash
-./venv/bin/python scripts/run_api_service.py --host 0.0.0.0 --port 8081
+./venv/bin/python scripts/run_api_service.py --host 0.0.0.0 --port 8040
 ```
 
 Required env:
@@ -28,7 +28,7 @@ Optional env:
 
 ```bash
 API_HOST=0.0.0.0
-API_PORT=8081
+API_PORT=8040
 AI_CONFIG_TABLE=ai_configurations
 API_MODEL_BASE_VERSION=v1.1.0
 API_EXPORT_AFTER_INFERENCE=false
