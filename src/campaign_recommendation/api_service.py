@@ -730,6 +730,7 @@ class AIMLApiService:
         prediction_file = PREDICTIONS_DIR / f"{current_month_yyyy_mm().replace('-', '_')}_strategy_predictions_{model_name}.csv"
         checkpoint_dir = CHECKPOINT_DIR / model_name
 
+        prepare_command = self._build_prepare_training_command(months=months)
         command = self._build_training_command(
             model_name=model_name,
             months=months,
@@ -741,8 +742,10 @@ class AIMLApiService:
             validation_source_months=payload.get("validationSourceMonths"),
             prediction_source_months=payload.get("predictionSourceMonths"),
         )
+        self.logger.info("Starting training-data preparation | transaction_id=%s command=%s", transaction_id, prepare_command)
         self.logger.info("Starting training job | transaction_id=%s command=%s", transaction_id, command)
         try:
+            subprocess.run(prepare_command, check=True, cwd=REPO_ROOT, capture_output=True, text=True)
             subprocess.run(command, check=True, cwd=REPO_ROOT, capture_output=True, text=True)
             snapshot = read_metrics_snapshot(model_name)
             response_body = {
@@ -847,6 +850,16 @@ class AIMLApiService:
                 entry_type="INFERENCE",
                 training_window="10 days",
             )
+
+    def _build_prepare_training_command(self, *, months: int) -> list[str]:
+        return [
+            str(VENV_PYTHON),
+            str(SCRIPTS_DIR / "prepare_training_window_from_postgres.py"),
+            "--months",
+            str(months),
+            "--month-source",
+            self.config.feature_month_source,
+        ]
 
     def _build_training_command(
         self,
