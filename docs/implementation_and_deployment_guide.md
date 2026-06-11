@@ -567,166 +567,542 @@ This project now supports:
 
 ## 24. New Server Setup
 
-Use this when moving project to another Linux server for one-time or recurring monthly runs.
+This section is the operational runbook for moving the project to a different server.
 
-### 24.1 Clone Repository
+Use it when you want to:
+
+- move the API service to a new machine
+- move the monthly inference/training/export scripts to a new machine
+- re-create the same runtime with the same DB and SFTP integrations
+
+### 24.1 What Must Be Available On The New Server
+
+Before starting, confirm the new server has:
+
+- Linux shell access with `sudo`
+- Python `3.11+` or `3.12`
+- Git
+- network access to the source Postgres database
+- network access to the target Postgres database if different
+- network access to the SFTP host if workbook upload is enabled
+- a service account/user that can run the app, usually `ubuntu`
+
+Recommended OS packages:
 
 ```bash
-git clone <github_repo_url>
-cd recommendation
-git checkout feat/integration-with-digital
+sudo apt update
+sudo apt install -y git python3 python3-venv python3-pip build-essential libpq-dev
 ```
 
-If repository already exists:
+### 24.2 Decide What You Are Migrating
+
+There are 2 operational modes in this repo.
+
+1. API mode
+This is the Digital-team integration mode.
+It exposes:
+
+- `/api/v1/auth`
+- `/api/v1/training`
+- `/api/v1/inference`
+- `/api/status`
+- `/api/health`
+- `/api/v1/transactions/{transactionId}`
+
+2. Script mode
+This is direct CLI execution for monthly inference/export/training.
+
+For current usage, API mode is the primary deployment pattern.
+
+### 24.3 Clone Repository
+
+On the new server:
 
 ```bash
-git fetch
-git checkout feat/integration-with-digital
-git pull
+cd /home/ubuntu
+git clone <github_repo_url> recommendation
+cd /home/ubuntu/recommendation
 ```
 
-### 24.2 Python Environment
-
-This project is installed from `pyproject.toml`. There is no `requirements.txt`.
+If the project is being copied from an existing server instead of cloned:
 
 ```bash
+rsync -av <old_server>:/home/ubuntu/aiml/recommendation/ /home/ubuntu/recommendation/
+```
+
+After copy, remove environment-specific files you do not want to carry over blindly.
+
+Do not copy these from old server unless intentionally required:
+
+- `.env`
+- `artifacts/logs/*`
+- `artifacts/predictions/*`
+- `artifacts/exports/*`
+
+### 24.4 Python Environment
+
+Create virtual environment:
+
+```bash
+cd /home/ubuntu/recommendation
 python3 -m venv venv
 source venv/bin/activate
 pip install -U pip
 pip install -e .
 ```
 
-If test tools are needed too:
+If you also want test tools:
 
 ```bash
 pip install -e ".[dev]"
 ```
 
-### 24.3 Model Artifact To Copy
+### 24.5 Files And Artifacts To Copy From Old Server
 
-Copy this file to same relative path on new server:
+Copy these if you want the new server to start with the existing trained model:
 
 ```text
 artifacts/models/next_month_strategy_catboost_3m.joblib
-```
-
-Optional related files:
-
-```text
 artifacts/metrics/next_month_strategy_catboost_3m_metrics.json
+artifacts/checkpoints/catboost_3m/
 config/default_config.json
 ```
 
-### 24.4 Environment Variables
+Optional but useful to copy:
 
-Create `.env` on new server.
-
-Source read database example:
-
-```bash
-PGHOST=<source_db_host>
-PGPORT=5432
-PGDATABASE=<source_db_name>
-PGUSER=<source_db_user>
-PGPASSWORD=<source_db_password>
-SOURCE_SCHEMA=digital_collections
-SOURCE_TABLE=communications
+```text
+data/communication/MFL_COMMUNICATION_DATA/
+data/features/strategy_monthly_features.csv
+data/schedules/strategy_schedule_dataset_all_months.csv
+data/training/strategy_training_dataset_all_months.csv
 ```
 
-Common target/output variables:
+Notes:
+
+- The API can rebuild training datasets from Postgres during training.
+- Inference and export do not require historical raw files if the pipeline can fetch what it needs from Postgres.
+- Copying the model artifact is strongly recommended unless you plan to retrain immediately on the new server.
+
+Example copy from old server:
 
 ```bash
+rsync -av <old_server>:/home/ubuntu/aiml/recommendation/artifacts/models/ ./artifacts/models/
+rsync -av <old_server>:/home/ubuntu/aiml/recommendation/artifacts/metrics/ ./artifacts/metrics/
+rsync -av <old_server>:/home/ubuntu/aiml/recommendation/artifacts/checkpoints/catboost_3m/ ./artifacts/checkpoints/catboost_3m/
+```
+
+### 24.6 Create `.env`
+
+Create `.env` from the template:
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` with real values.
+
+Minimum required DB/source variables:
+
+```bash
+PGHOST=<postgres_host>
+PGPORT=5432
+PGDATABASE=<postgres_db>
+PGUSER=<postgres_user>
+PGPASSWORD=<postgres_password>
+SOURCE_SCHEMA=digital_collections
+SOURCE_TABLE=communications
 TARGET_SCHEMA=digital_collections
-CAMPAIGN_TABLE=ai_ml_campaign_recommendations
-CAMPAIGN_MAPPING_TABLE=ai_ml_campaign_mapping
+```
+
+Core model/runtime variables:
+
+```bash
 MODEL_NAME=catboost_3m
 FEATURE_MONTH_SOURCE=emi_date
 CAMPAIGN_VERTICAL=LAP
 CAMPAIGN_VENDOR=prutech-cpass
+CAMPAIGN_TABLE=ai_ml_campaign_recommendations
+CAMPAIGN_MAPPING_TABLE=ai_ml_campaign_mapping
 ```
 
-### 24.5 Network Checks
-
-Before running pipeline, confirm required DB endpoints are reachable from the server.
+API service variables:
 
 ```bash
-python3 - <<'PY'
-import socket
-for host, port in [
-    ("<source_db_host>", 5432),
-    ("<target_db_host>", 5432),
-]:
-    try:
-        s = socket.create_connection((host, port), timeout=5)
-        print(host, "ok")
-        s.close()
-    except Exception as exc:
-        print(host, "fail", exc)
-PY
+API_HOST=0.0.0.0
+API_PORT=8040
+API_AUTH_USERNAME=aiml
+API_AUTH_PASSWORD=<api_password>
+API_AUTH_SECRET=<long_random_secret>
+API_TOKEN_TTL_SECONDS=28800
+AI_CONFIG_TABLE=ai_configurations
+API_MODEL_BASE_VERSION=v1.1.0
+API_EXPORT_AFTER_INFERENCE=true
+API_EXPORT_WRITE=true
+API_SFTP_EXPORT_PATH=/home/ubuntu/recommendation/artifacts/exports/sftp
 ```
 
-### 24.6 Export Quartz And Dataset Tables
-
-Quartz and MCollect dataset tables are not written by inference. Run export separately after campaign staging rows exist.
-
-Dry run first:
+SFTP variables if upload is enabled:
 
 ```bash
-./venv/bin/python scripts/export_mcollect_scheduler.py \
-  --host <target_db_host> \
-  --port 5432 \
-  --dbname <target_db_name> \
-  --user <target_db_user> \
-  --password <target_db_password> \
-  --schema digital_collections \
-  --source-month 2026-04 \
-  --prediction-month 2026-05 \
-  --model catboost_3m
+SFTP_EXPORT_PATH=/home/ubuntu/recommendation/artifacts/exports/sftp
+SFTP_UPLOAD_ENABLED=true
+SFTP_HOST=<sftp_host>
+SFTP_PORT=22
+SFTP_USERNAME=<sftp_user>
+SFTP_PASSWORD=<sftp_password>
+SFTP_PRIVATE_KEY_PATH=
+SFTP_PRIVATE_KEY_PASSPHRASE=
+SFTP_REMOTE_PATH=<remote_upload_dir>
+SFTP_RETRIES=3
+SFTP_RETRY_DELAY_SECONDS=5
+SFTP_TIMEOUT_SECONDS=30
+SFTP_FAIL_ON_ERROR=false
 ```
 
-Actual write:
+Meaning of `SFTP_FAIL_ON_ERROR`:
 
-```bash
-./venv/bin/python scripts/export_mcollect_scheduler.py \
-  --host <target_db_host> \
-  --port 5432 \
-  --dbname <target_db_name> \
-  --user <target_db_user> \
-  --password <target_db_password> \
-  --schema digital_collections \
-  --source-month 2026-04 \
-  --prediction-month 2026-05 \
-  --model catboost_3m \
-  --trigger-state PAUSED \
-  --write
-```
+- `true`: upload failure fails the job
+- `false`: upload failure is logged but local generation can still succeed
 
-This writes:
+### 24.7 DB Objects Expected By The App
+
+Source read table:
+
+- `digital_collections.communications`
+
+Target/update tables used by runtime:
+
+- `digital_collections.ai_configurations`
+- `digital_collections.ai_ml_campaign_recommendations`
+- `digital_collections.ai_ml_campaign_mapping`
+
+Quartz/Digital export target tables when export write is enabled:
 
 - `dataset`
 - `qrtz_job_details`
 - `qrtz_triggers`
 - `qrtz_cron_triggers`
 
-It does not create `digital_rules`. Templates there must already exist manually.
+Important API behavior:
 
-### 24.9 Post-Run Verification
+- Digital application must insert `transactionId` first into `ai_configurations`
+- AIML API updates the existing row
+- AIML API does not create the transaction row
+
+### 24.8 Network Checks
+
+Before starting the service, verify outbound connectivity.
+
+Postgres and SFTP reachability:
+
+```bash
+python3 - <<'PY'
+import socket
+for host, port in [
+    ("<postgres_host>", 5432),
+    ("<sftp_host>", 22),
+]:
+    try:
+        s = socket.create_connection((host, port), timeout=5)
+        print(host, port, 'ok')
+        s.close()
+    except Exception as exc:
+        print(host, port, 'fail', exc)
+PY
+```
+
+### 24.9 Prepare Writable Directories
+
+Create expected writable paths:
+
+```bash
+mkdir -p artifacts/models artifacts/metrics artifacts/checkpoints/catboost_3m
+mkdir -p artifacts/logs artifacts/predictions artifacts/exports/sftp
+mkdir -p data/communication/MFL_COMMUNICATION_DATA data/training data/features data/schedules data/cases
+```
+
+If using copied artifacts, confirm permissions:
+
+```bash
+chmod -R u+rwX artifacts data
+```
+
+### 24.10 Manual Smoke Test Before Systemd
+
+Activate environment:
+
+```bash
+cd /home/ubuntu/recommendation
+source venv/bin/activate
+```
+
+Run health service manually once:
+
+```bash
+./venv/bin/python scripts/run_api_service.py --host 0.0.0.0 --port 8040
+```
+
+From another shell:
+
+```bash
+curl -fsS http://127.0.0.1:8040/api/health
+```
+
+Expected shape:
+
+```json
+{
+  "status": "ok",
+  "service": "aiml-integration-api",
+  "dbStatus": "ok",
+  "dbError": null,
+  "modelVersion": "v1.1.0"
+}
+```
+
+Stop the foreground process after validation.
+
+### 24.11 Install Systemd Service
+
+The repo already contains the unit file:
+
+- [deploy/systemd/recommendation.service](../deploy/systemd/recommendation.service)
+
+Current unit assumptions:
+
+- working directory: `/home/ubuntu/recommendation`
+- port: `8040`
+- env file: `/home/ubuntu/recommendation/.env`
+
+If your actual path differs, update the unit file before copying it.
+
+Install:
+
+```bash
+sudo cp deploy/systemd/recommendation.service /etc/systemd/system/recommendation.service
+sudo systemctl daemon-reload
+sudo systemctl enable recommendation.service
+sudo systemctl restart recommendation.service
+```
+
+Check status:
+
+```bash
+sudo systemctl status recommendation.service --no-pager
+```
+
+Check listener:
+
+```bash
+ss -ltnp | grep 8040
+```
+
+### 24.12 API Smoke Tests
+
+#### Health
+
+```bash
+curl -fsS http://127.0.0.1:8040/api/health
+```
+
+#### Auth
+
+```bash
+curl -sS -X POST http://127.0.0.1:8040/api/v1/auth \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"aiml","password":"<api_password>"}'
+```
+
+#### Training pre-check
+
+Insert one test row in `ai_configurations` first if not already inserted by the Digital app.
+
+Then call training:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8040/api/v1/training \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <token>' \
+  -d '{"transactionId":"TRN202606080003","months":6}'
+```
+
+#### Inference pre-check
+
+```bash
+curl -sS -X POST http://127.0.0.1:8040/api/v1/inference \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <token>' \
+  -d '{"transactionId":"TRN202606080004"}'
+```
+
+#### Poll status
+
+```bash
+curl -sS -H 'Authorization: Bearer <token>' \
+  http://127.0.0.1:8040/api/v1/transactions/TRN202606080003
+```
+
+### 24.13 Training-Specific Notes On New Server
+
+Current API training behavior:
+
+- `months` now rebuilds training data from Postgres before CatBoost training
+- the service prepares raw month extracts, day-level training data, schedule data, and monthly features automatically
+
+Example request:
+
+```json
+{
+  "transactionId": "TRN202606080003",
+  "months": 6
+}
+```
+
+How it works:
+
+- requested `months=6` resolves a larger historical source window from Postgres
+- the training flow rebuilds:
+  - `data/training/strategy_training_dataset_all_months.csv`
+  - `data/schedules/strategy_schedule_dataset_all_months.csv`
+  - `data/features/strategy_monthly_features.csv`
+- then CatBoost training starts
+
+Important limitation still applies:
+
+- if any day target like `D-1` has only one unique class in final `train_df`, training will fail by design
+- current validation message is explicit, for example:
+
+```text
+Training target for D-1 contains only one unique value: '-' (rows=390).
+```
+
+### 24.14 Inference And Export On New Server
+
+Monthly inference CLI example:
+
+```bash
+./venv/bin/python scripts/run_monthly_inference_pipeline.py \
+  --source-month 2026-05 \
+  --predict-month 2026-06 \
+  --model catboost_3m
+```
+
+Workbook export example:
+
+```bash
+./venv/bin/python scripts/export_recommendation_workbooks.py \
+  --source-month 2026-05 \
+  --prediction-month 2026-06 \
+  --model catboost_3m \
+  --output-dir artifacts/exports/sftp \
+  --write
+```
+
+Generated files:
+
+- `MD_UB_DATASET_DDMMYYYY_XX.xlsx`
+- `MD_UB_SCHEDULER_DDMMYYYY_XX.xlsx`
+
+### 24.15 Logs To Check
+
+Application/service logs:
+
+```bash
+sudo journalctl -u recommendation.service -n 200 --no-pager
+```
+
+Repo log files:
+
+```text
+artifacts/logs/aiml_api.log
+artifacts/logs/monthly_inference_pipeline.log
+artifacts/logs/catboost_training.log
+artifacts/logs/prepare_training_window.log
+```
+
+### 24.16 Post-Deployment Verification SQL
+
+Verify API status rows:
 
 ```sql
-select count(*) from digital_collections.ai_ml_recommendations_data;
-select count(*) from digital_collections.ai_ml_campaign_recommendations;
-select count(*) from digital_collections.ai_ml_campaign_mapping;
-select transaction_id, type, status, modified_on
+select transaction_id, type, status, message, model_version, accuracy, drift, modified_on
 from digital_collections.ai_configurations
 order by id desc
-limit 5;
+limit 20;
+```
+
+Verify campaign staging rows:
+
+```sql
+select count(*) from digital_collections.ai_ml_campaign_recommendations;
+select count(*) from digital_collections.ai_ml_campaign_mapping;
+```
+
+Verify export-side tables if enabled:
+
+```sql
 select count(*) from digital_collections.dataset;
 select count(*) from digital_collections.qrtz_job_details;
 select count(*) from digital_collections.qrtz_triggers;
 select count(*) from digital_collections.qrtz_cron_triggers;
 ```
 
-### 24.10 Common Failure Mode
+### 24.17 Common Migration Failure Points
 
-If source inference succeeds but target write fails with connection timeout, issue is usually network access, security group, route, or DB allowlist on target host, not model logic.
+1. Wrong working directory in systemd service
+- service starts but cannot find scripts, models, or `.env`
 
+2. `.env` copied with old server paths
+- SFTP output path or key path may be invalid on new server
+
+3. Postgres reachable from old server but not new server
+- allowlist, route, security group, firewall
+
+4. Model artifact not copied
+- inference cannot run if local model file is expected but missing
+
+5. Digital app inserts no `transactionId`
+- training/inference API returns `transactionId ... not found in ai_configurations`
+
+6. Training data has no day-level class variation
+- training fails with single-class target validation such as `D-1` all `'-'`
+
+7. SFTP upload enabled but credentials wrong
+- workbook generation may succeed but upload may fail depending on `SFTP_FAIL_ON_ERROR`
+
+### 24.18 Migration Checklist
+
+Use this checklist during cutover.
+
+- server packages installed
+- repo cloned/copied
+- virtualenv created
+- dependencies installed
+- model artifact copied
+- `.env` created and reviewed
+- DB reachability verified
+- SFTP reachability verified
+- directories created and writable
+- manual `/api/health` test passed
+- systemd unit installed
+- systemd service active on port `8040`
+- `/api/v1/auth` test passed
+- `/api/v1/training` test passed to `ACCEPTED`
+- `/api/v1/inference` test passed to `ACCEPTED`
+- transaction polling works
+- export files generated/uploaded if enabled
+- journal logs clean
+
+### 24.19 Rollback Plan
+
+If migration fails:
+
+1. stop new server traffic
+2. keep old server active
+3. restore old DNS/IP routing if changed
+4. compare:
+- `.env`
+- model artifact paths
+- DB connectivity
+- service logs
+5. retry cutover only after smoke tests pass on new server
