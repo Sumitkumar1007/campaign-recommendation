@@ -10,7 +10,7 @@ Group=ubuntu
 WorkingDirectory=/home/ubuntu/aiml/recommendation
 Environment=PYTHONUNBUFFERED=1
 Environment=API_HOST=0.0.0.0
-Environment=API_PORT=8081
+Environment=API_PORT=8040
 EnvironmentFile=-/home/ubuntu/aiml/recommendation/.env
 ExecStart=/home/ubuntu/aiml/recommendation/venv/bin/python /home/ubuntu/aiml/recommendation/scripts/run_api_service.py
 Restart=always
