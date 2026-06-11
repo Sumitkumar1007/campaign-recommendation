@@ -39,6 +39,7 @@ from train_next_month_strategy_model_catboost import (
     build_feature_matrix,
     build_rolling_feature_windows,
     predict_top_k_by_risk,
+    validate_day_target_variation,
 )
 from pipeline_common import DAY_COLUMNS
 from predict_next_month_strategy_catboost import build_prediction_population, build_prediction_reason
@@ -53,6 +54,13 @@ def test_validate_month_pair_accepts_adjacent_months() -> None:
 def test_validate_month_pair_rejects_non_adjacent_months() -> None:
     with pytest.raises(ValueError, match="exactly one month after"):
         validate_month_pair("2026-04", "2026-06")
+
+
+def test_validate_day_target_variation_rejects_single_class_target() -> None:
+    y_train = pd.DataFrame({"D+1": ["-", "-", "-"]})
+
+    with pytest.raises(ValueError, match=r"Training target for D\+1 contains only one unique value: '-' \(rows=3\)\."):
+        validate_day_target_variation("D+1", y_train)
 
 
 def test_month_bounds_use_half_open_calendar_window() -> None:
