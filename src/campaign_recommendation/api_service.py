@@ -241,10 +241,29 @@ def subprocess_error_message(exc: subprocess.CalledProcessError) -> str:
         candidates.extend(line.strip() for line in exc.stderr.splitlines() if line.strip())
     if isinstance(exc.stdout, str) and exc.stdout.strip():
         candidates.extend(line.strip() for line in exc.stdout.splitlines() if line.strip())
-    for line in reversed(candidates):
-        if 'Traceback' in line:
+
+    ignored_fragments = (
+        'Traceback (most recent call last):',
+        'subprocess.CalledProcessError:',
+        'Command [',
+        'returned non-zero exit status',
+        'Child script failed |',
+        'Child script stdout empty |',
+        'Child script stderr empty |',
+        'Logging initialized.',
+    )
+
+    for raw_line in reversed(candidates):
+        line = raw_line
+        if '| script=' in line and ' | ' in line:
+            line = line.rsplit(' | ', 1)[-1].strip()
+        if 'transaction_id=' in line and ' | ' in line:
+            line = line.rsplit(' | ', 1)[-1].strip()
+        if not line:
             continue
         if line.startswith('File "'):
+            continue
+        if any(fragment in line for fragment in ignored_fragments):
             continue
         return line
     return str(exc)
