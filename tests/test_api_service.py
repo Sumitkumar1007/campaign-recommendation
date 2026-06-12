@@ -31,6 +31,9 @@ from campaign_recommendation.api_service import (  # noqa: E402
 )
 import campaign_recommendation.api_service as api_service_module  # noqa: E402
 
+api_service_module.AI_CONFIG_UPDATE_INITIAL_DELAY_SECONDS = 0.0
+api_service_module.AI_CONFIG_UPDATE_WAIT_TIMEOUT_SECONDS = 0.0
+api_service_module.AI_CONFIG_UPDATE_WAIT_INTERVAL_SECONDS = 0.0
 
 
 class DummyJobRunner(BackgroundJobRunner):
@@ -277,9 +280,7 @@ def test_training_route_creates_audit_and_submits_job() -> None:
     assert status.startswith("202")
     assert payload["status"] == "ACCEPTED"
     assert payload["modelVersion"] == "v1.1.1"
-    assert service.ai_config_repo.updated[0]["transaction_id"] == "TRN1"
-    assert service.ai_config_repo.updated[0]["training_window"] == "3"
-    assert service.ai_config_repo.updated[0]["model_version"] == "v1.1.1"
+    assert service.ai_config_repo.updated == []
     assert service.job_runner.submitted == ["TRN1"]
 
 
@@ -306,12 +307,13 @@ def test_transaction_lookup_route() -> None:
     assert payload["modelVersion"] == "v1.1.1"
 
 
-def test_training_requires_existing_ai_configuration_row() -> None:
+def test_training_accepts_request_before_ai_configuration_row_exists() -> None:
     config = build_config()
+    runner = DummyJobRunner()
     service = AIMLApiService(
         config=config,
         auth_manager=AuthManager("aiml", "secret", "top-secret", 60),
-        job_runner=DummyJobRunner(),
+        job_runner=runner,
         logger=logging.getLogger("test_aiml_api"),
         ai_config_repo=DummyAIConfigRepo(),
     )
@@ -326,8 +328,9 @@ def test_training_requires_existing_ai_configuration_row() -> None:
         body={"transactionId": "TRN_MISSING", "months": 3},
     )
 
-    assert status.startswith("404")
-    assert payload["message"] == "transactionId TRN_MISSING not found in ai_configurations."
+    assert status.startswith("202")
+    assert payload["status"] == "ACCEPTED"
+    assert runner.submitted == ["TRN_MISSING"]
 
 
 
@@ -348,12 +351,13 @@ def test_training_rejects_extra_fields() -> None:
     assert payload == {"transactionId": "TRN_EXTRA", "status": "FAILED", "message": "Unexpected fields: model"}
 
 
-def test_inference_requires_existing_ai_configuration_row() -> None:
+def test_inference_accepts_request_before_ai_configuration_row_exists() -> None:
     config = build_config()
+    runner = DummyJobRunner()
     service = AIMLApiService(
         config=config,
         auth_manager=AuthManager("aiml", "secret", "top-secret", 60),
-        job_runner=DummyJobRunner(),
+        job_runner=runner,
         logger=logging.getLogger("test_aiml_api"),
         ai_config_repo=DummyAIConfigRepo(),
     )
@@ -368,8 +372,9 @@ def test_inference_requires_existing_ai_configuration_row() -> None:
         body={"transactionId": "TRN_MISSING_INF"},
     )
 
-    assert status.startswith("404")
-    assert payload["message"] == "transactionId TRN_MISSING_INF not found in ai_configurations."
+    assert status.startswith("202")
+    assert payload["status"] == "ACCEPTED"
+    assert runner.submitted == ["TRN_MISSING_INF"]
 
 
 
@@ -458,7 +463,11 @@ def test_run_inference_job_completes_when_summary_reader_is_available(monkeypatc
         "modified_on": "2026-06-09T11:00:00",
     }
 
-    monkeypatch.setattr(api_service_module.subprocess, "run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        api_service_module.subprocess,
+        "run",
+        lambda *args, **kwargs: api_service_module.subprocess.CompletedProcess(args[0], 0, stdout="", stderr=""),
+    )
     monkeypatch.setattr(api_service_module, "read_metrics_snapshot", lambda model_name: {"modelVersion": model_name, "currentAccuracy": 78.5, "driftPercentage": 4.8})
     monkeypatch.setattr(api_service_module, "read_prediction_summary", lambda predict_month: {"drift": {"drift_percentage": 4.8, "overall_psi": 0.12, "max_feature_psi": 0.2, "status": "LOW"}})
 
@@ -467,9 +476,9 @@ def test_run_inference_job_completes_when_summary_reader_is_available(monkeypatc
         payload={"sourceMonth": "2026-06", "predictMonth": "2026-07", "model": "catboost_3m"},
     )
 
-    assert service.ai_config_repo.updated[0]["drift"] == 4.8
-    assert service.ai_config_repo.updated[0]["training_window"] == "10 days"
-    assert service.ai_config_repo.updated[0]["model_version"] == "v1.1.3"
+    assert service.ai_config_repo.updated[-1]["drift"] == 4.8
+    assert service.ai_config_repo.updated[-1]["training_window"] == "10 days"
+    assert service.ai_config_repo.updated[-1]["model_version"] == "v1.1.3"
 
 
 def test_inference_export_command_enabled() -> None:
