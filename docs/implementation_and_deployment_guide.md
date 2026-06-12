@@ -616,50 +616,39 @@ For current usage, API mode is the primary deployment pattern.
 
 ### 24.3 Clone Repository
 
-On the new server:
+Clone the integration branch directly:
 
 ```bash
-cd /home/ubuntu
-git clone <github_repo_url> recommendation
-cd /home/ubuntu/recommendation
+git clone -b feat/integration-with-digital https://github.com/Sumitkumar1007/campaign-recommendation.git
 ```
-
-If the project is being copied from an existing server instead of cloned:
-
-```bash
-rsync -av <old_server>:/home/ubuntu/aiml/recommendation/ /home/ubuntu/recommendation/
-```
-
-After copy, remove environment-specific files you do not want to carry over blindly.
-
-Do not copy these from old server unless intentionally required:
-
-- `.env`
-- `artifacts/logs/*`
-- `artifacts/predictions/*`
-- `artifacts/exports/*`
 
 ### 24.4 Python Environment
 
-Create virtual environment:
+Python requirement:
+
+- Python `3.11+` or `3.12`
+
+Set up the virtual environment:
 
 ```bash
-cd /home/ubuntu/recommendation
-python3 -m venv venv
+python3.11 -m venv venv
 source venv/bin/activate
 pip install -U pip
 pip install -e .
 ```
 
-If you also want test tools:
+### 24.5 Prepare Required Directories
+
+Create the minimum required artifact directories:
 
 ```bash
-pip install -e ".[dev]"
+mkdir artifacts/models
+mkdir artifacts/metrics
 ```
 
-### 24.5 Files And Artifacts To Copy From Old Server
+### 24.6 Copy Required Artifacts And Config
 
-Copy these if you want the new server to start with the existing trained model:
+Copy these files and directories from the existing server to the new server:
 
 ```text
 artifacts/models/next_month_strategy_catboost_3m.joblib
@@ -668,215 +657,87 @@ artifacts/checkpoints/catboost_3m/
 config/default_config.json
 ```
 
-Optional but useful to copy:
-
-```text
-data/communication/MFL_COMMUNICATION_DATA/
-data/features/strategy_monthly_features.csv
-data/schedules/strategy_schedule_dataset_all_months.csv
-data/training/strategy_training_dataset_all_months.csv
-```
-
-Notes:
-
-- The API can rebuild training datasets from Postgres during training.
-- Inference and export do not require historical raw files if the pipeline can fetch what it needs from Postgres.
-- Copying the model artifact is strongly recommended unless you plan to retrain immediately on the new server.
-
-Example copy from old server:
-
-```bash
-rsync -av <old_server>:/home/ubuntu/aiml/recommendation/artifacts/models/ ./artifacts/models/
-rsync -av <old_server>:/home/ubuntu/aiml/recommendation/artifacts/metrics/ ./artifacts/metrics/
-rsync -av <old_server>:/home/ubuntu/aiml/recommendation/artifacts/checkpoints/catboost_3m/ ./artifacts/checkpoints/catboost_3m/
-```
-
-### 24.6 Create `.env`
-
-Create `.env` from the template:
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` with real values.
-
-Minimum required DB/source variables:
-
-```bash
-PGHOST=<postgres_host>
-PGPORT=5432
-PGDATABASE=<postgres_db>
-PGUSER=<postgres_user>
-PGPASSWORD=<postgres_password>
-SOURCE_SCHEMA=digital_collections
-SOURCE_TABLE=communications
-TARGET_SCHEMA=digital_collections
-```
-
-Core model/runtime variables:
-
-```bash
-MODEL_NAME=catboost_3m
-FEATURE_MONTH_SOURCE=emi_date
-CAMPAIGN_VERTICAL=LAP
-CAMPAIGN_VENDOR=prutech-cpass
-CAMPAIGN_TABLE=ai_ml_campaign_recommendations
-CAMPAIGN_MAPPING_TABLE=ai_ml_campaign_mapping
-```
-
-API service variables:
-
-```bash
-API_HOST=0.0.0.0
-API_PORT=8040
-API_AUTH_USERNAME=aiml
-API_AUTH_PASSWORD=<api_password>
-API_AUTH_SECRET=<long_random_secret>
-API_TOKEN_TTL_SECONDS=28800
-AI_CONFIG_TABLE=ai_configurations
-API_MODEL_BASE_VERSION=v1.1.0
-API_EXPORT_AFTER_INFERENCE=true
-API_EXPORT_WRITE=true
-API_SFTP_EXPORT_PATH=/home/ubuntu/recommendation/artifacts/exports/sftp
-```
-
-SFTP variables if upload is enabled:
-
-```bash
-SFTP_EXPORT_PATH=/home/ubuntu/recommendation/artifacts/exports/sftp
-SFTP_UPLOAD_ENABLED=true
-SFTP_HOST=<sftp_host>
-SFTP_PORT=22
-SFTP_USERNAME=<sftp_user>
-SFTP_PASSWORD=<sftp_password>
-SFTP_PRIVATE_KEY_PATH=
-SFTP_PRIVATE_KEY_PASSPHRASE=
-SFTP_REMOTE_PATH=<remote_upload_dir>
-SFTP_RETRIES=3
-SFTP_RETRY_DELAY_SECONDS=5
-SFTP_TIMEOUT_SECONDS=30
-SFTP_FAIL_ON_ERROR=false
-```
-
-Meaning of `SFTP_FAIL_ON_ERROR`:
-
-- `true`: upload failure fails the job
-- `false`: upload failure is logged but local generation can still succeed
-
-### 24.7 DB Objects Expected By The App
-
-Source read table:
-
-- `digital_collections.communications`
-
-Target/update tables used by runtime:
-
-- `digital_collections.ai_configurations`
-- `digital_collections.ai_ml_campaign_recommendations`
-- `digital_collections.ai_ml_campaign_mapping`
-
-Quartz/Digital export target tables when export write is enabled:
-
-- `dataset`
-- `qrtz_job_details`
-- `qrtz_triggers`
-- `qrtz_cron_triggers`
-
-Important API behavior:
-
-- Digital application must insert `transactionId` first into `ai_configurations`
-- AIML API updates the existing row
-- AIML API does not create the transaction row
-
-### 24.8 Network Checks
-
-Before starting the service, verify outbound connectivity.
-
-Postgres and SFTP reachability:
-
-```bash
-python3 - <<'PY'
-import socket
-for host, port in [
-    ("<postgres_host>", 5432),
-    ("<sftp_host>", 22),
-]:
-    try:
-        s = socket.create_connection((host, port), timeout=5)
-        print(host, port, 'ok')
-        s.close()
-    except Exception as exc:
-        print(host, port, 'fail', exc)
-PY
-```
-
-### 24.9 Prepare Writable Directories
-
-Create expected writable paths:
-
-```bash
-mkdir -p artifacts/models artifacts/metrics artifacts/checkpoints/catboost_3m
-mkdir -p artifacts/logs artifacts/predictions artifacts/exports/sftp
-mkdir -p data/communication/MFL_COMMUNICATION_DATA data/training data/features data/schedules data/cases
-```
-
 If using copied artifacts, confirm permissions:
 
 ```bash
 chmod -R u+rwX artifacts data
 ```
 
-### 24.10 Manual Smoke Test Before Systemd
+### 24.7 Create `.env`
 
-Activate environment:
-
-```bash
-cd /home/ubuntu/recommendation
-source venv/bin/activate
-```
-
-Run health service manually once:
+Create `.env` with the deployment values below:
 
 ```bash
-./venv/bin/python scripts/run_api_service.py --host 0.0.0.0 --port 8040
+# Postgres source and snapshot storage
+PGHOST=10.1.1.45
+PGPORT=5432
+PGDATABASE=postgres
+PGUSER=postgres
+PGPASSWORD=mysecretpassword
+
+# Source communication table
+SOURCE_SCHEMA=digital_collections
+SOURCE_TABLE=communications
+
+# Target schema/tables used by the pipeline
+TARGET_SCHEMA=digital_collections
+CAMPAIGN_TABLE=ai_ml_campaign_recommendations
+CAMPAIGN_MAPPING_TABLE=ai_ml_campaign_mapping
+
+# Monthly inference defaults
+MODEL_NAME=catboost_3m
+FEATURE_MONTH_SOURCE=emi_date
+
+# MLflow registry
+MLFLOW_TRACKING_URI=http://10.1.1.45:5000
+MLFLOW_EXPERIMENT_NAME=campaign-recommendation
+MLFLOW_REGISTERED_MODEL_NAME=campaign_next_month_catboost_3m
+MLFLOW_RUN_NAME=catboost-3m-may-2026-v1
+
+# API service
+API_HOST=0.0.0.0
+API_PORT=8040
+API_AUTH_USERNAME=aiml
+API_AUTH_PASSWORD=aiml
+API_AUTH_SECRET=4b32d0dbabc3749210ee55d98bb91bef34071a30126cdb42b24bb4c98c0c1bb8
+API_TOKEN_TTL_SECONDS=28800
+AI_CONFIG_TABLE=ai_configurations
+API_MODEL_BASE_VERSION=v1.1.0
+API_EXPORT_AFTER_INFERENCE=true
+API_EXPORT_WRITE=true
+API_SFTP_EXPORT_PATH=/app/muthoot/digital/kafka-web/aiml/campaign-recommendation/artifacts/exports/sftp
+
+# SFTP upload after workbook generation
+SFTP_EXPORT_PATH=/app/muthoot/digital/kafka-web/aiml/campaign-recommendation/artifacts/exports/sftp
+SFTP_UPLOAD_ENABLED=true
+SFTP_HOST=10.1.1.45
+SFTP_PORT=22
+SFTP_USERNAME=sumit
+SFTP_PASSWORD=go4it*22
+SFTP_PRIVATE_KEY_PATH=
+SFTP_PRIVATE_KEY_PASSPHRASE=
+SFTP_REMOTE_PATH=/home/sumit/sftp-test/output
+SFTP_RETRIES=3
+SFTP_RETRY_DELAY_SECONDS=5
+SFTP_TIMEOUT_SECONDS=30
+SFTP_FAIL_ON_ERROR=true
 ```
 
-From another shell:
+### 24.8 Update And Install Systemd Service
 
-```bash
-curl -fsS http://127.0.0.1:8040/api/health
-```
+Update the service file first:
 
-Expected shape:
+- user
+- group
+- `WorkingDirectory`
+- `EnvironmentFile`
+- `ExecStart`
 
-```json
-{
-  "status": "ok",
-  "service": "aiml-integration-api",
-  "dbStatus": "ok",
-  "dbError": null,
-  "modelVersion": "v1.1.0"
-}
-```
-
-Stop the foreground process after validation.
-
-### 24.11 Install Systemd Service
-
-The repo already contains the unit file:
+Service file path:
 
 - [deploy/systemd/recommendation.service](../deploy/systemd/recommendation.service)
 
-Current unit assumptions:
-
-- working directory: `/home/ubuntu/recommendation`
-- port: `8040`
-- env file: `/home/ubuntu/recommendation/.env`
-
-If your actual path differs, update the unit file before copying it.
-
-Install:
+Then install and start it:
 
 ```bash
 sudo cp deploy/systemd/recommendation.service /etc/systemd/system/recommendation.service
@@ -885,19 +746,13 @@ sudo systemctl enable recommendation.service
 sudo systemctl restart recommendation.service
 ```
 
-Check status:
+Check service status:
 
 ```bash
 sudo systemctl status recommendation.service --no-pager
 ```
 
-Check listener:
-
-```bash
-ss -ltnp | grep 8040
-```
-
-### 24.12 API Smoke Tests
+### 24.9 Smoke Test
 
 #### Health
 
@@ -938,6 +793,64 @@ curl -sS -X POST http://127.0.0.1:8040/api/v1/inference \
 #### Poll status
 
 ```bash
+curl -sS -H 'Authorization: Bearer <token>' \
+  http://127.0.0.1:8040/api/v1/transactions/TRN202606080003
+```
+
+### 24.10 DB Objects Expected By The App
+
+Source read table:
+
+- `digital_collections.communications`
+
+Target/update tables used by runtime:
+
+- `digital_collections.ai_configurations`
+- `digital_collections.ai_ml_campaign_recommendations`
+- `digital_collections.ai_ml_campaign_mapping`
+
+Quartz/Digital export target tables when export write is enabled:
+
+- `dataset`
+- `qrtz_job_details`
+- `qrtz_triggers`
+- `qrtz_cron_triggers`
+
+Important API behavior:
+
+- Digital application must insert `transactionId` first into `ai_configurations`
+- AIML API updates the existing row
+- AIML API does not create the transaction row
+
+### 24.11 Notes
+
+- This setup is for API-mode deployment on the new server.
+- The branch used is `feat/integration-with-digital`.
+- The service listens on port `8040`.
+- `SFTP_FAIL_ON_ERROR=true` means SFTP upload failure will fail the inference/export job.
+- If the filesystem path on the new server is different, update both `.env` and `deploy/systemd/recommendation.service` before starting the service.
+
+### 24.12 Manual API Commands Reference
+
+These are the same smoke-test commands, grouped here as a quick reference.
+
+```bash
+curl -fsS http://127.0.0.1:8040/api/health
+
+curl -sS -X POST http://127.0.0.1:8040/api/v1/auth \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"aiml","password":"<api_password>"}'
+
+curl -sS -X POST http://127.0.0.1:8040/api/v1/training \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <token>' \
+  -d '{"transactionId":"TRN202606080003","months":6}'
+
+curl -sS -X POST http://127.0.0.1:8040/api/v1/inference \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <token>' \
+  -d '{"transactionId":"TRN202606080004"}'
+
 curl -sS -H 'Authorization: Bearer <token>' \
   http://127.0.0.1:8040/api/v1/transactions/TRN202606080003
 ```
