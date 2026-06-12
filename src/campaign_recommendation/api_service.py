@@ -251,9 +251,24 @@ def subprocess_error_message(exc: subprocess.CalledProcessError) -> str:
         'Child script stdout empty |',
         'Child script stderr empty |',
         'Logging initialized.',
+        'raise CalledProcessError(',
+    )
+    preferred_markers = (
+        'FATAL:',
+        'OperationalError:',
+        'ValueError:',
+        'RuntimeError:',
+        'Error:',
+        'Exception:',
+        'database ',
+        'does not exist',
+        'permission denied',
+        'connection failed',
+        'No such file or directory',
     )
 
-    for raw_line in reversed(candidates):
+    cleaned_candidates: list[str] = []
+    for raw_line in candidates:
         line = raw_line
         if '| script=' in line and ' | ' in line:
             line = line.rsplit(' | ', 1)[-1].strip()
@@ -261,11 +276,17 @@ def subprocess_error_message(exc: subprocess.CalledProcessError) -> str:
             line = line.rsplit(' | ', 1)[-1].strip()
         if not line:
             continue
-        if line.startswith('File "'):
+        if line.startswith('File "') or line.startswith('raise ') or line in {'^', '~^'}:
             continue
         if any(fragment in line for fragment in ignored_fragments):
             continue
-        return line
+        cleaned_candidates.append(line)
+
+    for line in reversed(cleaned_candidates):
+        if any(marker in line for marker in preferred_markers):
+            return line
+    if cleaned_candidates:
+        return cleaned_candidates[-1]
     return str(exc)
 
 
