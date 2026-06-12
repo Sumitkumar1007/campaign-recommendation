@@ -31,6 +31,9 @@ METRICS_DIR = REPO_ROOT / "artifacts" / "metrics"
 PREDICTIONS_DIR = REPO_ROOT / "artifacts" / "predictions"
 CHECKPOINT_DIR = REPO_ROOT / "artifacts" / "checkpoints"
 DEFAULT_SFTP_EXPORT_PATH = REPO_ROOT / "artifacts" / "exports" / "sftp"
+AI_CONFIG_UPDATE_INITIAL_DELAY_SECONDS = float(os.getenv("AI_CONFIG_UPDATE_INITIAL_DELAY_SECONDS", "5"))
+AI_CONFIG_UPDATE_WAIT_TIMEOUT_SECONDS = float(os.getenv("AI_CONFIG_UPDATE_WAIT_TIMEOUT_SECONDS", "60"))
+AI_CONFIG_UPDATE_WAIT_INTERVAL_SECONDS = float(os.getenv("AI_CONFIG_UPDATE_WAIT_INTERVAL_SECONDS", "1"))
 
 
 def load_dotenv(path: Path | None = None) -> None:
@@ -726,6 +729,51 @@ class AIMLApiService:
         except (TypeError, ValueError):
             return None
 
+    def _wait_for_ai_configuration_row(
+        self,
+        transaction_id: str,
+        *,
+        initial_delay_seconds: float = 0.0,
+        timeout_seconds: float = AI_CONFIG_UPDATE_WAIT_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = AI_CONFIG_UPDATE_WAIT_INTERVAL_SECONDS,
+    ) -> None:
+        if initial_delay_seconds > 0:
+            self.logger.info(
+                "Waiting before ai_configurations lookup | transaction_id=%s delay_seconds=%s",
+                transaction_id,
+                initial_delay_seconds,
+            )
+            time.sleep(initial_delay_seconds)
+        deadline = time.monotonic() + max(timeout_seconds, 0.0)
+        while True:
+            if self.ai_config_repo.fetch_by_transaction_id(transaction_id) is not None:
+                return
+            if time.monotonic() >= deadline:
+                raise FileNotFoundError(
+                    f"transactionId {transaction_id} not found in ai_configurations after waiting {timeout_seconds} seconds."
+                )
+            time.sleep(max(poll_interval_seconds, 0.0))
+
+    def _update_ai_configuration_entry(
+        self,
+        *,
+        transaction_id: str,
+        initial_delay_seconds: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
+        self._wait_for_ai_configuration_row(transaction_id, initial_delay_seconds=initial_delay_seconds)
+        self.ai_config_repo.update_entry(transaction_id=transaction_id, **kwargs)
+
+    def _safe_update_ai_configuration_entry(self, *, log_context: str, transaction_id: str, **kwargs: Any) -> None:
+        try:
+            self._update_ai_configuration_entry(transaction_id=transaction_id, **kwargs)
+        except Exception:
+            self.logger.exception(
+                "Failed to update ai_configurations | transaction_id=%s context=%s",
+                transaction_id,
+                log_context,
+            )
+
     def trigger_training(self, payload: dict[str, Any], request_url: str) -> tuple[int, dict[str, Any]]:
         transaction_id = str(payload.get("transactionId", "")).strip()
         try:
@@ -734,9 +782,6 @@ class AIMLApiService:
             return HTTPStatus.BAD_REQUEST, failure_response(transaction_id, str(exc))
         if not transaction_id:
             return HTTPStatus.BAD_REQUEST, failure_response(transaction_id, "transactionId is required.")
-        config_entry = self.ai_config_repo.fetch_by_transaction_id(transaction_id)
-        if config_entry is None:
-            return HTTPStatus.NOT_FOUND, failure_response(transaction_id, f"transactionId {transaction_id} not found in ai_configurations.")
 
         if self.job_runner.is_running(transaction_id):
             return HTTPStatus.CONFLICT, failure_response(transaction_id, f"Job already running for {transaction_id}.")
@@ -758,14 +803,6 @@ class AIMLApiService:
             "model": model_name,
             "modelVersion": next_model_version,
         }
-        self.ai_config_repo.update_entry(
-            transaction_id=transaction_id,
-            entry_type="TRAINING",
-            status="ACCEPTED",
-            message="Request accepted for processing.",
-            training_window=str(months),
-            model_version=next_model_version,
-        )
         self.job_runner.submit(
             transaction_id,
             lambda: self._run_training_job(transaction_id=transaction_id, payload=request_body),
@@ -780,9 +817,6 @@ class AIMLApiService:
             return HTTPStatus.BAD_REQUEST, failure_response(transaction_id, str(exc))
         if not transaction_id:
             return HTTPStatus.BAD_REQUEST, failure_response(transaction_id, "transactionId is required.")
-        config_entry = self.ai_config_repo.fetch_by_transaction_id(transaction_id)
-        if config_entry is None:
-            return HTTPStatus.NOT_FOUND, failure_response(transaction_id, f"transactionId {transaction_id} not found in ai_configurations.")
 
         if self.job_runner.is_running(transaction_id):
             return HTTPStatus.CONFLICT, failure_response(transaction_id, f"Job already running for {transaction_id}.")
@@ -812,14 +846,6 @@ class AIMLApiService:
             "predictMonth": predict_month,
             "model": model_name,
         }
-        self.ai_config_repo.update_entry(
-            transaction_id=transaction_id,
-            entry_type="INFERENCE",
-            status="ACCEPTED",
-            message="Request accepted for processing.",
-            model_version=current_model_version,
-            training_window="10 days",
-        )
         self.job_runner.submit(
             transaction_id,
             lambda: self._run_inference_job(transaction_id=transaction_id, payload=request_body),
@@ -860,6 +886,15 @@ class AIMLApiService:
             checkpoint_dir,
         )
         try:
+            self._update_ai_configuration_entry(
+                transaction_id=transaction_id,
+                initial_delay_seconds=AI_CONFIG_UPDATE_INITIAL_DELAY_SECONDS,
+                entry_type="TRAINING",
+                status="ACCEPTED",
+                message="Request accepted for processing.",
+                training_window=str(months),
+                model_version=target_model_version,
+            )
             run_logged_subprocess(
                 prepare_command,
                 logger=self.logger,
@@ -883,7 +918,8 @@ class AIMLApiService:
                 metrics_file,
                 model_file,
             )
-            self.ai_config_repo.update_entry(
+            self._safe_update_ai_configuration_entry(
+                log_context="training_completed",
                 transaction_id=transaction_id,
                 status="COMPLETED",
                 message="Processing completed.",
@@ -901,7 +937,8 @@ class AIMLApiService:
                 error_message = summarize_subprocess_failure(exc, step_name=failed_step)
             else:
                 error_message = str(exc)
-            self.ai_config_repo.update_entry(
+            self._safe_update_ai_configuration_entry(
+                log_context="training_failed",
                 transaction_id=transaction_id,
                 status="FAILED",
                 message=error_message,
@@ -932,6 +969,15 @@ class AIMLApiService:
             self.config.export_write,
         )
         try:
+            self._update_ai_configuration_entry(
+                transaction_id=transaction_id,
+                initial_delay_seconds=AI_CONFIG_UPDATE_INITIAL_DELAY_SECONDS,
+                entry_type="INFERENCE",
+                status="ACCEPTED",
+                message="Request accepted for processing.",
+                model_version=model_version,
+                training_window="10 days",
+            )
             run_logged_subprocess(
                 command,
                 logger=self.logger,
@@ -971,7 +1017,8 @@ class AIMLApiService:
                 "schedulerExportWrite": self.config.export_write if self.config.export_after_inference else None,
                 "schedulerExportTriggerState": self.config.export_trigger_state if self.config.export_after_inference else None,
             }
-            self.ai_config_repo.update_entry(
+            self._safe_update_ai_configuration_entry(
+                log_context="inference_completed",
                 transaction_id=transaction_id,
                 status="COMPLETED",
                 message="Metrics generated successfully",
@@ -989,7 +1036,8 @@ class AIMLApiService:
                 error_message = summarize_subprocess_failure(exc, step_name=failed_step)
             else:
                 error_message = str(exc)
-            self.ai_config_repo.update_entry(
+            self._safe_update_ai_configuration_entry(
+                log_context="inference_failed",
                 transaction_id=transaction_id,
                 status="FAILED",
                 message=error_message,
