@@ -547,6 +547,49 @@ def test_http_server_end_to_end_routes() -> None:
         thread.join(timeout=5)
 
 
+def test_failed_training_keeps_current_model_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = AIMLApiService(
+        config=build_config(),
+        auth_manager=AuthManager("aiml", "secret", "top-secret", 60),
+        job_runner=DummyJobRunner(),
+        logger=logging.getLogger("test_aiml_api"),
+        ai_config_repo=DummyAIConfigRepo(),
+    )
+    service.ai_config_repo.entries["TRN_FAIL"] = {"transaction_id": "TRN_FAIL"}
+    service.ai_config_repo.entries["TRN_MODEL"] = {
+        "transaction_id": "TRN_MODEL",
+        "type": "TRAINING",
+        "status": "COMPLETED",
+        "model_version": "v1.1.0",
+        "modified_on": "2026-06-09T11:00:00",
+    }
+
+    def raise_prepare_failure(*args, **kwargs):
+        raise api_service_module.subprocess.CalledProcessError(
+            1,
+            ["prepare_training_window"],
+            stdout="",
+            stderr="ValueError: No rows matched the D-5 to D+5 window.",
+        )
+
+    monkeypatch.setattr(api_service_module, "run_logged_subprocess", raise_prepare_failure)
+
+    service._run_training_job(
+        transaction_id="TRN_FAIL",
+        payload={
+            "transactionId": "TRN_FAIL",
+            "months": 3,
+            "model": "catboost_3m",
+            "currentModelVersion": "v1.1.0",
+            "modelVersion": "v1.1.1",
+        },
+    )
+
+    assert service.ai_config_repo.updated[0]["model_version"] == "v1.1.0"
+    assert service.ai_config_repo.updated[-1]["status"] == "FAILED"
+    assert service.ai_config_repo.updated[-1]["model_version"] == "v1.1.0"
+
+
 def test_training_missing_months_returns_failed_payload() -> None:
     service = build_service()
     app = AIMLApiApp(service)

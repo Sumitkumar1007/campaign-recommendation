@@ -790,6 +790,7 @@ class AIMLApiService:
             return HTTPStatus.BAD_REQUEST, failure_response(transaction_id, "months is required.")
         months = int(payload.get("months", 3))
         model_name = self.config.model_name
+        current_model_version = self.current_model_version()
         next_model_version = self.next_model_version()
         accepted = {
             "transactionId": transaction_id,
@@ -801,6 +802,7 @@ class AIMLApiService:
             "transactionId": transaction_id,
             "months": months,
             "model": model_name,
+            "currentModelVersion": current_model_version,
             "modelVersion": next_model_version,
         }
         self.job_runner.submit(
@@ -856,6 +858,7 @@ class AIMLApiService:
         started_at = time.perf_counter()
         model_name = str(payload["model"])
         months = int(payload["months"])
+        current_model_version = str(payload.get("currentModelVersion") or self.current_model_version())
         target_model_version = str(payload.get("modelVersion") or self.next_model_version())
         metrics_file = METRICS_DIR / f"next_month_strategy_{model_name}_metrics.json"
         model_file = MODEL_DIR / f"next_month_strategy_{model_name}.joblib"
@@ -893,7 +896,7 @@ class AIMLApiService:
                 status="ACCEPTED",
                 message="Request accepted for processing.",
                 training_window=str(months),
-                model_version=target_model_version,
+                model_version=current_model_version,
             )
             run_logged_subprocess(
                 prepare_command,
@@ -942,7 +945,7 @@ class AIMLApiService:
                 transaction_id=transaction_id,
                 status="FAILED",
                 message=error_message,
-                model_version=target_model_version,
+                model_version=current_model_version,
                 processing_time_ms=int((time.perf_counter() - started_at) * 1000),
                 entry_type="TRAINING",
                 training_window=str(months),
