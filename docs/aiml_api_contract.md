@@ -159,7 +159,7 @@ Rules:
 
 ## Inference Workbook Export
 
-If `API_EXPORT_AFTER_INFERENCE=true`, inference completion writes 2 files to configured `API_SFTP_EXPORT_PATH`:
+If `API_EXPORT_AFTER_INFERENCE=true`, inference completion writes 2 files to configured local export path:
 
 - `MD_UB_DATASET_DDMMYYYY_01.xlsx`
 - `MD_UB_SCHEDULER_DDMMYYYY_01.xlsx`

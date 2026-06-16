@@ -103,7 +103,7 @@ class ApiConfig:
             log_file=Path(os.getenv("API_LOG_FILE", str(LOG_DIR / "aiml_api.log"))),
             ai_config_table=os.getenv("AI_CONFIG_TABLE", "ai_configurations"),
             api_model_base_version=os.getenv("API_MODEL_BASE_VERSION", "v1.1.0"),
-            sftp_export_path=Path(os.getenv("API_SFTP_EXPORT_PATH", os.getenv("SFTP_EXPORT_PATH", str(DEFAULT_SFTP_EXPORT_PATH)))),
+            sftp_export_path=Path(os.getenv("SFTP_EXPORT_PATH", str(DEFAULT_SFTP_EXPORT_PATH))),
         )
 
 

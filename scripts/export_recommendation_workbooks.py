@@ -42,6 +42,8 @@ class SFTPConfig:
     private_key_path: Path | None
     private_key_passphrase: str | None
     remote_path: str
+    remote_dataset_path: str
+    remote_scheduler_path: str
     retries: int
     retry_delay_seconds: float
     timeout_seconds: int
@@ -90,6 +92,8 @@ def parse_args() -> ExportConfig:
     parser.add_argument("--sftp-private-key-path", default=os.getenv("SFTP_PRIVATE_KEY_PATH"))
     parser.add_argument("--sftp-private-key-passphrase", default=os.getenv("SFTP_PRIVATE_KEY_PASSPHRASE"))
     parser.add_argument("--sftp-remote-path", default=os.getenv("SFTP_REMOTE_PATH", ""))
+    parser.add_argument("--sftp-remote-dataset-path", default=os.getenv("SFTP_REMOTE_DATASET_PATH", os.getenv("SFTP_REMOTE_PATH", "")))
+    parser.add_argument("--sftp-remote-scheduler-path", default=os.getenv("SFTP_REMOTE_SCHEDULER_PATH", os.getenv("SFTP_REMOTE_PATH", "")))
     parser.add_argument("--sftp-retries", type=int, default=int(os.getenv("SFTP_RETRIES", "3")))
     parser.add_argument("--sftp-retry-delay-seconds", type=float, default=float(os.getenv("SFTP_RETRY_DELAY_SECONDS", "5")))
     parser.add_argument("--sftp-timeout-seconds", type=int, default=int(os.getenv("SFTP_TIMEOUT_SECONDS", "30")))
@@ -120,6 +124,8 @@ def parse_args() -> ExportConfig:
         private_key_path=Path(args.sftp_private_key_path) if args.sftp_private_key_path else None,
         private_key_passphrase=args.sftp_private_key_passphrase,
         remote_path=str(args.sftp_remote_path).strip(),
+        remote_dataset_path=str(args.sftp_remote_dataset_path).strip(),
+        remote_scheduler_path=str(args.sftp_remote_scheduler_path).strip(),
         retries=max(1, int(args.sftp_retries)),
         retry_delay_seconds=max(0.0, float(args.sftp_retry_delay_seconds)),
         timeout_seconds=max(1, int(args.sftp_timeout_seconds)),
@@ -152,8 +158,10 @@ def validate_sftp_config(parser: argparse.ArgumentParser, config: SFTPConfig) ->
         missing.append("SFTP_HOST/--sftp-host")
     if not config.username:
         missing.append("SFTP_USERNAME/--sftp-username")
-    if not config.remote_path:
-        missing.append("SFTP_REMOTE_PATH/--sftp-remote-path")
+    if not config.remote_dataset_path:
+        missing.append("SFTP_REMOTE_DATASET_PATH/--sftp-remote-dataset-path")
+    if not config.remote_scheduler_path:
+        missing.append("SFTP_REMOTE_SCHEDULER_PATH/--sftp-remote-scheduler-path")
     if not config.password and config.private_key_path is None:
         missing.append("SFTP_PASSWORD or SFTP_PRIVATE_KEY_PATH")
     if missing:
@@ -310,13 +318,13 @@ def remote_file_path(remote_dir: str, local_path: Path) -> str:
     return f"{prefix}/{local_path.name}" if prefix else local_path.name
 
 
-def upload_file(local_path: Path, config: SFTPConfig) -> str:
+def upload_file(local_path: Path, config: SFTPConfig, *, remote_dir: str) -> str:
     transport = None
     sftp_client = None
-    remote_path = remote_file_path(config.remote_path, local_path)
+    remote_path = remote_file_path(remote_dir, local_path)
     try:
         transport, sftp_client = _connect_sftp(config)
-        ensure_remote_dir(sftp_client, config.remote_path)
+        ensure_remote_dir(sftp_client, remote_dir)
         sftp_client.put(str(local_path), remote_path)
         return remote_path
     finally:
@@ -326,11 +334,11 @@ def upload_file(local_path: Path, config: SFTPConfig) -> str:
             transport.close()
 
 
-def upload_with_retry(local_path: Path, config: SFTPConfig) -> tuple[bool, str | None, str | None]:
+def upload_with_retry(local_path: Path, config: SFTPConfig, *, remote_dir: str) -> tuple[bool, str | None, str | None]:
     last_error: Exception | None = None
     for attempt in range(1, config.retries + 1):
         try:
-            return True, upload_file(local_path, config), None
+            return True, upload_file(local_path, config, remote_dir=remote_dir), None
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             if attempt < config.retries:
@@ -341,12 +349,12 @@ def upload_with_retry(local_path: Path, config: SFTPConfig) -> tuple[bool, str |
     return False, None, message
 
 
-def upload_files(local_paths: list[Path], config: SFTPConfig) -> list[dict[str, Any]]:
+def upload_files(file_specs: list[tuple[Path, str]], config: SFTPConfig) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     if not config.enabled:
         return results
-    for local_path in local_paths:
-        uploaded, remote_path, error = upload_with_retry(local_path, config)
+    for local_path, remote_dir in file_specs:
+        uploaded, remote_path, error = upload_with_retry(local_path, config, remote_dir=remote_dir)
         result = {
             'localPath': str(local_path),
             'uploaded': uploaded,
@@ -381,7 +389,13 @@ def main() -> None:
 
     write_xlsx(dataset_path, headers=['Name', 'Query'], rows=dataset_rows)
     write_xlsx(scheduler_path, headers=['Name', 'Mode', 'Date', 'Time', 'Template Name', 'Dataset Name', 'Vendor', 'Active', 'Reason'], rows=scheduler_rows)
-    results = upload_files([dataset_path, scheduler_path], args.sftp)
+    results = upload_files(
+        [
+            (dataset_path, args.sftp.remote_dataset_path),
+            (scheduler_path, args.sftp.remote_scheduler_path),
+        ],
+        args.sftp,
+    )
     print('dry_run=false')
     if results:
         print(f'sftp_uploads={results}')

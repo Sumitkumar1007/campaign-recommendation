@@ -705,10 +705,10 @@ AI_CONFIG_TABLE=ai_configurations
 API_MODEL_BASE_VERSION=v1.1.0
 API_EXPORT_AFTER_INFERENCE=true
 API_EXPORT_WRITE=true
-API_SFTP_EXPORT_PATH=/app/muthoot/digital/kafka-web/aiml/campaign-recommendation/artifacts/exports/sftp
-
 # SFTP upload after workbook generation
 SFTP_EXPORT_PATH=/app/muthoot/digital/kafka-web/aiml/campaign-recommendation/artifacts/exports/sftp
+SFTP_REMOTE_DATASET_PATH=/app/muthoot/digital/kafka-web/upload/dataset/sftp
+SFTP_REMOTE_SCHEDULER_PATH=/app/muthoot/digital/kafka-web/upload/scheduler/sftp
 SFTP_UPLOAD_ENABLED=true
 SFTP_HOST=10.1.1.45
 SFTP_PORT=22

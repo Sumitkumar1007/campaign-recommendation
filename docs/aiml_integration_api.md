@@ -33,7 +33,7 @@ AI_CONFIG_TABLE=ai_configurations
 API_MODEL_BASE_VERSION=v1.1.0
 API_EXPORT_AFTER_INFERENCE=false
 API_EXPORT_WRITE=false
-API_SFTP_EXPORT_PATH=/path/to/sftp/drop
+SFTP_EXPORT_PATH=/path/to/local/sftp/drop
 ```
 
 Systemd unit file:
