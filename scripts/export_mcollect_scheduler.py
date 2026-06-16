@@ -188,18 +188,40 @@ def dataset_query_for(row: pd.Series, *, schema: str, campaign_table: str, mappi
     emi_cycle = int(row["emi_cycle"])
     date_value = str(row["date"]).replace("'", "''")
     time_value = str(row["time"]).replace("'", "''")
+    source_month = str(row["source_month"]).replace("'", "''")
+    prediction_month = str(row["prediction_month"]).replace("'", "''")
     schema_prefix = f"{schema}." if schema else ""
     return (
         "select distinct dc.* "
         f"from {schema_prefix}digital_cases dc "
         f"join {schema_prefix}{mapping_table} amcm on dc.apac_card_number = amcm.loan_number "
-        f"where amcm.\"mode\" = '{mode}' "
+        f"where amcm.mode = '{mode}' "
         f"and amcm.vertical = '{vertical}' "
-        f"and amcm.\"language\" = '{language}' "
+        f"and amcm.language = '{language}' "
         f"and amcm.risk = '{risk}' "
         f"and amcm.emi_cycle = {emi_cycle} "
-        f"and amcm.\"date\" = '{date_value}' "
-        f"and amcm.\"time\" = '{time_value}'"
+        f"and amcm.date = '{date_value}' "
+        f"and amcm.time = '{time_value}' "
+        f"and amcm.source_month = '{source_month}' "
+        f"and amcm.prediction_month = '{prediction_month}' "
+        "AND dc.apac_card_number NOT IN ( "
+        f"SELECT dnd.apac_card_number FROM {schema_prefix}dnd_digital_cases dnd"
+        " ) "
+        "AND dc.apac_card_number NOT IN ( "
+        "SELECT p.apac_card_number "
+        "FROM payment p "
+        "WHERE p.apac_card_number = dc.apac_card_number "
+        "AND p.status = 'SUCCESS' "
+        "AND p.payment_datetime::date BETWEEN ( "
+        "to_date(dc.emi_date, 'DD/MM/YYYY') - ( "
+        "SELECT value::integer FROM data_config WHERE key_name = 'payment_start_date_range' "
+        ") * interval '1 day' "
+        ") AND ( "
+        "to_date(dc.emi_date, 'DD/MM/YYYY') + ( "
+        "SELECT value::integer FROM data_config WHERE key_name = 'payment_end_date_range' "
+        ") * interval '1 day' "
+        ") "
+        ")"
     )
 
 

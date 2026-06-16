@@ -773,13 +773,15 @@ def test_build_prediction_reason_explains_no_history_blank_predictions() -> None
 
 def test_dataset_query_for_uses_mapping_table_filters() -> None:
     row = pd.Series({
-        "mode": "SMS",
+        "mode": "WHATSAPP",
         "vertical": "LAP",
-        "template_name": "POSTDUE_AIML_SMS_ENGLISH",
+        "template_name": "POSTDUE_AIML_WHATSAPP_TELUGU",
         "risk": "MR",
-        "emi_cycle": 5,
-        "date": "D+1",
-        "time": "16:00:00",
+        "emi_cycle": 15,
+        "date": "D-3",
+        "time": "09:00:00",
+        "source_month": "JUN-2026",
+        "prediction_month": "JUL-2026",
     })
 
     query = dataset_query_for(
@@ -793,13 +795,33 @@ def test_dataset_query_for_uses_mapping_table_filters() -> None:
         "select distinct dc.* "
         "from digital_collections.digital_cases dc "
         "join digital_collections.ai_ml_campaign_mapping amcm on dc.apac_card_number = amcm.loan_number "
-        "where amcm.\"mode\" = 'SMS' "
+        "where amcm.mode = 'WHATSAPP' "
         "and amcm.vertical = 'LAP' "
-        "and amcm.\"language\" = 'ENGLISH' "
+        "and amcm.language = 'TELUGU' "
         "and amcm.risk = 'MR' "
-        "and amcm.emi_cycle = 5 "
-        "and amcm.\"date\" = 'D+1' "
-        "and amcm.\"time\" = '16:00:00'"
+        "and amcm.emi_cycle = 15 "
+        "and amcm.date = 'D-3' "
+        "and amcm.time = '09:00:00' "
+        "and amcm.source_month = 'JUN-2026' "
+        "and amcm.prediction_month = 'JUL-2026' "
+        "AND dc.apac_card_number NOT IN ( "
+        "SELECT dnd.apac_card_number FROM digital_collections.dnd_digital_cases dnd"
+        " ) "
+        "AND dc.apac_card_number NOT IN ( "
+        "SELECT p.apac_card_number "
+        "FROM payment p "
+        "WHERE p.apac_card_number = dc.apac_card_number "
+        "AND p.status = 'SUCCESS' "
+        "AND p.payment_datetime::date BETWEEN ( "
+        "to_date(dc.emi_date, 'DD/MM/YYYY') - ( "
+        "SELECT value::integer FROM data_config WHERE key_name = 'payment_start_date_range' "
+        ") * interval '1 day' "
+        ") AND ( "
+        "to_date(dc.emi_date, 'DD/MM/YYYY') + ( "
+        "SELECT value::integer FROM data_config WHERE key_name = 'payment_end_date_range' "
+        ") * interval '1 day' "
+        ") "
+        ")"
     )
 
 
