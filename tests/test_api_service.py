@@ -249,6 +249,41 @@ def test_extract_metrics_snapshot_uses_validation_accuracy_and_gap() -> None:
     assert snapshot["driftPercentage"] == 7.0
 
 
+def test_summarize_subprocess_failure_adds_plain_language_reason() -> None:
+    exc = api_service_module.subprocess.CalledProcessError(
+        1,
+        ["run_inference_pipeline"],
+        output="",
+        stderr="OperationalError: connection failed",
+    )
+
+    message = api_service_module.summarize_subprocess_failure(exc, step_name="run_inference_pipeline")
+
+    assert message == (
+        "The system could not connect to the required database or source system. "
+        "Technical detail: run_inference_pipeline failed: OperationalError: connection failed"
+    )
+
+
+def test_subprocess_error_message_ignores_traceback_pointer_lines() -> None:
+    exc = api_service_module.subprocess.CalledProcessError(
+        1,
+        ["run_inference_pipeline"],
+        output="",
+        stderr=(
+            "Traceback (most recent call last):\n"
+            "  File \"x.py\", line 1, in <module>\n"
+            "    run_python_script(\n"
+            "    fetch_communication_extract(args, output_file, fetch_month, logger)\n"
+            "    result = subprocess.run(cmd, check=True, cwd=SCRIPTS_DIR.parent, env=env, capture_output=True, text=True)\n"
+            "OperationalError: connection failed\n"
+            "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^"
+        ),
+    )
+
+    assert api_service_module.subprocess_error_message(exc) == "OperationalError: connection failed"
+
+
 def test_auth_and_status_route() -> None:
     service = build_service()
     service.ai_config_repo.entries["TRN_STATUS_1"] = {

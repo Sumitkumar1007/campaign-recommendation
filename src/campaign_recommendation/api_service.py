@@ -240,6 +240,19 @@ def prediction_summary_path(predict_month: str) -> Path:
     return LOG_DIR / f"{predict_month.replace('-', '_').lower()}_prediction_summary.json"
 
 
+def _looks_like_traceback_context(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if stripped.startswith('File "') or stripped.startswith('raise ') or stripped.startswith('result = ') or stripped.startswith('cmd = '):
+        return True
+    if stripped.endswith('(') and '(' in stripped and ':' not in stripped:
+        return True
+    if stripped[0].isalpha() and '(' in stripped and stripped.endswith(')') and ':' not in stripped and ' ' not in stripped.split('(', 1)[0]:
+        return True
+    return False
+
+
 def subprocess_error_message(exc: subprocess.CalledProcessError) -> str:
     candidates = []
     if isinstance(exc.stderr, str) and exc.stderr.strip():
@@ -257,6 +270,9 @@ def subprocess_error_message(exc: subprocess.CalledProcessError) -> str:
         'Child script stderr empty |',
         'Logging initialized.',
         'raise CalledProcessError(',
+        'subprocess.run(',
+        'capture_output=True',
+        'run_python_script(',
     )
     preferred_markers = (
         'FATAL:',
@@ -281,7 +297,9 @@ def subprocess_error_message(exc: subprocess.CalledProcessError) -> str:
             line = line.rsplit(' | ', 1)[-1].strip()
         if not line:
             continue
-        if line.startswith('File "') or line.startswith('raise ') or line in {'^', '~^'}:
+        if _looks_like_traceback_context(line):
+            continue
+        if set(line) <= {'^', '~', ' '}:
             continue
         if any(fragment in line for fragment in ignored_fragments):
             continue
@@ -290,14 +308,37 @@ def subprocess_error_message(exc: subprocess.CalledProcessError) -> str:
     for line in reversed(cleaned_candidates):
         if any(marker in line for marker in preferred_markers):
             return line
-    if cleaned_candidates:
-        return cleaned_candidates[-1]
-    return str(exc)
+    for line in reversed(cleaned_candidates):
+        if not _looks_like_traceback_context(line):
+            return line
+    return "The request could not be processed due to an internal pipeline error."
+
+
+def _human_readable_failure_reason(*, step_name: str, detail: str) -> str:
+    lowered = detail.lower()
+    if "connection failed" in lowered or "does not exist" in lowered or "operationalerror:" in lowered:
+        return "The system could not connect to the required database or source system."
+    if "no rows matched" in lowered or "training data insufficient" in lowered:
+        return "Required source data was not available for the selected period."
+    if "permission denied" in lowered:
+        return "The system does not have permission to access a required file or location."
+    if "no such file or directory" in lowered or "not found" in lowered:
+        return "A required file, model, or configuration was not found."
+    if step_name == "export_recommendation_workbooks":
+        return "The recommendation export file could not be generated or uploaded."
+    if step_name == "prepare_training_window":
+        return "Training could not be started because the required input data could not be prepared."
+    if step_name == "train_model":
+        return "Model training could not be completed successfully."
+    if step_name == "run_inference_pipeline":
+        return "Inference could not be completed because the required data or model input could not be processed."
+    return "The request could not be completed due to an internal processing error."
 
 
 def summarize_subprocess_failure(exc: subprocess.CalledProcessError, *, step_name: str, limit: int = 500) -> str:
     detail = subprocess_error_message(exc)
-    summary = f"{step_name} failed: {detail}"
+    reason = _human_readable_failure_reason(step_name=step_name, detail=detail)
+    summary = f"{reason} Technical detail: {step_name} failed: {detail}"
     if len(summary) <= limit:
         return summary
     return summary[: limit - 3].rstrip() + "..."
@@ -617,19 +658,25 @@ class ApiAuditLogRepository:
                 CREATE TABLE IF NOT EXISTS {table_ref} (
                     id int8 GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
                     "type" varchar(50) NULL,
+                    request_url varchar(255) NULL,
                     reference_number varchar(100) NULL,
-                    request_url text NULL,
+                    message text NULL,
+                    status varchar(20) NULL,
                     request_body text NULL,
                     response_body text NULL,
-                    status varchar(20) NULL,
-                    success_count int8 NULL,
-                    failure_count int8 NULL,
-                    total_processed int8 NULL,
-                    processing_time_ms varchar(255) NULL,
                     created_by varchar(50) NULL,
                     created_on timestamp NULL,
                     modified_by varchar(50) NULL,
-                    modified_on timestamp NULL
+                    modified_on timestamp NULL,
+                    delete_flag varchar(5) NULL,
+                    channel varchar(50) NULL,
+                    tenant_id varchar(100) NULL,
+                    module_name varchar(100) NULL,
+                    client_name varchar(100) NULL,
+                    total_records varchar(255) NULL,
+                    success_count varchar(255) NULL,
+                    failure_count varchar(255) NULL,
+                    processing_time_ms varchar(255) NULL
                 )
                 """
             ).format(table_ref=qualified_identifier(self.config.target_schema, self.config.api_audit_table))
@@ -644,9 +691,10 @@ class ApiAuditLogRepository:
         request_body: str,
         response_body: str,
         status: str,
+        message: str | None = None,
         success_count: int | None = None,
         failure_count: int | None = None,
-        total_processed: int | None = None,
+        total_records: int | None = None,
         processing_time_ms: int | None = None,
     ) -> None:
         with self.connect() as conn:
@@ -656,28 +704,35 @@ class ApiAuditLogRepository:
                 sql.SQL(
                     """
                     INSERT INTO {table_ref} (
-                        "type", reference_number, request_url, request_body, response_body,
-                        status, success_count, failure_count, total_processed, processing_time_ms,
-                        created_by, created_on, modified_by, modified_on
+                        "type", reference_number, request_url, message, status, request_body, response_body,
+                        created_by, created_on, modified_by, modified_on,
+                        delete_flag, channel, tenant_id, module_name, client_name,
+                        total_records, success_count, failure_count, processing_time_ms
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """
                 ).format(table_ref=qualified_identifier(self.config.target_schema, self.config.api_audit_table)),
                 (
                     entry_type,
                     reference_number,
                     request_url,
+                    message,
+                    status,
                     request_body,
                     response_body,
-                    status,
-                    success_count,
-                    failure_count,
-                    total_processed,
+                    "AIML",
+                    now,
+                    "AIML",
+                    now,
+                    "N",
+                    "API",
+                    "DIGITAL",
+                    "AIML",
+                    "DIGITAL",
+                    str(total_records) if total_records is not None else None,
+                    str(success_count) if success_count is not None else None,
+                    str(failure_count) if failure_count is not None else None,
                     str(processing_time_ms) if processing_time_ms is not None else None,
-                    "AIML",
-                    now,
-                    "AIML",
-                    now,
                 ),
             )
             conn.commit()
@@ -690,9 +745,10 @@ class ApiAuditLogRepository:
         request_url: str,
         response_body: str,
         status: str,
+        message: str | None = None,
         success_count: int | None = None,
         failure_count: int | None = None,
-        total_processed: int | None = None,
+        total_records: int | None = None,
         processing_time_ms: int | None = None,
     ) -> None:
         with self.connect() as conn:
@@ -701,11 +757,12 @@ class ApiAuditLogRepository:
                 sql.SQL(
                     """
                     UPDATE {table_ref}
-                    SET response_body = %s,
+                    SET message = %s,
+                        response_body = %s,
                         status = %s,
                         success_count = %s,
                         failure_count = %s,
-                        total_processed = %s,
+                        total_records = %s,
                         processing_time_ms = %s,
                         modified_by = %s,
                         modified_on = %s
@@ -721,11 +778,12 @@ class ApiAuditLogRepository:
                     """
                 ).format(table_ref=qualified_identifier(self.config.target_schema, self.config.api_audit_table)),
                 (
+                    message,
                     response_body,
                     status,
-                    success_count,
-                    failure_count,
-                    total_processed,
+                    str(success_count) if success_count is not None else None,
+                    str(failure_count) if failure_count is not None else None,
+                    str(total_records) if total_records is not None else None,
                     str(processing_time_ms) if processing_time_ms is not None else None,
                     "AIML",
                     utcnow_naive(),
@@ -982,6 +1040,7 @@ class AIMLApiService:
             request_body=json_dumps_compact(request_body),
             response_body=json_dumps_compact(accepted),
             status="ACCEPTED",
+            message="Request accepted for processing.",
         )
         self.job_runner.submit(
             transaction_id,
@@ -1034,6 +1093,7 @@ class AIMLApiService:
             request_body=json_dumps_compact(request_body),
             response_body=json_dumps_compact(accepted),
             status="ACCEPTED",
+            message="Request accepted for processing.",
         )
         self.job_runner.submit(
             transaction_id,
@@ -1136,9 +1196,10 @@ class AIMLApiService:
                     "driftPercentage": snapshot.get("driftPercentage"),
                 }),
                 status="COMPLETED",
+                message="Processing completed.",
                 success_count=1,
                 failure_count=0,
-                total_processed=1,
+                total_records=1,
                 processing_time_ms=duration_ms,
             )
         except Exception as exc:  # noqa: BLE001
@@ -1171,9 +1232,10 @@ class AIMLApiService:
                     "modelVersion": current_model_version,
                 }),
                 status="FAILED",
+                message=error_message,
                 success_count=0,
                 failure_count=1,
-                total_processed=1,
+                total_records=1,
                 processing_time_ms=duration_ms,
             )
 
@@ -1270,9 +1332,10 @@ class AIMLApiService:
                 request_url=request_url,
                 response_body=json_dumps_compact(response_body),
                 status="COMPLETED",
+                message="Metrics generated successfully",
                 success_count=success_count,
                 failure_count=failure_count,
-                total_processed=total_processed,
+                total_records=total_processed,
                 processing_time_ms=duration_ms,
             )
         except Exception as exc:  # noqa: BLE001
@@ -1305,9 +1368,10 @@ class AIMLApiService:
                     "modelVersion": model_version,
                 }),
                 status="FAILED",
+                message=error_message,
                 success_count=0,
                 failure_count=1,
-                total_processed=1,
+                total_records=1,
                 processing_time_ms=duration_ms,
             )
 
