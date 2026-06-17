@@ -315,6 +315,21 @@ def test_auth_and_status_route() -> None:
     assert payload["currentDrift"] == 4.8
 
 
+def test_unknown_api_path_returns_not_found_before_auth() -> None:
+    service = build_service()
+    app = AIMLApiApp(service)
+
+    status, payload = invoke(
+        app,
+        method="POST",
+        path="/api/v1/authh",
+        body={"username": "aiml", "password": "aiml"},
+    )
+
+    assert status.startswith("404")
+    assert payload == {"message": "Not found."}
+
+
 def test_training_route_creates_audit_and_submits_job() -> None:
     service = build_service()
     app = AIMLApiApp(service)

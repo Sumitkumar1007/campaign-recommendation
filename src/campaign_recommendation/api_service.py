@@ -1510,11 +1510,20 @@ class AIMLApiApp:
         method = environ.get("REQUEST_METHOD", "GET").upper()
         path = environ.get("PATH_INFO", "")
         try:
-            if path == "/api/health" and method == "GET":
+            known_paths = {"/api/health", "/api/status", "/api/v1/auth", "/api/v1/training", "/api/v1/inference"}
+            is_transaction_path = path.startswith("/api/v1/transactions/")
+            if path not in known_paths and not is_transaction_path:
+                return json_response(start_response, HTTPStatus.NOT_FOUND, {"message": "Not found."})
+
+            if path == "/api/health":
+                if method != "GET":
+                    return json_response(start_response, HTTPStatus.METHOD_NOT_ALLOWED, {"message": "Method not allowed."})
                 status_code, payload = self.service.health()
                 return json_response(start_response, status_code, payload)
 
-            if path == "/api/v1/auth" and method == "POST":
+            if path == "/api/v1/auth":
+                if method != "POST":
+                    return json_response(start_response, HTTPStatus.METHOD_NOT_ALLOWED, {"message": "Method not allowed."})
                 status_code, payload = self.service.issue_auth_token(read_json_body(environ))
                 return json_response(start_response, status_code, payload)
 
@@ -1522,25 +1531,31 @@ class AIMLApiApp:
             if auth_error is not None:
                 return json_response(start_response, HTTPStatus.UNAUTHORIZED, auth_error)
 
-            if path == "/api/status" and method == "GET":
+            if path == "/api/status":
+                if method != "GET":
+                    return json_response(start_response, HTTPStatus.METHOD_NOT_ALLOWED, {"message": "Method not allowed."})
                 status_code, payload = self.service.model_status()
                 return json_response(start_response, status_code, payload)
 
-            if path.startswith("/api/v1/transactions/") and method == "GET":
+            if is_transaction_path:
+                if method != "GET":
+                    return json_response(start_response, HTTPStatus.METHOD_NOT_ALLOWED, {"message": "Method not allowed."})
                 reference_number = path.removeprefix("/api/v1/transactions/").strip()
                 status_code, payload = self.service.get_transaction_status(reference_number)
                 return json_response(start_response, status_code, payload)
 
-            if path == "/api/v1/training" and method == "POST":
+            if path == "/api/v1/training":
+                if method != "POST":
+                    return json_response(start_response, HTTPStatus.METHOD_NOT_ALLOWED, {"message": "Method not allowed."})
                 status_code, payload = self.service.trigger_training(read_json_body(environ), request_url=path)
                 return json_response(start_response, status_code, payload)
 
-            if path == "/api/v1/inference" and method == "POST":
+            if path == "/api/v1/inference":
+                if method != "POST":
+                    return json_response(start_response, HTTPStatus.METHOD_NOT_ALLOWED, {"message": "Method not allowed."})
                 status_code, payload = self.service.trigger_inference(read_json_body(environ), request_url=path)
                 return json_response(start_response, status_code, payload)
 
-            if path in {"/api/health", "/api/status", "/api/v1/auth", "/api/v1/training", "/api/v1/inference"} or path.startswith("/api/v1/transactions/"):
-                return json_response(start_response, HTTPStatus.METHOD_NOT_ALLOWED, {"message": "Method not allowed."})
             return json_response(start_response, HTTPStatus.NOT_FOUND, {"message": "Not found."})
         except PermissionError as exc:
             return json_response(start_response, HTTPStatus.UNAUTHORIZED, {"message": str(exc)})
