@@ -12,6 +12,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from zoneinfo import ZoneInfo
 from http import HTTPStatus
 from pathlib import Path
 from typing import Any, Callable
@@ -34,6 +35,7 @@ DEFAULT_SFTP_EXPORT_PATH = REPO_ROOT / "artifacts" / "exports" / "sftp"
 AI_CONFIG_UPDATE_INITIAL_DELAY_SECONDS = float(os.getenv("AI_CONFIG_UPDATE_INITIAL_DELAY_SECONDS", "5"))
 AI_CONFIG_UPDATE_WAIT_TIMEOUT_SECONDS = float(os.getenv("AI_CONFIG_UPDATE_WAIT_TIMEOUT_SECONDS", "60"))
 AI_CONFIG_UPDATE_WAIT_INTERVAL_SECONDS = float(os.getenv("AI_CONFIG_UPDATE_WAIT_INTERVAL_SECONDS", "1"))
+API_TIMEZONE = ZoneInfo("Asia/Kolkata")
 
 
 def load_dotenv(path: Path | None = None) -> None:
@@ -110,7 +112,7 @@ class ApiConfig:
 
 
 def utcnow_naive() -> datetime:
-    return datetime.now(UTC).replace(tzinfo=None)
+    return datetime.now(API_TIMEZONE).replace(tzinfo=None)
 
 
 def qualified_identifier(schema: str, table: str) -> sql.Composed:
@@ -527,7 +529,7 @@ class AIConfigurationRepository:
                         model_version = %s,
                         accuracy = %s,
                         drift = %s,
-                        processing_time_ms = %s,
+                        processing_time_ms = COALESCE(%s, processing_time_ms),
                         training_window = COALESCE(%s, training_window),
                         modified_by = %s,
                         modified_on = %s
@@ -763,7 +765,7 @@ class ApiAuditLogRepository:
                         success_count = %s,
                         failure_count = %s,
                         total_records = %s,
-                        processing_time_ms = %s,
+                        processing_time_ms = COALESCE(%s, processing_time_ms),
                         modified_by = %s,
                         modified_on = %s
                     WHERE id = (
@@ -771,7 +773,6 @@ class ApiAuditLogRepository:
                         FROM {table_ref}
                         WHERE "type" = %s
                           AND reference_number = %s
-                          AND request_url = %s
                         ORDER BY COALESCE(modified_on, created_on) DESC, id DESC
                         LIMIT 1
                     )
@@ -789,7 +790,6 @@ class ApiAuditLogRepository:
                     utcnow_naive(),
                     entry_type,
                     reference_number,
-                    request_url,
                 ),
             )
             conn.commit()
@@ -1202,7 +1202,6 @@ class AIMLApiService:
                 model_version=target_model_version,
                 accuracy=snapshot.get("currentAccuracy"),
                 drift=snapshot.get("driftPercentage"),
-                processing_time_ms=duration_ms,
                 entry_type="TRAINING",
                 training_window=str(months),
             )
@@ -1224,7 +1223,6 @@ class AIMLApiService:
                 success_count=1,
                 failure_count=0,
                 total_records=1,
-                processing_time_ms=duration_ms,
             )
         except Exception as exc:  # noqa: BLE001
             self.logger.exception("Training job failed | transaction_id=%s", transaction_id)
@@ -1240,7 +1238,6 @@ class AIMLApiService:
                 status="FAILED",
                 message=error_message,
                 model_version=current_model_version,
-                processing_time_ms=duration_ms,
                 entry_type="TRAINING",
                 training_window=str(months),
             )
@@ -1260,7 +1257,6 @@ class AIMLApiService:
                 success_count=0,
                 failure_count=1,
                 total_records=1,
-                processing_time_ms=duration_ms,
             )
 
     def _run_inference_job(self, *, transaction_id: str, payload: dict[str, Any]) -> None:
@@ -1345,7 +1341,6 @@ class AIMLApiService:
                 model_version=model_version,
                 accuracy=response_body.get("currentAccuracy"),
                 drift=response_body.get("driftPercentage"),
-                processing_time_ms=duration_ms,
                 entry_type="INFERENCE",
                 training_window="10 days",
             )
@@ -1360,7 +1355,6 @@ class AIMLApiService:
                 success_count=success_count,
                 failure_count=failure_count,
                 total_records=total_processed,
-                processing_time_ms=duration_ms,
             )
         except Exception as exc:  # noqa: BLE001
             self.logger.exception("Inference job failed | transaction_id=%s", transaction_id)
@@ -1376,7 +1370,6 @@ class AIMLApiService:
                 status="FAILED",
                 message=error_message,
                 model_version=model_version,
-                processing_time_ms=duration_ms,
                 entry_type="INFERENCE",
                 training_window="10 days",
             )
@@ -1396,7 +1389,6 @@ class AIMLApiService:
                 success_count=0,
                 failure_count=1,
                 total_records=1,
-                processing_time_ms=duration_ms,
             )
 
     def _build_prepare_training_command(self, *, months: int) -> list[str]:

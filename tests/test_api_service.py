@@ -556,6 +556,8 @@ def test_run_inference_job_completes_when_summary_reader_is_available(monkeypatc
     assert service.api_audit_repo.updated[-1]["request_url"] == "/api/v1/inference"
     assert service.api_audit_repo.updated[-1]["status"] == "COMPLETED"
     assert service.api_audit_repo.updated[-1]["success_count"] == 0
+    assert "processing_time_ms" not in service.ai_config_repo.updated[-1]
+    assert "processing_time_ms" not in service.api_audit_repo.updated[-1]
 
 
 def test_inference_export_command_enabled() -> None:
@@ -670,6 +672,8 @@ def test_failed_training_keeps_current_model_version(monkeypatch: pytest.MonkeyP
     assert service.api_audit_repo.updated[-1]["reference_number"] == "TRN_FAIL"
     assert service.api_audit_repo.updated[-1]["request_url"] == "/api/v1/training"
     assert service.api_audit_repo.updated[-1]["status"] == "FAILED"
+    assert "processing_time_ms" not in service.ai_config_repo.updated[-1]
+    assert "processing_time_ms" not in service.api_audit_repo.updated[-1]
 
 
 def test_training_rejects_months_when_data_config_duration_differs(monkeypatch: pytest.MonkeyPatch) -> None:
