@@ -73,6 +73,18 @@ class DummyAIConfigRepo:
         return candidates[-1]
 
 
+class DummyApiAuditRepo:
+    def __init__(self) -> None:
+        self.created: list[dict] = []
+        self.updated: list[dict] = []
+
+    def create_entry(self, **kwargs) -> None:
+        self.created.append(kwargs)
+
+    def update_latest_entry(self, **kwargs) -> None:
+        self.updated.append(kwargs)
+
+
 class CapturingService(AIMLApiService):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -126,12 +138,14 @@ def build_config(*, export_after_inference: bool = False, export_write: bool = F
         export_write=export_write,
         log_file=REPO_ROOT / "artifacts" / "logs" / "test_aiml_api.log",
         api_model_base_version="v1.1.0",
+        api_audit_table="api_audit_log",
     )
 
 
 def build_service(*, export_after_inference: bool = False, export_write: bool = False) -> AIMLApiService:
     config = build_config(export_after_inference=export_after_inference, export_write=export_write)
     ai_config_repo = DummyAIConfigRepo()
+    api_audit_repo = DummyApiAuditRepo()
     ai_config_repo.entries["TRN1"] = {"transaction_id": "TRN1"}
     ai_config_repo.entries["TRNLOOKUP"] = {"transaction_id": "TRNLOOKUP"}
     ai_config_repo.entries["TRN_FIX"] = {"transaction_id": "TRN_FIX"}
@@ -143,6 +157,7 @@ def build_service(*, export_after_inference: bool = False, export_write: bool = 
         job_runner=DummyJobRunner(),
         logger=logging.getLogger("test_aiml_api"),
         ai_config_repo=ai_config_repo,
+        api_audit_repo=api_audit_repo,
     )
 
 
@@ -212,6 +227,7 @@ def live_db_config() -> ApiConfig | None:
         export_write=False,
         log_file=REPO_ROOT / "artifacts" / "logs" / "test_aiml_api_live.log",
         api_model_base_version="v1.1.0",
+        api_audit_table="api_audit_log",
     )
 
 
@@ -281,6 +297,9 @@ def test_training_route_creates_audit_and_submits_job() -> None:
     assert payload["status"] == "ACCEPTED"
     assert payload["modelVersion"] == "v1.1.1"
     assert service.ai_config_repo.updated == []
+    assert service.api_audit_repo.created[0]["reference_number"] == "TRN1"
+    assert service.api_audit_repo.created[0]["request_url"] == "/api/v1/training"
+    assert service.api_audit_repo.created[0]["status"] == "ACCEPTED"
     assert service.job_runner.submitted == ["TRN1"]
 
 
@@ -316,6 +335,7 @@ def test_training_accepts_request_before_ai_configuration_row_exists() -> None:
         job_runner=runner,
         logger=logging.getLogger("test_aiml_api"),
         ai_config_repo=DummyAIConfigRepo(),
+        api_audit_repo=DummyApiAuditRepo(),
     )
     app = AIMLApiApp(service)
     token = service.auth_manager.issue_token("aiml")["access_token"]
@@ -360,6 +380,7 @@ def test_inference_accepts_request_before_ai_configuration_row_exists() -> None:
         job_runner=runner,
         logger=logging.getLogger("test_aiml_api"),
         ai_config_repo=DummyAIConfigRepo(),
+        api_audit_repo=DummyApiAuditRepo(),
     )
     app = AIMLApiApp(service)
     token = service.auth_manager.issue_token("aiml")["access_token"]
@@ -421,6 +442,7 @@ def test_inference_command_uses_pipeline_without_audit_flag() -> None:
         job_runner=runner,
         logger=logging.getLogger("test_aiml_api"),
         ai_config_repo=DummyAIConfigRepo(),
+        api_audit_repo=DummyApiAuditRepo(),
     )
     service.ai_config_repo.entries["TRN_SKIP_AUDIT"] = {"transaction_id": "TRN_SKIP_AUDIT"}
     app = AIMLApiApp(service)
@@ -453,6 +475,7 @@ def test_run_inference_job_completes_when_summary_reader_is_available(monkeypatc
         job_runner=DummyJobRunner(),
         logger=logging.getLogger("test_aiml_api"),
         ai_config_repo=DummyAIConfigRepo(),
+        api_audit_repo=DummyApiAuditRepo(),
     )
     service.ai_config_repo.entries["TRN_FIX"] = {"transaction_id": "TRN_FIX"}
     service.ai_config_repo.entries["TRN_MODEL"] = {
@@ -479,6 +502,10 @@ def test_run_inference_job_completes_when_summary_reader_is_available(monkeypatc
     assert service.ai_config_repo.updated[-1]["drift"] == 4.8
     assert service.ai_config_repo.updated[-1]["training_window"] == "10 days"
     assert service.ai_config_repo.updated[-1]["model_version"] == "v1.1.3"
+    assert service.api_audit_repo.updated[-1]["reference_number"] == "TRN_FIX"
+    assert service.api_audit_repo.updated[-1]["request_url"] == "/api/v1/inference"
+    assert service.api_audit_repo.updated[-1]["status"] == "COMPLETED"
+    assert service.api_audit_repo.updated[-1]["success_count"] == 0
 
 
 def test_inference_export_command_enabled() -> None:
@@ -490,6 +517,7 @@ def test_inference_export_command_enabled() -> None:
         job_runner=runner,
         logger=logging.getLogger("test_aiml_api"),
         ai_config_repo=DummyAIConfigRepo(),
+        api_audit_repo=DummyApiAuditRepo(),
     )
     service.ai_config_repo.entries["TRN3"] = {"transaction_id": "TRN3"}
     app = AIMLApiApp(service)
@@ -554,6 +582,7 @@ def test_failed_training_keeps_current_model_version(monkeypatch: pytest.MonkeyP
         job_runner=DummyJobRunner(),
         logger=logging.getLogger("test_aiml_api"),
         ai_config_repo=DummyAIConfigRepo(),
+        api_audit_repo=DummyApiAuditRepo(),
     )
     service.ai_config_repo.entries["TRN_FAIL"] = {"transaction_id": "TRN_FAIL"}
     service.ai_config_repo.entries["TRN_MODEL"] = {
@@ -588,6 +617,9 @@ def test_failed_training_keeps_current_model_version(monkeypatch: pytest.MonkeyP
     assert service.ai_config_repo.updated[0]["model_version"] == "v1.1.0"
     assert service.ai_config_repo.updated[-1]["status"] == "FAILED"
     assert service.ai_config_repo.updated[-1]["model_version"] == "v1.1.0"
+    assert service.api_audit_repo.updated[-1]["reference_number"] == "TRN_FAIL"
+    assert service.api_audit_repo.updated[-1]["request_url"] == "/api/v1/training"
+    assert service.api_audit_repo.updated[-1]["status"] == "FAILED"
 
 
 def test_training_missing_months_returns_failed_payload() -> None:

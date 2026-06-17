@@ -74,6 +74,7 @@ class ApiConfig:
     export_write: bool
     log_file: Path
     ai_config_table: str = "ai_configurations"
+    api_audit_table: str = "api_audit_log"
     api_model_base_version: str = "v1.1.0"
     sftp_export_path: Path = DEFAULT_SFTP_EXPORT_PATH
 
@@ -102,6 +103,7 @@ class ApiConfig:
             export_write=os.getenv("API_EXPORT_WRITE", "false").strip().lower() == "true",
             log_file=Path(os.getenv("API_LOG_FILE", str(LOG_DIR / "aiml_api.log"))),
             ai_config_table=os.getenv("AI_CONFIG_TABLE", "ai_configurations"),
+            api_audit_table=os.getenv("API_AUDIT_TABLE", "api_audit_log"),
             api_model_base_version=os.getenv("API_MODEL_BASE_VERSION", "v1.1.0"),
             sftp_export_path=Path(os.getenv("SFTP_EXPORT_PATH", str(DEFAULT_SFTP_EXPORT_PATH))),
         )
@@ -366,6 +368,10 @@ def read_prediction_summary(predict_month: str) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def json_dumps_compact(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+
+
 class AuthManager:
     def __init__(self, username: str, password: str, secret: str, ttl_seconds: int):
         self.username = username
@@ -590,6 +596,155 @@ class NoopAIConfigurationRepository:
         return None
 
 
+class ApiAuditLogRepository:
+    def __init__(self, config: ApiConfig):
+        self.config = config
+
+    def connect(self) -> psycopg.Connection:
+        return psycopg.connect(
+            host=self.config.db_host,
+            port=self.config.db_port,
+            dbname=self.config.db_name,
+            user=self.config.db_user,
+            password=self.config.db_password,
+            autocommit=False,
+        )
+
+    def ensure_table(self, conn: psycopg.Connection) -> None:
+        conn.execute(
+            sql.SQL(
+                """
+                CREATE TABLE IF NOT EXISTS {table_ref} (
+                    id int8 GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                    "type" varchar(50) NULL,
+                    reference_number varchar(100) NULL,
+                    request_url text NULL,
+                    request_body text NULL,
+                    response_body text NULL,
+                    status varchar(20) NULL,
+                    success_count int8 NULL,
+                    failure_count int8 NULL,
+                    total_processed int8 NULL,
+                    processing_time_ms varchar(255) NULL,
+                    created_by varchar(50) NULL,
+                    created_on timestamp NULL,
+                    modified_by varchar(50) NULL,
+                    modified_on timestamp NULL
+                )
+                """
+            ).format(table_ref=qualified_identifier(self.config.target_schema, self.config.api_audit_table))
+        )
+
+    def create_entry(
+        self,
+        *,
+        entry_type: str,
+        reference_number: str,
+        request_url: str,
+        request_body: str,
+        response_body: str,
+        status: str,
+        success_count: int | None = None,
+        failure_count: int | None = None,
+        total_processed: int | None = None,
+        processing_time_ms: int | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            self.ensure_table(conn)
+            now = utcnow_naive()
+            conn.execute(
+                sql.SQL(
+                    """
+                    INSERT INTO {table_ref} (
+                        "type", reference_number, request_url, request_body, response_body,
+                        status, success_count, failure_count, total_processed, processing_time_ms,
+                        created_by, created_on, modified_by, modified_on
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """
+                ).format(table_ref=qualified_identifier(self.config.target_schema, self.config.api_audit_table)),
+                (
+                    entry_type,
+                    reference_number,
+                    request_url,
+                    request_body,
+                    response_body,
+                    status,
+                    success_count,
+                    failure_count,
+                    total_processed,
+                    str(processing_time_ms) if processing_time_ms is not None else None,
+                    "AIML",
+                    now,
+                    "AIML",
+                    now,
+                ),
+            )
+            conn.commit()
+
+    def update_latest_entry(
+        self,
+        *,
+        entry_type: str,
+        reference_number: str,
+        request_url: str,
+        response_body: str,
+        status: str,
+        success_count: int | None = None,
+        failure_count: int | None = None,
+        total_processed: int | None = None,
+        processing_time_ms: int | None = None,
+    ) -> None:
+        with self.connect() as conn:
+            self.ensure_table(conn)
+            conn.execute(
+                sql.SQL(
+                    """
+                    UPDATE {table_ref}
+                    SET response_body = %s,
+                        status = %s,
+                        success_count = %s,
+                        failure_count = %s,
+                        total_processed = %s,
+                        processing_time_ms = %s,
+                        modified_by = %s,
+                        modified_on = %s
+                    WHERE id = (
+                        SELECT id
+                        FROM {table_ref}
+                        WHERE "type" = %s
+                          AND reference_number = %s
+                          AND request_url = %s
+                        ORDER BY COALESCE(modified_on, created_on) DESC, id DESC
+                        LIMIT 1
+                    )
+                    """
+                ).format(table_ref=qualified_identifier(self.config.target_schema, self.config.api_audit_table)),
+                (
+                    response_body,
+                    status,
+                    success_count,
+                    failure_count,
+                    total_processed,
+                    str(processing_time_ms) if processing_time_ms is not None else None,
+                    "AIML",
+                    utcnow_naive(),
+                    entry_type,
+                    reference_number,
+                    request_url,
+                ),
+            )
+            conn.commit()
+
+
+class NoopApiAuditLogRepository:
+    def create_entry(self, **kwargs) -> None:
+        return None
+
+    def update_latest_entry(self, **kwargs) -> None:
+        return None
+
+
 class BackgroundJobRunner:
     def __init__(self) -> None:
         self._threads: dict[str, threading.Thread] = {}
@@ -635,12 +790,14 @@ class AIMLApiService:
         job_runner: BackgroundJobRunner,
         logger: logging.Logger,
         ai_config_repo: AIConfigurationRepository | NoopAIConfigurationRepository | None = None,
+        api_audit_repo: ApiAuditLogRepository | NoopApiAuditLogRepository | None = None,
     ) -> None:
         self.config = config
         self.auth_manager = auth_manager
         self.job_runner = job_runner
         self.logger = logger
         self.ai_config_repo = ai_config_repo or NoopAIConfigurationRepository()
+        self.api_audit_repo = api_audit_repo or NoopApiAuditLogRepository()
 
     def health(self) -> tuple[int, dict[str, Any]]:
         db_status = "not-configured"
@@ -774,6 +931,18 @@ class AIMLApiService:
                 log_context,
             )
 
+    def _safe_create_api_audit_entry(self, *, log_context: str, **kwargs: Any) -> None:
+        try:
+            self.api_audit_repo.create_entry(**kwargs)
+        except Exception:
+            self.logger.exception("Failed to create api_audit_log row | context=%s", log_context)
+
+    def _safe_update_api_audit_entry(self, *, log_context: str, **kwargs: Any) -> None:
+        try:
+            self.api_audit_repo.update_latest_entry(**kwargs)
+        except Exception:
+            self.logger.exception("Failed to update api_audit_log row | context=%s", log_context)
+
     def trigger_training(self, payload: dict[str, Any], request_url: str) -> tuple[int, dict[str, Any]]:
         transaction_id = str(payload.get("transactionId", "")).strip()
         try:
@@ -805,6 +974,15 @@ class AIMLApiService:
             "currentModelVersion": current_model_version,
             "modelVersion": next_model_version,
         }
+        self._safe_create_api_audit_entry(
+            log_context="training_accepted",
+            entry_type="TRAINING",
+            reference_number=transaction_id,
+            request_url=request_url,
+            request_body=json_dumps_compact(request_body),
+            response_body=json_dumps_compact(accepted),
+            status="ACCEPTED",
+        )
         self.job_runner.submit(
             transaction_id,
             lambda: self._run_training_job(transaction_id=transaction_id, payload=request_body),
@@ -848,6 +1026,15 @@ class AIMLApiService:
             "predictMonth": predict_month,
             "model": model_name,
         }
+        self._safe_create_api_audit_entry(
+            log_context="inference_accepted",
+            entry_type="INFERENCE",
+            reference_number=transaction_id,
+            request_url=request_url,
+            request_body=json_dumps_compact(request_body),
+            response_body=json_dumps_compact(accepted),
+            status="ACCEPTED",
+        )
         self.job_runner.submit(
             transaction_id,
             lambda: self._run_inference_job(transaction_id=transaction_id, payload=request_body),
@@ -856,6 +1043,7 @@ class AIMLApiService:
 
     def _run_training_job(self, *, transaction_id: str, payload: dict[str, Any]) -> None:
         started_at = time.perf_counter()
+        request_url = "/api/v1/training"
         model_name = str(payload["model"])
         months = int(payload["months"])
         current_model_version = str(payload.get("currentModelVersion") or self.current_model_version())
@@ -921,6 +1109,7 @@ class AIMLApiService:
                 metrics_file,
                 model_file,
             )
+            duration_ms = int((time.perf_counter() - started_at) * 1000)
             self._safe_update_ai_configuration_entry(
                 log_context="training_completed",
                 transaction_id=transaction_id,
@@ -929,9 +1118,28 @@ class AIMLApiService:
                 model_version=target_model_version,
                 accuracy=snapshot.get("currentAccuracy"),
                 drift=snapshot.get("driftPercentage"),
-                processing_time_ms=int((time.perf_counter() - started_at) * 1000),
+                processing_time_ms=duration_ms,
                 entry_type="TRAINING",
                 training_window=str(months),
+            )
+            self._safe_update_api_audit_entry(
+                log_context="training_completed",
+                entry_type="TRAINING",
+                reference_number=transaction_id,
+                request_url=request_url,
+                response_body=json_dumps_compact({
+                    "transactionId": transaction_id,
+                    "status": "COMPLETED",
+                    "message": "Processing completed.",
+                    "modelVersion": target_model_version,
+                    "currentAccuracy": snapshot.get("currentAccuracy"),
+                    "driftPercentage": snapshot.get("driftPercentage"),
+                }),
+                status="COMPLETED",
+                success_count=1,
+                failure_count=0,
+                total_processed=1,
+                processing_time_ms=duration_ms,
             )
         except Exception as exc:  # noqa: BLE001
             self.logger.exception("Training job failed | transaction_id=%s", transaction_id)
@@ -940,19 +1148,38 @@ class AIMLApiService:
                 error_message = summarize_subprocess_failure(exc, step_name=failed_step)
             else:
                 error_message = str(exc)
+            duration_ms = int((time.perf_counter() - started_at) * 1000)
             self._safe_update_ai_configuration_entry(
                 log_context="training_failed",
                 transaction_id=transaction_id,
                 status="FAILED",
                 message=error_message,
                 model_version=current_model_version,
-                processing_time_ms=int((time.perf_counter() - started_at) * 1000),
+                processing_time_ms=duration_ms,
                 entry_type="TRAINING",
                 training_window=str(months),
+            )
+            self._safe_update_api_audit_entry(
+                log_context="training_failed",
+                entry_type="TRAINING",
+                reference_number=transaction_id,
+                request_url=request_url,
+                response_body=json_dumps_compact({
+                    "transactionId": transaction_id,
+                    "status": "FAILED",
+                    "message": error_message,
+                    "modelVersion": current_model_version,
+                }),
+                status="FAILED",
+                success_count=0,
+                failure_count=1,
+                total_processed=1,
+                processing_time_ms=duration_ms,
             )
 
     def _run_inference_job(self, *, transaction_id: str, payload: dict[str, Any]) -> None:
         started_at = time.perf_counter()
+        request_url = "/api/v1/inference"
         source_month = str(payload["sourceMonth"])
         predict_month = str(payload["predictMonth"])
         model_name = str(payload["model"])
@@ -1020,6 +1247,10 @@ class AIMLApiService:
                 "schedulerExportWrite": self.config.export_write if self.config.export_after_inference else None,
                 "schedulerExportTriggerState": self.config.export_trigger_state if self.config.export_after_inference else None,
             }
+            total_processed = int(summary.get("prediction_rows") or 0)
+            success_count = int(summary.get("mapping_rows") or summary.get("campaign_rows") or total_processed)
+            failure_count = max(total_processed - success_count, 0)
+            duration_ms = int((time.perf_counter() - started_at) * 1000)
             self._safe_update_ai_configuration_entry(
                 log_context="inference_completed",
                 transaction_id=transaction_id,
@@ -1028,9 +1259,21 @@ class AIMLApiService:
                 model_version=model_version,
                 accuracy=response_body.get("currentAccuracy"),
                 drift=response_body.get("driftPercentage"),
-                processing_time_ms=int((time.perf_counter() - started_at) * 1000),
+                processing_time_ms=duration_ms,
                 entry_type="INFERENCE",
                 training_window="10 days",
+            )
+            self._safe_update_api_audit_entry(
+                log_context="inference_completed",
+                entry_type="INFERENCE",
+                reference_number=transaction_id,
+                request_url=request_url,
+                response_body=json_dumps_compact(response_body),
+                status="COMPLETED",
+                success_count=success_count,
+                failure_count=failure_count,
+                total_processed=total_processed,
+                processing_time_ms=duration_ms,
             )
         except Exception as exc:  # noqa: BLE001
             self.logger.exception("Inference job failed | transaction_id=%s", transaction_id)
@@ -1039,15 +1282,33 @@ class AIMLApiService:
                 error_message = summarize_subprocess_failure(exc, step_name=failed_step)
             else:
                 error_message = str(exc)
+            duration_ms = int((time.perf_counter() - started_at) * 1000)
             self._safe_update_ai_configuration_entry(
                 log_context="inference_failed",
                 transaction_id=transaction_id,
                 status="FAILED",
                 message=error_message,
                 model_version=model_version,
-                processing_time_ms=int((time.perf_counter() - started_at) * 1000),
+                processing_time_ms=duration_ms,
                 entry_type="INFERENCE",
                 training_window="10 days",
+            )
+            self._safe_update_api_audit_entry(
+                log_context="inference_failed",
+                entry_type="INFERENCE",
+                reference_number=transaction_id,
+                request_url=request_url,
+                response_body=json_dumps_compact({
+                    "transactionId": transaction_id,
+                    "status": "FAILED",
+                    "message": error_message,
+                    "modelVersion": model_version,
+                }),
+                status="FAILED",
+                success_count=0,
+                failure_count=1,
+                total_processed=1,
+                processing_time_ms=duration_ms,
             )
 
     def _build_prepare_training_command(self, *, months: int) -> list[str]:
@@ -1248,6 +1509,7 @@ def build_app(config: ApiConfig | None = None) -> AIMLApiApp:
         job_runner=BackgroundJobRunner(),
         logger=logger,
         ai_config_repo=AIConfigurationRepository(resolved),
+        api_audit_repo=ApiAuditLogRepository(resolved),
     )
     return AIMLApiApp(service)
 
