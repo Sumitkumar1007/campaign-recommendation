@@ -345,7 +345,7 @@ def test_training_route_creates_audit_and_submits_job() -> None:
 
     assert status.startswith("202")
     assert payload["status"] == "ACCEPTED"
-    assert payload["modelVersion"] == "v1.1.1"
+    assert payload["modelVersion"] == "v1.1.0"
     assert service.ai_config_repo.updated == []
     assert service.api_audit_repo.created[0]["reference_number"] == "TRN1"
     assert service.api_audit_repo.created[0]["request_url"] == "/api/v1/training"
@@ -670,6 +670,28 @@ def test_failed_training_keeps_current_model_version(monkeypatch: pytest.MonkeyP
     assert service.api_audit_repo.updated[-1]["reference_number"] == "TRN_FAIL"
     assert service.api_audit_repo.updated[-1]["request_url"] == "/api/v1/training"
     assert service.api_audit_repo.updated[-1]["status"] == "FAILED"
+
+
+def test_training_rejects_months_when_data_config_duration_differs(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = build_service()
+    app = AIMLApiApp(service)
+    token = service.auth_manager.issue_token("aiml")["access_token"]
+    monkeypatch.setattr(service, "_configured_training_month_duration", lambda: 6)
+
+    status, payload = invoke(
+        app,
+        method="POST",
+        path="/api/v1/training",
+        token=token,
+        body={"transactionId": "TRN1", "months": 3},
+    )
+
+    assert status.startswith("400")
+    assert payload == {
+        "transactionId": "TRN1",
+        "status": "FAILED",
+        "message": "months must match configured training duration 6.",
+    }
 
 
 def test_training_missing_months_returns_failed_payload() -> None:

@@ -1001,6 +1001,24 @@ class AIMLApiService:
         except Exception:
             self.logger.exception("Failed to update api_audit_log row | context=%s", log_context)
 
+    def _configured_training_month_duration(self) -> int | None:
+        query = sql.SQL(
+            "SELECT value FROM {} WHERE key_name = %s LIMIT 1"
+        ).format(qualified_identifier(self.config.target_schema, "data_config"))
+        try:
+            with self.ai_config_repo.connect() as conn:
+                row = conn.execute(query, ("aiml.training.month.duration",)).fetchone()
+        except Exception:
+            self.logger.exception("Failed to read aiml.training.month.duration from data_config")
+            return None
+        if row is None or row[0] in (None, ""):
+            return None
+        try:
+            return int(str(row[0]).strip())
+        except (TypeError, ValueError):
+            self.logger.warning("Invalid aiml.training.month.duration value in data_config | value=%s", row[0])
+            return None
+
     def trigger_training(self, payload: dict[str, Any], request_url: str) -> tuple[int, dict[str, Any]]:
         transaction_id = str(payload.get("transactionId", "")).strip()
         try:
@@ -1016,13 +1034,19 @@ class AIMLApiService:
         if "months" not in payload:
             return HTTPStatus.BAD_REQUEST, failure_response(transaction_id, "months is required.")
         months = int(payload.get("months", 3))
+        configured_months = self._configured_training_month_duration()
+        if configured_months is not None and months != configured_months:
+            return HTTPStatus.BAD_REQUEST, failure_response(
+                transaction_id,
+                f"months must match configured training duration {configured_months}.",
+            )
         model_name = self.config.model_name
         current_model_version = self.current_model_version()
         next_model_version = self.next_model_version()
         accepted = {
             "transactionId": transaction_id,
             "status": "ACCEPTED",
-            "modelVersion": next_model_version,
+            "modelVersion": current_model_version,
             "message": "Request accepted for processing.",
         }
         request_body = {
