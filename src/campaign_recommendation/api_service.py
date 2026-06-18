@@ -516,7 +516,7 @@ class AIConfigurationRepository:
             )
             conn.commit()
 
-    def update_entry(self, *, transaction_id: str, status: str, message: str, model_version: str | None = None, accuracy: float | None = None, drift: float | None = None, processing_time_ms: int | None = None, entry_type: str | None = None, training_window: str | None = None) -> None:
+    def update_entry(self, *, transaction_id: str, status: str, message: str, model_version: str | None = None, accuracy: float | None = None, drift: float | None = None, entry_type: str | None = None, training_window: str | None = None) -> None:
         with self.connect() as conn:
             self.ensure_table(conn)
             conn.execute(
@@ -529,7 +529,6 @@ class AIConfigurationRepository:
                         model_version = %s,
                         accuracy = %s,
                         drift = %s,
-                        processing_time_ms = COALESCE(%s, processing_time_ms),
                         training_window = COALESCE(%s, training_window),
                         modified_by = %s,
                         modified_on = %s
@@ -543,7 +542,6 @@ class AIConfigurationRepository:
                     model_version,
                     str(accuracy) if accuracy is not None else None,
                     str(drift) if drift is not None else None,
-                    str(processing_time_ms) if processing_time_ms is not None else None,
                     training_window,
                     "AIML",
                     utcnow_naive(),
@@ -559,7 +557,7 @@ class AIConfigurationRepository:
                 sql.SQL(
                     """
                     SELECT "type", transaction_id, status, message, model_version, accuracy, drift,
-                           processing_time_ms, created_on, modified_on, training_window
+                           created_on, modified_on, training_window
                     FROM {table_ref}
                     WHERE transaction_id = %s
                     ORDER BY COALESCE(modified_on, created_on) DESC
@@ -578,10 +576,9 @@ class AIConfigurationRepository:
                 "model_version": row[4],
                 "accuracy": row[5],
                 "drift": row[6],
-                "processing_time_ms": row[7],
-                "created_on": row[8].isoformat() if row[8] else None,
-                "modified_on": row[9].isoformat() if row[9] else None,
-                "training_window": row[10],
+                "created_on": row[7].isoformat() if row[7] else None,
+                "modified_on": row[8].isoformat() if row[8] else None,
+                "training_window": row[9],
             }
 
     def fetch_latest(self, *, entry_type: str, status: str | None = None) -> dict[str, Any] | None:
@@ -596,7 +593,7 @@ class AIConfigurationRepository:
                 sql.SQL(
                     """
                     SELECT "type", transaction_id, status, message, model_version, accuracy, drift,
-                           processing_time_ms, created_on, modified_on, training_window
+                           created_on, modified_on, training_window
                     FROM {table_ref}
                     WHERE {conditions}
                     ORDER BY COALESCE(modified_on, created_on) DESC, id DESC
@@ -618,10 +615,9 @@ class AIConfigurationRepository:
                 "model_version": row[4],
                 "accuracy": row[5],
                 "drift": row[6],
-                "processing_time_ms": row[7],
-                "created_on": row[8].isoformat() if row[8] else None,
-                "modified_on": row[9].isoformat() if row[9] else None,
-                "training_window": row[10],
+                "created_on": row[7].isoformat() if row[7] else None,
+                "modified_on": row[8].isoformat() if row[8] else None,
+                "training_window": row[9],
             }
 
 
@@ -881,7 +877,7 @@ class AIMLApiService:
         username = str(payload.get("username", ""))
         password = str(payload.get("password", ""))
         if not self.auth_manager.authenticate(username, password):
-            return HTTPStatus.UNAUTHORIZED, {"message": "Bad credentials."}
+            return HTTPStatus.UNAUTHORIZED, {"message": "Authentication failed."}
         return HTTPStatus.OK, self.auth_manager.issue_token(username)
 
     def model_status(self) -> tuple[int, dict[str, Any]]:
