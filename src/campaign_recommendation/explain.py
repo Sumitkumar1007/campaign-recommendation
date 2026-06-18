@@ -15,7 +15,14 @@ def explain_prediction(model, candidate_row: pd.DataFrame, top_k: int = 10) -> l
 
     matrix = get_model_matrix(candidate_row)
     transformed = preprocessor.transform(matrix)
-    coefficients = classifier.coef_[0]
+    if hasattr(classifier, "coef_"):
+        coefficients = classifier.coef_[0]
+    elif hasattr(classifier, "feature_importances_"):
+        coefficients = classifier.feature_importances_
+    else:
+        raise ValueError(
+            f"Classifier {type(classifier).__name__} is not supported for explanations."
+        )
     values = transformed.toarray()[0] if hasattr(transformed, "toarray") else np.asarray(transformed)[0]
     contributions = values * coefficients
     feature_names = preprocessor.get_feature_names_out()
@@ -32,6 +39,9 @@ def explain_prediction(model, candidate_row: pd.DataFrame, top_k: int = 10) -> l
                 "feature": str(name),
                 "contribution": float(value),
                 "direction": "up" if value >= 0 else "down",
+                "explanation_type": "linear_contribution"
+                if hasattr(classifier, "coef_")
+                else "importance_weighted_value",
             }
         )
     return explanation
