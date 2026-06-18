@@ -881,7 +881,7 @@ class AIMLApiService:
         username = str(payload.get("username", ""))
         password = str(payload.get("password", ""))
         if not self.auth_manager.authenticate(username, password):
-            return HTTPStatus.UNAUTHORIZED, {"message": "Authentication failed."}
+            return HTTPStatus.UNAUTHORIZED, {"message": "Bad credentials."}
         return HTTPStatus.OK, self.auth_manager.issue_token(username)
 
     def model_status(self) -> tuple[int, dict[str, Any]]:
@@ -1056,16 +1056,6 @@ class AIMLApiService:
             "currentModelVersion": current_model_version,
             "modelVersion": next_model_version,
         }
-        self._safe_create_api_audit_entry(
-            log_context="training_accepted",
-            entry_type="TRAINING",
-            reference_number=transaction_id,
-            request_url=request_url,
-            request_body=json_dumps_compact(request_body),
-            response_body=json_dumps_compact(accepted),
-            status="ACCEPTED",
-            message="Request accepted for processing.",
-        )
         self.job_runner.submit(
             transaction_id,
             lambda: self._run_training_job(transaction_id=transaction_id, payload=request_body),
@@ -1109,16 +1099,6 @@ class AIMLApiService:
             "predictMonth": predict_month,
             "model": model_name,
         }
-        self._safe_create_api_audit_entry(
-            log_context="inference_accepted",
-            entry_type="INFERENCE",
-            reference_number=transaction_id,
-            request_url=request_url,
-            request_body=json_dumps_compact(request_body),
-            response_body=json_dumps_compact(accepted),
-            status="ACCEPTED",
-            message="Request accepted for processing.",
-        )
         self.job_runner.submit(
             transaction_id,
             lambda: self._run_inference_job(transaction_id=transaction_id, payload=request_body),
@@ -1166,7 +1146,7 @@ class AIMLApiService:
                 initial_delay_seconds=AI_CONFIG_UPDATE_INITIAL_DELAY_SECONDS,
                 entry_type="TRAINING",
                 status="ACCEPTED",
-                message="Request accepted for processing.",
+                message=json_dumps_compact({"transactionId": transaction_id, "status": "ACCEPTED", "modelVersion": current_model_version, "message": "Request accepted for processing."}),
                 training_window=str(months),
                 model_version=current_model_version,
             )
@@ -1198,7 +1178,7 @@ class AIMLApiService:
                 log_context="training_completed",
                 transaction_id=transaction_id,
                 status="COMPLETED",
-                message="Processing completed.",
+                message=json_dumps_compact({"transactionId": transaction_id, "status": "COMPLETED", "message": "Processing completed.", "modelVersion": target_model_version, "currentAccuracy": snapshot.get("currentAccuracy"), "driftPercentage": snapshot.get("driftPercentage")}),
                 model_version=target_model_version,
                 accuracy=snapshot.get("currentAccuracy"),
                 drift=snapshot.get("driftPercentage"),
@@ -1223,6 +1203,7 @@ class AIMLApiService:
                 success_count=1,
                 failure_count=0,
                 total_records=1,
+                processing_time_ms=duration_ms,
             )
         except Exception as exc:  # noqa: BLE001
             self.logger.exception("Training job failed | transaction_id=%s", transaction_id)
@@ -1236,7 +1217,7 @@ class AIMLApiService:
                 log_context="training_failed",
                 transaction_id=transaction_id,
                 status="FAILED",
-                message=error_message,
+                message=json_dumps_compact({"transactionId": transaction_id, "status": "FAILED", "message": error_message, "modelVersion": current_model_version}),
                 model_version=current_model_version,
                 entry_type="TRAINING",
                 training_window=str(months),
@@ -1257,6 +1238,7 @@ class AIMLApiService:
                 success_count=0,
                 failure_count=1,
                 total_records=1,
+                processing_time_ms=duration_ms,
             )
 
     def _run_inference_job(self, *, transaction_id: str, payload: dict[str, Any]) -> None:
@@ -1286,7 +1268,7 @@ class AIMLApiService:
                 initial_delay_seconds=AI_CONFIG_UPDATE_INITIAL_DELAY_SECONDS,
                 entry_type="INFERENCE",
                 status="ACCEPTED",
-                message="Request accepted for processing.",
+                message=json_dumps_compact({"transactionId": transaction_id, "status": "ACCEPTED", "driftPercentage": read_metrics_snapshot(model_name).get("driftPercentage"), "currentAccuracy": read_metrics_snapshot(model_name).get("currentAccuracy"), "modelVersion": model_version, "message": "Request accepted for processing."}),
                 model_version=model_version,
                 training_window="10 days",
             )
@@ -1337,7 +1319,7 @@ class AIMLApiService:
                 log_context="inference_completed",
                 transaction_id=transaction_id,
                 status="COMPLETED",
-                message="Metrics generated successfully",
+                message=json_dumps_compact(response_body),
                 model_version=model_version,
                 accuracy=response_body.get("currentAccuracy"),
                 drift=response_body.get("driftPercentage"),
@@ -1355,6 +1337,7 @@ class AIMLApiService:
                 success_count=success_count,
                 failure_count=failure_count,
                 total_records=total_processed,
+                processing_time_ms=duration_ms,
             )
         except Exception as exc:  # noqa: BLE001
             self.logger.exception("Inference job failed | transaction_id=%s", transaction_id)
@@ -1368,7 +1351,7 @@ class AIMLApiService:
                 log_context="inference_failed",
                 transaction_id=transaction_id,
                 status="FAILED",
-                message=error_message,
+                message=json_dumps_compact({"transactionId": transaction_id, "status": "FAILED", "message": error_message, "modelVersion": model_version}),
                 model_version=model_version,
                 entry_type="INFERENCE",
                 training_window="10 days",
@@ -1389,6 +1372,7 @@ class AIMLApiService:
                 success_count=0,
                 failure_count=1,
                 total_records=1,
+                processing_time_ms=duration_ms,
             )
 
     def _build_prepare_training_command(self, *, months: int) -> list[str]:

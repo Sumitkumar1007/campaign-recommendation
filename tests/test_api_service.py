@@ -347,9 +347,7 @@ def test_training_route_creates_audit_and_submits_job() -> None:
     assert payload["status"] == "ACCEPTED"
     assert payload["modelVersion"] == "v1.1.0"
     assert service.ai_config_repo.updated == []
-    assert service.api_audit_repo.created[0]["reference_number"] == "TRN1"
-    assert service.api_audit_repo.created[0]["request_url"] == "/api/v1/training"
-    assert service.api_audit_repo.created[0]["status"] == "ACCEPTED"
+    assert service.api_audit_repo.created == []
     assert service.job_runner.submitted == ["TRN1"]
 
 
@@ -552,12 +550,13 @@ def test_run_inference_job_completes_when_summary_reader_is_available(monkeypatc
     assert service.ai_config_repo.updated[-1]["drift"] == 4.8
     assert service.ai_config_repo.updated[-1]["training_window"] == "10 days"
     assert service.ai_config_repo.updated[-1]["model_version"] == "v1.1.3"
+    assert json.loads(service.ai_config_repo.updated[-1]["message"])["status"] == "COMPLETED"
     assert service.api_audit_repo.updated[-1]["reference_number"] == "TRN_FIX"
     assert service.api_audit_repo.updated[-1]["request_url"] == "/api/v1/inference"
     assert service.api_audit_repo.updated[-1]["status"] == "COMPLETED"
     assert service.api_audit_repo.updated[-1]["success_count"] == 0
     assert "processing_time_ms" not in service.ai_config_repo.updated[-1]
-    assert "processing_time_ms" not in service.api_audit_repo.updated[-1]
+    assert service.api_audit_repo.updated[-1]["processing_time_ms"] >= 0
 
 
 def test_inference_export_command_enabled() -> None:
@@ -669,11 +668,12 @@ def test_failed_training_keeps_current_model_version(monkeypatch: pytest.MonkeyP
     assert service.ai_config_repo.updated[0]["model_version"] == "v1.1.0"
     assert service.ai_config_repo.updated[-1]["status"] == "FAILED"
     assert service.ai_config_repo.updated[-1]["model_version"] == "v1.1.0"
+    assert json.loads(service.ai_config_repo.updated[-1]["message"])["status"] == "FAILED"
     assert service.api_audit_repo.updated[-1]["reference_number"] == "TRN_FAIL"
     assert service.api_audit_repo.updated[-1]["request_url"] == "/api/v1/training"
     assert service.api_audit_repo.updated[-1]["status"] == "FAILED"
     assert "processing_time_ms" not in service.ai_config_repo.updated[-1]
-    assert "processing_time_ms" not in service.api_audit_repo.updated[-1]
+    assert service.api_audit_repo.updated[-1]["processing_time_ms"] >= 0
 
 
 def test_training_rejects_months_when_data_config_duration_differs(monkeypatch: pytest.MonkeyPatch) -> None:
