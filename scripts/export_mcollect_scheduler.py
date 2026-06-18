@@ -112,7 +112,11 @@ def month_start_from_label(month: str) -> datetime:
 
 
 def relative_campaign_day_to_date(day_label: str, prediction_month_label: str, emi_cycle: int) -> datetime:
-    day_label = day_label.strip().upper()
+    raw_day_label = day_label.strip()
+    if re.fullmatch(r"\d{2}-\d{2}-\d{4}", raw_day_label):
+        return datetime.strptime(raw_day_label, "%d-%m-%Y")
+
+    day_label = raw_day_label.upper()
     if day_label == "D":
         offset = 0
     else:

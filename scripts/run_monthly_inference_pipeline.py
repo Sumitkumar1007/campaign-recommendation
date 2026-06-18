@@ -58,6 +58,7 @@ NAME_CHANNEL_BY_MODE = {
     "VOICE": "VOICE",
 }
 VENDOR_CONFIG_KEY = "voice.service.vendor-list"
+EMI_DATES_CONFIG_KEY = "upload.scheduler.emi-dates"
 
 
 def parse_args() -> argparse.Namespace:
@@ -709,9 +710,14 @@ def _parse_strategy(strategy: str) -> tuple[str, str, str] | None:
     return mode, _format_scheduler_hour(hour_label), normalized_language
 
 
-def _due_bucket(day: str) -> tuple[str, str, str]:
+def _due_bucket(day: str, *, configured_emi_dates: list[str] | None = None) -> tuple[str, str, str]:
     if day in PREDUE_DAYS:
         return "PRE", "PREDUE", day
+    if day == "D":
+        emi_dates = configured_emi_dates or []
+        if emi_dates:
+            return "DUE", "DUEDATE", ",".join(emi_dates)
+        return "DUE", "DUEDATE", day
     if day in POSTDUE_DAYS:
         return "POST", "POSTDUE", day
     raise ValueError(f"Unsupported campaign day: {day}")
@@ -981,6 +987,82 @@ def _mapping_prediction_reason(row: pd.Series, context_lookup: dict[str, dict[st
     return "Reason not available from prediction output for this campaign mapping."
 
 
+def _extract_scheduler_emi_dates(raw_value: object) -> list[str]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, list):
+        items = raw_value
+    else:
+        if pd.isna(raw_value):
+            return []
+        text = str(raw_value).strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = text
+        if isinstance(parsed, list):
+            items = parsed
+        else:
+            items = [part.strip() for part in str(parsed).split(",") if part.strip()]
+
+    dates: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        value = str(item).strip()
+        if not value:
+            continue
+        try:
+            normalized = datetime.strptime(value, "%d-%m-%Y").strftime("%d-%m-%Y")
+        except ValueError:
+            continue
+        if normalized not in seen:
+            seen.add(normalized)
+            dates.append(normalized)
+    return dates
+
+
+def resolve_scheduler_emi_dates(
+    conn,
+    *,
+    source_schema: str,
+    target_schema: str,
+    logger: logging.Logger,
+) -> list[str]:
+    candidate_refs: list[sql.Composable] = [sql.Identifier("data_config")]
+    seen = {"data_config"}
+    for schema_name in (source_schema, target_schema):
+        key = f"{schema_name}.data_config"
+        if schema_name and key not in seen:
+            seen.add(key)
+            candidate_refs.append(sql.SQL("{}.{}").format(sql.Identifier(schema_name), sql.Identifier("data_config")))
+
+    for table_ref in candidate_refs:
+        try:
+            row = conn.execute(
+                sql.SQL("SELECT value FROM {} WHERE key_name = %s LIMIT 1").format(table_ref),
+                (EMI_DATES_CONFIG_KEY,),
+            ).fetchone()
+        except errors.UndefinedTable:
+            conn.rollback()
+            continue
+        except Exception:
+            logger.exception("Scheduler EMI date lookup failed.")
+            conn.rollback()
+            break
+
+        if not row:
+            continue
+
+        emi_dates = _extract_scheduler_emi_dates(row[0])
+        if emi_dates:
+            logger.info("Resolved scheduler EMI dates from data_config | key=%s emi_dates=%s", EMI_DATES_CONFIG_KEY, emi_dates)
+            return emi_dates
+
+    return []
+
+
 def _build_campaign_assignment_groups(
     prediction_file: Path,
     *,
@@ -990,6 +1072,7 @@ def _build_campaign_assignment_groups(
     emi_cycles: list[int],
     vertical: str,
     vendors: list[str],
+    configured_emi_dates: list[str],
     run_token: str,
 ) -> pd.DataFrame:
     df = pd.read_csv(prediction_file)
@@ -1000,13 +1083,13 @@ def _build_campaign_assignment_groups(
         loan_number = str(row["Loan_number"])
         risk = str(row.get("SOURCE_RISK", row.get("RISK", "LOW"))).upper()
         risk_code = RISK_CODES.get(risk, "LR")
-        for day in [*PREDUE_DAYS, *POSTDUE_DAYS]:
+        for day in [*PREDUE_DAYS, "D", *POSTDUE_DAYS]:
             for strategy in str(row.get(day, "")).split("|"):
                 parsed = _parse_strategy(strategy.strip())
                 if parsed is None:
                     continue
                 mode, send_time, language = parsed
-                campaign_type, due_type, campaign_dates = _due_bucket(day)
+                campaign_type, due_type, campaign_dates = _due_bucket(day, configured_emi_dates=configured_emi_dates)
                 vertical_value = str(row.get("SOURCE_VERTICAL", row.get("VERTICAL", vertical))).strip().upper()
                 if not vertical_value or vertical_value == "UNKNOWN":
                     vertical_value = vertical.upper()
@@ -1099,6 +1182,7 @@ def _prepare_campaign_outputs(
     emi_cycles: list[int],
     vertical: str,
     vendors: list[str],
+    configured_emi_dates: list[str],
     run_date: datetime | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     run_token = (run_date or datetime.now(timezone.utc)).strftime("%d%m%y")
@@ -1110,6 +1194,7 @@ def _prepare_campaign_outputs(
         emi_cycles=emi_cycles,
         vertical=vertical,
         vendors=vendors,
+        configured_emi_dates=configured_emi_dates,
         run_token=run_token,
     )
     if assignment_groups.empty:
@@ -1748,6 +1833,12 @@ def main() -> None:
                         fallback_vendor=args.campaign_vendor,
                         logger=logger,
                     )
+                    configured_emi_dates = resolve_scheduler_emi_dates(
+                        conn,
+                        source_schema=args.source_schema,
+                        target_schema=args.target_schema,
+                        logger=logger,
+                    )
                     prediction_rows = store_prediction_snapshots(
                         conn,
                         args.target_schema,
@@ -1764,6 +1855,7 @@ def main() -> None:
                         emi_cycles=resolve_emi_cycle(args.config_file, os.getenv("EMI_CYCLE", "")),
                         vertical=args.campaign_vertical,
                         vendors=campaign_vendors,
+                        configured_emi_dates=configured_emi_dates,
                     )
                     campaign_rows = store_campaign_recommendations(
                         conn,
@@ -1789,6 +1881,7 @@ def main() -> None:
                 print(f"Stored {mapping_rows:,} campaign mapping snapshots in Postgres")
         else:
             campaign_vendors = []
+            configured_emi_dates = []
             campaign_df, mapping_df = _prepare_campaign_outputs(
                 prediction_file,
                 source_month_label=source_month_label,
@@ -1797,6 +1890,7 @@ def main() -> None:
                 emi_cycles=resolve_emi_cycle(args.config_file, os.getenv("EMI_CYCLE", "")),
                 vertical=args.campaign_vertical,
                 vendors=_extract_campaign_vendors(args.campaign_vendor) or [args.campaign_vendor],
+                configured_emi_dates=configured_emi_dates,
             )
 
         summary = build_prediction_summary(

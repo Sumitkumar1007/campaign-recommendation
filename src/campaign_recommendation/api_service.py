@@ -1298,14 +1298,9 @@ class AIMLApiService:
                 "modelVersion": model_version,
                 "currentAccuracy": snapshot.get("currentAccuracy"),
                 "driftPercentage": drift_summary.get("drift_percentage", snapshot.get("driftPercentage")),
-                "overallPsi": drift_summary.get("overall_psi"),
-                "maxFeaturePsi": drift_summary.get("max_feature_psi"),
                 "driftStatus": drift_summary.get("status"),
                 "sourceMonth": month_label(source_month),
                 "predictMonth": month_label(predict_month),
-                "schedulerExportTriggered": self.config.export_after_inference,
-                "schedulerExportWrite": self.config.export_write if self.config.export_after_inference else None,
-                "schedulerExportTriggerState": self.config.export_trigger_state if self.config.export_after_inference else None,
             }
             total_processed = int(summary.get("prediction_rows") or 0)
             success_count = int(summary.get("mapping_rows") or summary.get("campaign_rows") or total_processed)
