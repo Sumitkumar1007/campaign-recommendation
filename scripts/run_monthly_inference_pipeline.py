@@ -19,7 +19,7 @@ from psycopg.types.json import Jsonb
 from app_logging import log_step, setup_logging
 from drift_utils import compute_drift_report
 from env_utils import load_dotenv
-from pipeline_common import build_feature_matrix, prepare_next_month_dataset, resolve_emi_cycle, split_by_source_month
+from pipeline_common import build_feature_matrix, prepare_next_month_dataset, split_by_source_month
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
 from predict_next_month_strategy_catboost import build_prediction_population, load_base_population
 from project_paths import (
@@ -114,11 +114,6 @@ def parse_args() -> argparse.Namespace:
         "--campaign-vendor",
         default=os.getenv("CAMPAIGN_VENDOR", "prutech-cpass"),
         help="Fallback campaign vendor when data_config vendor lookup is unavailable.",
-    )
-    parser.add_argument(
-        "--config-file",
-        default=os.getenv("CONFIG_FILE", str(SCRIPTS_DIR.parent / "config" / "default_config.json")),
-        help="JSON config file containing emi_cycle.",
     )
     parser.add_argument(
         "--source-month",
@@ -1063,6 +1058,20 @@ def resolve_scheduler_emi_dates(
     return []
 
 
+def _derive_emi_cycles_from_dates(date_values: list[str]) -> list[int]:
+    cycles: list[int] = []
+    seen: set[int] = set()
+    for value in date_values:
+        try:
+            day = datetime.strptime(str(value).strip(), "%d-%m-%Y").day
+        except ValueError:
+            continue
+        if day not in seen:
+            seen.add(day)
+            cycles.append(day)
+    return sorted(cycles)
+
+
 def _build_campaign_assignment_groups(
     prediction_file: Path,
     *,
@@ -1852,7 +1861,7 @@ def main() -> None:
                         source_month_label=source_month_label,
                         prediction_month_label=prediction_month_label,
                         model_name=args.model,
-                        emi_cycles=resolve_emi_cycle(args.config_file, os.getenv("EMI_CYCLE", "")),
+                        emi_cycles=_derive_emi_cycles_from_dates(configured_emi_dates),
                         vertical=args.campaign_vertical,
                         vendors=campaign_vendors,
                         configured_emi_dates=configured_emi_dates,
@@ -1887,7 +1896,7 @@ def main() -> None:
                 source_month_label=source_month_label,
                 prediction_month_label=prediction_month_label,
                 model_name=args.model,
-                emi_cycles=resolve_emi_cycle(args.config_file, os.getenv("EMI_CYCLE", "")),
+                emi_cycles=_derive_emi_cycles_from_dates(configured_emi_dates),
                 vertical=args.campaign_vertical,
                 vendors=_extract_campaign_vendors(args.campaign_vendor) or [args.campaign_vendor],
                 configured_emi_dates=configured_emi_dates,

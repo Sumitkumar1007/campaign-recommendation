@@ -12,11 +12,12 @@ from env_utils import load_dotenv
 from fetch_month_from_postgres import (
     build_query,
     default_output_file,
-    parse_args as _unused_fetch_parse_args,
+    emi_cycle_dates,
+    resolve_scheduler_emi_cycle,
     write_query_to_csv,
 )
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
-from project_paths import FEATURE_DATA_DIR, REPO_ROOT, SCHEDULE_DATA_DIR, TRAINING_DATA_DIR
+from project_paths import FEATURE_DATA_DIR, SCHEDULE_DATA_DIR, TRAINING_DATA_DIR
 from run_monthly_inference_pipeline import run_python_script
 
 
@@ -37,7 +38,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--table", default=os.getenv("SOURCE_TABLE", "communications"))
     parser.add_argument("--months", type=int, required=True, help="Requested historical source-month window for training.")
     parser.add_argument("--month-source", choices=["emi_date", "created_date"], default=os.getenv("FEATURE_MONTH_SOURCE", "emi_date"))
-    parser.add_argument("--config-file", default=os.getenv("CONFIG_FILE", str(REPO_ROOT / "config" / "default_config.json")))
     parser.add_argument("--fetch-size", type=int, default=100_000)
     parser.add_argument("--log-file", default=None)
     args = parser.parse_args()
@@ -101,10 +101,7 @@ def fetch_month_extracts(args: argparse.Namespace, logger: logging.Logger, month
         for month in months:
             output_file = default_output_file(month)
             output_file.parent.mkdir(parents=True, exist_ok=True)
-            # Reuse the existing month fetch SQL by substituting the configured EMI-cycle day dates.
-            # The fetch utility itself is still the source of truth for monthly communication snapshots.
-            from fetch_month_from_postgres import emi_cycle_dates, resolve_emi_cycle  # local import to avoid CLI coupling
-            emi_cycle = resolve_emi_cycle(args.config_file, os.getenv("EMI_CYCLE", ""))
+            emi_cycle = resolve_scheduler_emi_cycle(conn, schema=args.schema)
             params = {"emi_dates": [date.date() for date in emi_cycle_dates(emi_cycle, fetch_month=month)]}
             logger.info(
                 "Resolved EMI dates for training month | month=%s emi_cycle=%s emi_dates=%s output_file=%s",

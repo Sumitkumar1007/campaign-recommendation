@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -8,9 +9,8 @@ import pandas as pd
 from psycopg import sql
 
 from env_utils import load_dotenv
-from pipeline_common import resolve_emi_cycle
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
-from project_paths import CASE_DATA_DIR, REPO_ROOT, ensure_parent_dir
+from project_paths import CASE_DATA_DIR, ensure_parent_dir
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,16 +32,6 @@ def parse_args() -> argparse.Namespace:
         help="Source digital cases table.",
     )
     parser.add_argument(
-        "--config-file",
-        default=os.getenv("CONFIG_FILE", str(REPO_ROOT / "config" / "default_config.json")),
-        help="JSON config file containing emi_cycle.",
-    )
-    parser.add_argument(
-        "--emi-cycle",
-        default=os.getenv("EMI_CYCLE", ""),
-        help="Comma-separated EMI cycle days. Overrides config emi_cycle when provided.",
-    )
-    parser.add_argument(
         "--fetch-month",
         default="",
         help="Month/year used to build EMI cycle dates in YYYY-MM. Defaults to current month.",
@@ -52,7 +42,6 @@ def parse_args() -> argparse.Namespace:
         help="Optional explicit output CSV path.",
     )
     args = parser.parse_args()
-    args.emi_cycle = resolve_emi_cycle(args.config_file, args.emi_cycle)
     missing = [
         name
         for name, value in {
@@ -60,7 +49,6 @@ def parse_args() -> argparse.Namespace:
             "PGDATABASE/--dbname": args.dbname,
             "PGUSER/--user": args.user,
             "PGPASSWORD/--password": args.password,
-            "emi_cycle in config/default_config.json or EMI_CYCLE/--emi-cycle": args.emi_cycle,
         }.items()
         if not value
     ]
@@ -69,8 +57,59 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+EMI_DATES_CONFIG_KEY = "upload.scheduler.emi-dates"
+
+
 def current_month(today: pd.Timestamp | None = None) -> str:
     return (today or pd.Timestamp.today()).strftime("%Y-%m")
+
+
+def _extract_scheduler_emi_cycle(raw_value: object) -> list[int]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, list):
+        items = raw_value
+    else:
+        text = str(raw_value).strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = text
+        if isinstance(parsed, list):
+            items = parsed
+        else:
+            items = [part.strip() for part in str(parsed).split(",") if part.strip()]
+    cycles: list[int] = []
+    seen: set[int] = set()
+    for item in items:
+        try:
+            day = pd.Timestamp(str(item).strip(), dayfirst=True).day
+        except Exception:
+            continue
+        if day not in seen:
+            seen.add(day)
+            cycles.append(day)
+    return sorted(cycles)
+
+
+def resolve_scheduler_emi_cycle(conn, *, schema: str) -> list[int]:
+    candidate_refs = [sql.Identifier("data_config")]
+    if schema:
+        candidate_refs.append(qualified_identifier(schema, "data_config"))
+    for table_ref in candidate_refs:
+        try:
+            row = conn.execute(sql.SQL("SELECT value FROM {} WHERE key_name = %s LIMIT 1").format(table_ref), (EMI_DATES_CONFIG_KEY,)).fetchone()
+        except Exception:
+            conn.rollback()
+            continue
+        if not row:
+            continue
+        cycles = _extract_scheduler_emi_cycle(row[0])
+        if cycles:
+            return cycles
+    raise ValueError(f"Could not resolve EMI cycle from data_config key {EMI_DATES_CONFIG_KEY!r}.")
 
 
 def emi_cycle_dates(
@@ -110,7 +149,6 @@ def build_query(schema: str, table: str) -> sql.Composed:
 def main() -> None:
     args = parse_args()
     fetch_month = args.fetch_month or current_month()
-    emi_dates = emi_cycle_dates(args.emi_cycle, fetch_month=fetch_month)
     output_file = ensure_parent_dir(args.output_file) if args.output_file else ensure_parent_dir(default_output_file(fetch_month))
 
     config = PostgresConfig(
@@ -121,9 +159,11 @@ def main() -> None:
         password=args.password,
     )
     query = build_query(args.schema, args.table)
-    params = {"emi_dates": emi_dates}
 
     with connect_db(config) as conn:
+        emi_cycle = resolve_scheduler_emi_cycle(conn, schema=args.schema)
+        emi_dates = emi_cycle_dates(emi_cycle, fetch_month=fetch_month)
+        params = {"emi_dates": emi_dates}
         with conn.cursor() as cur:
             cur.execute(query, params)
             columns = [desc.name for desc in cur.description]
