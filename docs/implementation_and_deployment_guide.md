@@ -642,8 +642,8 @@ pip install -e .
 Create the minimum required artifact directories:
 
 ```bash
-mkdir artifacts/models
-mkdir artifacts/metrics
+mkdir -p artifacts/models
+mkdir -p artifacts/metrics
 ```
 
 ### 24.6 Copy Required Artifacts And Config
@@ -668,12 +668,20 @@ chmod -R u+rwX artifacts data
 Create `.env` with the deployment values below:
 
 ```bash
+# Fill these values on the server. This file is ignored by git.
+
 # Postgres source and snapshot storage
-PGHOST=10.1.1.45
+PGHOST=<postgres_host>
 PGPORT=5432
-PGDATABASE=postgres
-PGUSER=postgres
-PGPASSWORD=mysecretpassword
+PGDATABASE=<postgres_database>
+PGUSER=<postgres_user>
+PGPASSWORD=<postgres_password>
+
+# PGHOST=<alternate_postgres_host>
+# PGPORT=5432
+# PGDATABASE=<alternate_postgres_database>
+# PGUSER=<alternate_postgres_user>
+# PGPASSWORD=<alternate_postgres_password>
 
 # Source communication table
 SOURCE_SCHEMA=digital_collections
@@ -688,35 +696,38 @@ CAMPAIGN_MAPPING_TABLE=ai_ml_campaign_mapping
 MODEL_NAME=catboost_3m
 FEATURE_MONTH_SOURCE=emi_date
 
+
 # MLflow registry
-MLFLOW_TRACKING_URI=http://10.1.1.45:5000
+MLFLOW_TRACKING_URI=http://<mlflow_host>:5000
 MLFLOW_EXPERIMENT_NAME=campaign-recommendation
 MLFLOW_REGISTERED_MODEL_NAME=campaign_next_month_catboost_3m
 MLFLOW_RUN_NAME=catboost-3m-may-2026-v1
 
+
 # API service
 API_HOST=0.0.0.0
 API_PORT=8040
-API_AUTH_USERNAME=aiml
-API_AUTH_PASSWORD=aiml
-API_AUTH_SECRET=4b32d0dbabc3749210ee55d98bb91bef34071a30126cdb42b24bb4c98c0c1bb8
+API_AUTH_USERNAME=<api_username>
+API_AUTH_PASSWORD=<api_password>
+API_AUTH_SECRET=<long_random_secret>
 API_TOKEN_TTL_SECONDS=28800
 AI_CONFIG_TABLE=ai_configurations
+API_AUDIT_TABLE=api_audit_log
 API_MODEL_BASE_VERSION=v1.1.0
 API_EXPORT_AFTER_INFERENCE=true
 API_EXPORT_WRITE=true
 # SFTP upload after workbook generation
-SFTP_EXPORT_PATH=/app/muthoot/digital/kafka-web/aiml/campaign-recommendation/artifacts/exports/sftp
-SFTP_REMOTE_DATASET_PATH=/app/muthoot/digital/kafka-web/upload/dataset/sftp
-SFTP_REMOTE_SCHEDULER_PATH=/app/muthoot/digital/kafka-web/upload/scheduler/sftp
+SFTP_EXPORT_PATH=<local_sftp_export_path>
 SFTP_UPLOAD_ENABLED=true
-SFTP_HOST=10.1.1.45
+SFTP_HOST=<sftp_host>
 SFTP_PORT=22
-SFTP_USERNAME=sumit
-SFTP_PASSWORD=go4it*22
+SFTP_USERNAME=<sftp_username>
+SFTP_PASSWORD=<sftp_password>
 SFTP_PRIVATE_KEY_PATH=
 SFTP_PRIVATE_KEY_PASSPHRASE=
-SFTP_REMOTE_PATH=/home/sumit/sftp-test/output
+SFTP_REMOTE_PATH=<sftp_remote_base_path>
+SFTP_REMOTE_DATASET_PATH=
+SFTP_REMOTE_SCHEDULER_PATH=
 SFTP_RETRIES=3
 SFTP_RETRY_DELAY_SECONDS=5
 SFTP_TIMEOUT_SECONDS=30
@@ -752,6 +763,13 @@ Check service status:
 sudo systemctl status recommendation.service --no-pager
 ```
 
+If the new server uses a different application base path, update these values before copying the service:
+
+- `WorkingDirectory`
+- `EnvironmentFile`
+- `ExecStart`
+- any absolute export path in `.env`
+
 ### 24.9 Smoke Test
 
 #### Health
@@ -765,7 +783,7 @@ curl -fsS http://127.0.0.1:8040/api/health
 ```bash
 curl -sS -X POST http://127.0.0.1:8040/api/v1/auth \
   -H 'Content-Type: application/json' \
-  -d '{"username":"aiml","password":"<api_password>"}'
+  -d '{"username":"<api_username>","password":"<api_password>"}'
 ```
 
 #### Training pre-check
@@ -828,6 +846,8 @@ Important API behavior:
 - The branch used is `feat/integration-with-digital`.
 - The service listens on port `8040`.
 - `SFTP_FAIL_ON_ERROR=true` means SFTP upload failure will fail the inference/export job.
+- `SFTP_EXPORT_PATH` is the local filesystem export path on the application server.
+- `SFTP_REMOTE_DATASET_PATH` and `SFTP_REMOTE_SCHEDULER_PATH` are the remote SFTP upload destinations.
 - If the filesystem path on the new server is different, update both `.env` and `deploy/systemd/recommendation.service` before starting the service.
 
 ### 24.12 Manual API Commands Reference
@@ -839,7 +859,7 @@ curl -fsS http://127.0.0.1:8040/api/health
 
 curl -sS -X POST http://127.0.0.1:8040/api/v1/auth \
   -H 'Content-Type: application/json' \
-  -d '{"username":"aiml","password":"<api_password>"}'
+  -d '{"username":"<api_username>","password":"<api_password>"}'
 
 curl -sS -X POST http://127.0.0.1:8040/api/v1/training \
   -H 'Content-Type: application/json' \
