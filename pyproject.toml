@@ -16,7 +16,8 @@ dependencies = [
   "catboost>=1.2,<2",
   "mlflow>=2.12,<3",
   "psycopg[binary]>=3.2,<4",
-  "paramiko>=3.4,<4"
+  "paramiko>=3.4,<4",
+  "gunicorn>=22,<24"
 ]
 
 [project.optional-dependencies]

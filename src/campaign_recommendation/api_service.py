@@ -17,7 +17,8 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import Any, Callable
 
-from wsgiref.simple_server import make_server
+from socketserver import ThreadingMixIn
+from wsgiref.simple_server import WSGIServer, make_server
 
 import psycopg
 from psycopg import sql
@@ -57,6 +58,7 @@ def load_dotenv(path: Path | None = None) -> None:
 class ApiConfig:
     host: str
     port: int
+    request_queue_size: int
     db_host: str
     db_port: int
     db_name: str
@@ -86,6 +88,7 @@ class ApiConfig:
         return cls(
             host=os.getenv("API_HOST", "0.0.0.0"),
             port=int(os.getenv("API_PORT", "8080")),
+            request_queue_size=int(os.getenv("API_REQUEST_QUEUE_SIZE", "128")),
             db_host=os.getenv("PGHOST", ""),
             db_port=int(os.getenv("PGPORT", "5432")),
             db_name=os.getenv("PGDATABASE", ""),
@@ -413,6 +416,11 @@ def read_prediction_summary(predict_month: str) -> dict[str, Any]:
 
 def json_dumps_compact(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+
+
+class ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+    daemon_threads = True
+    allow_reuse_address = True
 
 
 class AuthManager:
@@ -1599,8 +1607,15 @@ def main() -> None:
     if args.port:
         config = ApiConfig(**{**config.__dict__, "port": args.port})
     app = build_app(config)
-    with make_server(config.host, config.port, app) as server:
-        app.service.logger.info("AIML API listening | host=%s port=%s", config.host, config.port)
+    with make_server(config.host, config.port, app, server_class=ThreadingWSGIServer) as server:
+        server.request_queue_size = config.request_queue_size
+        app.service.logger.info(
+            "AIML API listening | host=%s port=%s server=%s request_queue_size=%s",
+            config.host,
+            config.port,
+            ThreadingWSGIServer.__name__,
+            config.request_queue_size,
+        )
         server.serve_forever()
 
 

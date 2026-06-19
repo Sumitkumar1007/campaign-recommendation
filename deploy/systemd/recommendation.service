@@ -11,8 +11,11 @@ WorkingDirectory=/home/ubuntu/aiml/recommendation
 Environment=PYTHONUNBUFFERED=1
 Environment=API_HOST=0.0.0.0
 Environment=API_PORT=8040
+Environment=GUNICORN_WORKERS=4
+Environment=GUNICORN_THREADS=8
+Environment=GUNICORN_TIMEOUT=300
 EnvironmentFile=-/home/ubuntu/aiml/recommendation/.env
-ExecStart=/home/ubuntu/aiml/recommendation/venv/bin/python /home/ubuntu/aiml/recommendation/scripts/run_api_service.py
+ExecStart=/home/ubuntu/aiml/recommendation/venv/bin/gunicorn --workers ${GUNICORN_WORKERS} --threads ${GUNICORN_THREADS} --worker-class gthread --bind ${API_HOST}:${API_PORT} --timeout ${GUNICORN_TIMEOUT} --access-logfile - --error-logfile - campaign_recommendation.wsgi:app
 Restart=always
 RestartSec=5
 StandardOutput=journal

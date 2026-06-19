@@ -12,7 +12,15 @@ Implemented endpoints:
 Run service:
 
 ```bash
-./venv/bin/python scripts/run_api_service.py --host 0.0.0.0 --port 8040
+./venv/bin/gunicorn \
+  --workers 4 \
+  --threads 8 \
+  --worker-class gthread \
+  --bind 0.0.0.0:8040 \
+  --timeout 300 \
+  --access-logfile - \
+  --error-logfile - \
+  campaign_recommendation.wsgi:app
 ```
 
 Required env:

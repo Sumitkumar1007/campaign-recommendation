@@ -119,6 +119,7 @@ def build_config(*, export_after_inference: bool = False, export_write: bool = F
     return ApiConfig(
         host="127.0.0.1",
         port=8080,
+        request_queue_size=128,
         db_host="",
         db_port=5432,
         db_name="",
