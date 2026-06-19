@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pandas as pd
@@ -14,21 +13,6 @@ RISK_TOP_K = {
     "HIGH": 3,
 }
 
-
-def resolve_emi_cycle(config_file: str | Path, emi_cycle_override: str = "") -> list[int]:
-    if emi_cycle_override:
-        raw_cycle = [value.strip() for value in emi_cycle_override.split(",") if value.strip()]
-    else:
-        with Path(config_file).open("r", encoding="utf-8") as handle:
-            raw_cycle = json.load(handle).get("emi_cycle", [])
-
-    cycles: list[int] = []
-    for value in raw_cycle:
-        day = int(value)
-        if day < 1 or day > 31:
-            raise ValueError(f"Invalid EMI cycle day {value!r}. Expected a day from 1 to 31.")
-        cycles.append(day)
-    return sorted(set(cycles))
 
 
 def candidate_hours(send_hour_window: dict[str, int]) -> list[int]:

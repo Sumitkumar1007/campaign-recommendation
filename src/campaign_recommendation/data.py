@@ -46,7 +46,7 @@ def _prepare_chunk(
     success_statuses: dict[str, list[str]],
     success_scores: dict[str, dict[str, float]],
     positive_boost: float,
-    emi_cycles: list[int],
+    emi_cycles: list[int] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     prepared = chunk.copy()
     prepared["created_date"] = pd.to_datetime(prepared["created_date"], errors="coerce")
@@ -62,10 +62,11 @@ def _prepare_chunk(
             "collectable_amount",
         ]
     )
-    emi_cycle_set = {int(day) for day in emi_cycles}
-    prepared = prepared[prepared["emi_date"].dt.day.isin(emi_cycle_set)].copy()
-    if prepared.empty:
-        return prepared, prepared
+    if emi_cycles:
+        emi_cycle_set = {int(day) for day in emi_cycles}
+        prepared = prepared[prepared["emi_date"].dt.day.isin(emi_cycle_set)].copy()
+        if prepared.empty:
+            return prepared, prepared
 
     prepared["day_offset"] = (prepared["created_date"].dt.normalize() - prepared["emi_date"]).dt.days
     prepared["send_hour"] = prepared["created_date"].dt.hour
@@ -208,7 +209,7 @@ def build_modeling_dataset(
     success_statuses: dict[str, list[str]],
     success_scores: dict[str, dict[str, float]],
     positive_boost: float,
-    emi_cycles: list[int],
+    emi_cycles: list[int] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, list[str]]]:
     path = Path(csv_path)
     history_chunks: list[pd.DataFrame] = []

@@ -17,7 +17,7 @@ if str(SCRIPTS_DIR) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from fetch_month_from_postgres import emi_cycle_dates, month_bounds, resolve_emi_cycle
+from fetch_month_from_postgres import _extract_scheduler_emi_cycle, emi_cycle_dates, month_bounds
 from generate_strategy_dataset import bucket_send_hour, candidate_hours as dataset_candidate_hours, process_chunk
 
 from quartz_job_data import build_mcollect_job_data, serialize_quartz_job_data_map
@@ -69,11 +69,8 @@ def test_month_bounds_use_half_open_calendar_window() -> None:
     assert str(end.date()) == "2026-03-01"
 
 
-def test_resolve_emi_cycle_reads_multiple_days_from_config(tmp_path: Path) -> None:
-    config_file = tmp_path / "config.json"
-    config_file.write_text('{"emi_cycle": ["5", "10", 5]}', encoding="utf-8")
-
-    assert resolve_emi_cycle(str(config_file), "") == [5, 10]
+def test_extract_scheduler_emi_cycle_reads_multiple_days_from_config_dates() -> None:
+    assert _extract_scheduler_emi_cycle(["05-06-2026", "10-06-2026", "05-07-2026"]) == [5, 10]
 
 
 def test_emi_cycle_dates_use_current_month_and_year() -> None:
@@ -867,6 +864,12 @@ def test_mcollect_publish_skips_digital_rules_writes(monkeypatch: pytest.MonkeyP
                 "vertical": "LAP",
                 "risk": "MR",
                 "emi_cycle": 5,
+                "source_month": "APR-2026",
+                "prediction_month": "MAY-2026",
+                "model_name": "catboost_3m",
+                "active": "T",
+                "campaign_type": "POSTDUE",
+                "due_type": "POSTDUE",
             }
         ]
     )

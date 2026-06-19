@@ -106,7 +106,7 @@ def _extract_scheduler_emi_cycle(raw_value: object) -> list[int]:
     seen: set[int] = set()
     for item in items:
         try:
-            day = pd.Timestamp(str(item).strip(), dayfirst=True).day
+            day = pd.to_datetime(str(item).strip(), dayfirst=True, errors="raise").day
         except Exception:
             continue
         if day not in seen:

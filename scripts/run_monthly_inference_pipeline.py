@@ -1081,7 +1081,7 @@ def _build_campaign_assignment_groups(
     emi_cycles: list[int],
     vertical: str,
     vendors: list[str],
-    configured_emi_dates: list[str],
+    configured_emi_dates: list[str] | None = None,
     run_token: str,
 ) -> pd.DataFrame:
     df = pd.read_csv(prediction_file)
@@ -1098,7 +1098,7 @@ def _build_campaign_assignment_groups(
                 if parsed is None:
                     continue
                 mode, send_time, language = parsed
-                campaign_type, due_type, campaign_dates = _due_bucket(day, configured_emi_dates=configured_emi_dates)
+                campaign_type, due_type, campaign_dates = _due_bucket(day, configured_emi_dates=configured_emi_dates or [])
                 vertical_value = str(row.get("SOURCE_VERTICAL", row.get("VERTICAL", vertical))).strip().upper()
                 if not vertical_value or vertical_value == "UNKNOWN":
                     vertical_value = vertical.upper()
@@ -1191,7 +1191,7 @@ def _prepare_campaign_outputs(
     emi_cycles: list[int],
     vertical: str,
     vendors: list[str],
-    configured_emi_dates: list[str],
+    configured_emi_dates: list[str] | None = None,
     run_date: datetime | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     run_token = (run_date or datetime.now(timezone.utc)).strftime("%d%m%y")
@@ -1203,7 +1203,7 @@ def _prepare_campaign_outputs(
         emi_cycles=emi_cycles,
         vertical=vertical,
         vendors=vendors,
-        configured_emi_dates=configured_emi_dates,
+        configured_emi_dates=configured_emi_dates or [],
         run_token=run_token,
     )
     if assignment_groups.empty:
@@ -1864,7 +1864,7 @@ def main() -> None:
                         emi_cycles=_derive_emi_cycles_from_dates(configured_emi_dates),
                         vertical=args.campaign_vertical,
                         vendors=campaign_vendors,
-                        configured_emi_dates=configured_emi_dates,
+                        configured_emi_dates=configured_emi_dates or [],
                     )
                     campaign_rows = store_campaign_recommendations(
                         conn,
@@ -1899,7 +1899,7 @@ def main() -> None:
                 emi_cycles=_derive_emi_cycles_from_dates(configured_emi_dates),
                 vertical=args.campaign_vertical,
                 vendors=_extract_campaign_vendors(args.campaign_vendor) or [args.campaign_vendor],
-                configured_emi_dates=configured_emi_dates,
+                configured_emi_dates=configured_emi_dates or [],
             )
 
         summary = build_prediction_summary(

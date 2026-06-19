@@ -2,7 +2,6 @@
   "training_data_path": "training-data/mfl_last_6_months_communication_data.csv",
   "model_output_dir": "outputs/model",
   "recommendation_output_path": "outputs/recommendations.csv",
-  "emi_cycle": ["5"],
   "allowed_day_offsets": [-5,-4,-3,-2,-1,1,2,3,4,5],
   "risk_quota": {
     "low": 1,
