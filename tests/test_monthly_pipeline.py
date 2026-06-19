@@ -32,6 +32,7 @@ from run_monthly_inference_pipeline import (
     build_campaign_recommendations,
     month_label,
     resolve_campaign_vendors,
+    resolve_campaign_vendors_by_mode,
     selected_history_files,
     validate_month_pair,
 )
@@ -520,6 +521,68 @@ def test_resolve_campaign_vendors_normalizes_csv_vendor_variants() -> None:
     assert vendors == ["prutech", "kaleyra"]
 
 
+def test_resolve_campaign_vendors_by_mode_reads_service_specific_keys() -> None:
+    class DummyResult:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class DummyConn:
+        def execute(self, query, params):
+            key = params[0]
+            values = {
+                "sms.service.vendor-list": ("kaleyra,prutech",),
+                "voice.service.vendor-list": ("value-first,prutech-cpass",),
+                "whatsapp.service.vendor-list": ("prutech-v2,kaleyra",),
+            }
+            return DummyResult(values.get(key))
+
+    vendors = resolve_campaign_vendors_by_mode(
+        DummyConn(),
+        source_schema="digital_collections",
+        target_schema="digital_collections",
+        fallback_vendor="prutech-cpass",
+        logger=__import__("logging").getLogger("test_vendor"),
+    )
+
+    assert vendors == {
+        "SMS": ["kaleyra", "prutech"],
+        "VOICE": ["value", "prutech"],
+        "WHATSAPP": ["prutech", "kaleyra"],
+    }
+
+
+def test_resolve_campaign_vendors_supports_active_service_json_values() -> None:
+    class DummyResult:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class DummyConn:
+        def execute(self, query, params):
+            key = params[0]
+            values = {
+                "sms.service.vendor-list": ('[{"active_Service": "KALEYRA"}, {"active_Service": "PRUTECH-CPASS"}]',),
+                "voice.service.vendor-list": (None,),
+                "whatsapp.service.vendor-list": (None,),
+            }
+            return DummyResult(values.get(key))
+
+    vendors = resolve_campaign_vendors_by_mode(
+        DummyConn(),
+        source_schema="digital_collections",
+        target_schema="digital_collections",
+        fallback_vendor="prutech-cpass",
+        logger=__import__("logging").getLogger("test_vendor"),
+    )
+
+    assert vendors["SMS"] == ["kaleyra", "prutech"]
+
+
 def test_predict_top_k_by_risk_uses_bucket_quota() -> None:
     class DummyModel:
         def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
@@ -726,8 +789,8 @@ def test_build_prediction_reason_explains_matching_success_signal() -> None:
     )
 
     assert reason["D-5"] == (
-        "SMS at 9AM in Hindi is recommended because SMS has shown positive response patterns "
-        "and can be used as an early reminder."
+        "SMS at 9AM in Hindi is recommended as an early EMI reminder. "
+        "This is a light-touch communication before the due date and is suitable for starting the follow-up journey."
     )
 
 
@@ -751,8 +814,8 @@ def test_build_prediction_reason_respects_no_campaign_primary_rank() -> None:
     reason = json.loads(build_prediction_reason(prediction_row=prediction_row, source_row=source_row))
 
     assert reason["D+2"] == (
-        "No campaign is the primary recommendation; SMS at 8AM in Regional is kept as an alternate option "
-        "because SMS is a suitable follow-up channel based on past communication history."
+        "No campaign is recommended as the primary action to avoid frequent follow-up after the due date. "
+        "SMS at 8AM in Regional language can be used as an alternate reminder if additional follow-up is required."
     )
 
 
@@ -762,8 +825,7 @@ def test_build_prediction_reason_explains_no_history_blank_predictions() -> None
     reason = json.loads(build_prediction_reason(prediction_row=prediction_row, source_row=None))
 
     assert reason["D-5"] == (
-        "No campaign is recommended because past communication history does not show enough "
-        "early-reminder evidence for this day."
+        "No campaign is recommended as the primary action to avoid excessive communication before the due date."
     )
     assert set(reason) == set(DAY_COLUMNS)
 

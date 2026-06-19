@@ -57,7 +57,11 @@ NAME_CHANNEL_BY_MODE = {
     "WHATSAPP": "WA",
     "VOICE": "VOICE",
 }
-VENDOR_CONFIG_KEY = "voice.service.vendor-list"
+VENDOR_CONFIG_KEYS = {
+    "SMS": "sms.service.vendor-list",
+    "VOICE": "voice.service.vendor-list",
+    "WHATSAPP": "whatsapp.service.vendor-list",
+}
 EMI_DATES_CONFIG_KEY = "upload.scheduler.emi-dates"
 
 
@@ -810,7 +814,7 @@ def _extract_campaign_vendors(raw_value: object) -> list[str]:
         items = raw_value
     elif isinstance(raw_value, dict):
         items = []
-        for key in ("vendor", "vendors", "name", "value"):
+        for key in ("active_Service", "active_service", "activeService", "vendor", "vendors", "name", "value"):
             if key in raw_value:
                 items.append(raw_value[key])
     else:
@@ -846,6 +850,80 @@ def _extract_campaign_vendors(raw_value: object) -> list[str]:
     return vendors
 
 
+def _candidate_data_config_refs(source_schema: str, target_schema: str) -> list[sql.Composable]:
+    candidate_refs: list[sql.Composable] = [sql.Identifier("data_config")]
+    seen = {"data_config"}
+    for schema_name in (source_schema, target_schema):
+        key = f"{schema_name}.data_config"
+        if schema_name and key not in seen:
+            seen.add(key)
+            candidate_refs.append(sql.SQL("{}.{}").format(sql.Identifier(schema_name), sql.Identifier("data_config")))
+    return candidate_refs
+
+
+def resolve_campaign_vendors_by_mode(
+    conn,
+    *,
+    source_schema: str,
+    target_schema: str,
+    fallback_vendor: str,
+    logger: logging.Logger,
+) -> dict[str, list[str]]:
+    candidate_refs = _candidate_data_config_refs(source_schema, target_schema)
+    fallback_vendors = _extract_campaign_vendors(fallback_vendor)
+    vendor_map: dict[str, list[str]] = {}
+
+    for mode, config_key in VENDOR_CONFIG_KEYS.items():
+        resolved_vendors: list[str] = []
+        for table_ref in candidate_refs:
+            try:
+                row = conn.execute(
+                    sql.SQL("SELECT value FROM {} WHERE key_name = %s LIMIT 1").format(table_ref),
+                    (config_key,),
+                ).fetchone()
+            except errors.UndefinedTable:
+                conn.rollback()
+                continue
+            except Exception:
+                logger.exception("Vendor lookup failed for mode=%s key=%s. Using fallback vendor.", mode, config_key)
+                conn.rollback()
+                break
+
+            if not row:
+                continue
+
+            resolved_vendors = _extract_campaign_vendors(row[0])
+            if resolved_vendors:
+                logger.info(
+                    "Resolved campaign vendors from data_config | mode=%s key=%s vendors=%s",
+                    mode,
+                    config_key,
+                    resolved_vendors,
+                )
+                break
+
+        if resolved_vendors:
+            vendor_map[mode] = resolved_vendors
+        elif fallback_vendors:
+            logger.warning(
+                "Using fallback campaign vendors | mode=%s fallback_vendors=%s key=%s",
+                mode,
+                fallback_vendors,
+                config_key,
+            )
+            vendor_map[mode] = fallback_vendors
+        else:
+            logger.warning(
+                "Using raw fallback campaign vendor | mode=%s fallback_vendor=%s key=%s",
+                mode,
+                fallback_vendor,
+                config_key,
+            )
+            vendor_map[mode] = [fallback_vendor]
+
+    return vendor_map
+
+
 def resolve_campaign_vendors(
     conn,
     *,
@@ -854,50 +932,21 @@ def resolve_campaign_vendors(
     fallback_vendor: str,
     logger: logging.Logger,
 ) -> list[str]:
-    candidate_refs: list[sql.Composable] = [sql.Identifier("data_config")]
-    seen = {"data_config"}
-    for schema_name in (source_schema, target_schema):
-        key = f"{schema_name}.data_config"
-        if schema_name and key not in seen:
-            seen.add(key)
-            candidate_refs.append(sql.SQL("{}.{}").format(sql.Identifier(schema_name), sql.Identifier("data_config")))
-
-    for table_ref in candidate_refs:
-        try:
-            row = conn.execute(
-                sql.SQL("SELECT value FROM {} WHERE key_name = %s LIMIT 1").format(table_ref),
-                (VENDOR_CONFIG_KEY,),
-            ).fetchone()
-        except errors.UndefinedTable:
-            conn.rollback()
-            continue
-        except Exception:
-            logger.exception("Vendor lookup failed. Using fallback vendor.")
-            conn.rollback()
-            break
-
-        if not row:
-            continue
-
-        vendors = _extract_campaign_vendors(row[0])
-        if vendors:
-            logger.info("Resolved campaign vendors from data_config | key=%s vendors=%s", VENDOR_CONFIG_KEY, vendors)
-            return vendors
-
-    fallback_vendors = _extract_campaign_vendors(fallback_vendor)
-    if fallback_vendors:
-        logger.warning(
-            "Using fallback campaign vendors | fallback_vendors=%s key=%s",
-            fallback_vendors,
-            VENDOR_CONFIG_KEY,
-        )
-        return fallback_vendors
-    logger.warning(
-        "Using raw fallback campaign vendor | fallback_vendor=%s key=%s",
-        fallback_vendor,
-        VENDOR_CONFIG_KEY,
+    vendor_map = resolve_campaign_vendors_by_mode(
+        conn,
+        source_schema=source_schema,
+        target_schema=target_schema,
+        fallback_vendor=fallback_vendor,
+        logger=logger,
     )
-    return [fallback_vendor]
+    vendors: list[str] = []
+    seen: set[str] = set()
+    for mode in ("SMS", "VOICE", "WHATSAPP"):
+        for vendor in vendor_map.get(mode, []):
+            if vendor not in seen:
+                seen.add(vendor)
+                vendors.append(vendor)
+    return vendors
 
 
 def _join_campaign_days(values: pd.Series) -> str:
@@ -1080,7 +1129,8 @@ def _build_campaign_assignment_groups(
     model_name: str,
     emi_cycles: list[int],
     vertical: str,
-    vendors: list[str],
+    vendors: list[str] | None = None,
+    vendor_map: dict[str, list[str]] | None = None,
     configured_emi_dates: list[str] | None = None,
     run_token: str,
 ) -> pd.DataFrame:
@@ -1109,7 +1159,8 @@ def _build_campaign_assignment_groups(
                 )
                 emi_cycle = _resolve_row_emi_cycle(row, emi_cycles)
                 dataset_name = f"{due_type}|{NAME_CHANNEL_BY_MODE[mode]}|{vertical_value}|{language}|{risk_code}|{emi_cycle}"
-                for vendor in vendors:
+                mode_vendors = (vendor_map or {}).get(mode) or vendors or []
+                for vendor in mode_vendors:
                     base_name = _scheduler_name(
                         due_type=due_type,
                         mode=mode,
@@ -1190,7 +1241,8 @@ def _prepare_campaign_outputs(
     model_name: str,
     emi_cycles: list[int],
     vertical: str,
-    vendors: list[str],
+    vendors: list[str] | None = None,
+    vendor_map: dict[str, list[str]] | None = None,
     configured_emi_dates: list[str] | None = None,
     run_date: datetime | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -1203,6 +1255,7 @@ def _prepare_campaign_outputs(
         emi_cycles=emi_cycles,
         vertical=vertical,
         vendors=vendors,
+        vendor_map=vendor_map,
         configured_emi_dates=configured_emi_dates or [],
         run_token=run_token,
     )
@@ -1835,7 +1888,7 @@ def main() -> None:
                     password=args.password,
                 )
                 with connect_db(config) as conn:
-                    campaign_vendors = resolve_campaign_vendors(
+                    campaign_vendor_map = resolve_campaign_vendors_by_mode(
                         conn,
                         source_schema=args.source_schema,
                         target_schema=args.target_schema,
@@ -1863,7 +1916,8 @@ def main() -> None:
                         model_name=args.model,
                         emi_cycles=_derive_emi_cycles_from_dates(configured_emi_dates),
                         vertical=args.campaign_vertical,
-                        vendors=campaign_vendors,
+                        vendors=_extract_campaign_vendors(args.campaign_vendor) or [args.campaign_vendor],
+                        vendor_map=campaign_vendor_map,
                         configured_emi_dates=configured_emi_dates or [],
                     )
                     campaign_rows = store_campaign_recommendations(

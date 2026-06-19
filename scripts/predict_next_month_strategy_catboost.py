@@ -171,7 +171,8 @@ def _readable_strategy(label: str) -> str:
         return "no campaign"
     channel, hour, language = parts
     channel_name = {"SMS": "SMS", "WH": "WhatsApp", "VOICE": "voice call"}.get(channel, channel)
-    return f"{channel_name} at {hour} in {language.title()}"
+    language_name = "Regional language" if language.upper() == "REGIONAL" else language.title()
+    return f"{channel_name} at {hour} in {language_name}"
 
 
 def _ranked_business_labels(predicted: object) -> list[str]:
@@ -195,22 +196,16 @@ def _has_channel_success(source_row: pd.Series | None, channel: str) -> bool:
 
 def _no_campaign_reason(day: str) -> str:
     if day == "D":
-        return "No campaign is recommended because this is the EMI due date."
-    if day == "D-1":
-        return "No campaign is recommended because there is no strong day-specific evidence for a suitable contact before the EMI date."
-    if day == "D-2":
-        return "No campaign is recommended because past communication history does not show enough evidence for an effective campaign on this day."
-    if day == "D-4":
-        return "No campaign is recommended because there is no strong successful signal for this day."
+        return "No campaign is recommended as the primary action on the EMI due date to avoid unnecessary communication."
     if day.startswith("D-"):
-        return "No campaign is recommended because past communication history does not show enough early-reminder evidence for this day."
-    return "No campaign is recommended because past communication history does not show enough post-due follow-up evidence for this day."
+        return "No campaign is recommended as the primary action to avoid excessive communication before the due date."
+    return "No campaign is recommended as the primary action to avoid frequent follow-up after the due date."
 
 
 def _business_reason_for_label(label: str, day: str, source_row: pd.Series | None) -> str:
     parts = _strategy_parts(label)
     if not parts:
-        return "Campaign is recommended based on the customer's past communication pattern."
+        return "Campaign is recommended because it is aligned with the customer's past communication pattern."
 
     channel, _hour, language = parts
     readable = _readable_strategy(label)
@@ -222,74 +217,62 @@ def _business_reason_for_label(label: str, day: str, source_row: pd.Series | Non
 
     if channel == "SMS":
         if day == "D-5":
-            return f"{readable} is recommended because SMS has shown positive response patterns and can be used as an early reminder."
-        if day == "D-1":
-            return f"{readable} is recommended because SMS is suitable for a final reminder before the EMI date."
+            return f"{readable} is recommended as an early EMI reminder. This is a light-touch communication before the due date and is suitable for starting the follow-up journey."
+        if day == "D-4":
+            return f"{readable} is recommended because SMS has been an effective communication channel for this customer in earlier interactions."
         if day == "D+1":
-            return f"{readable} is recommended because SMS has shown a positive response pattern for this customer."
+            return f"{readable} is recommended as an immediate post-due follow-up, as SMS has worked well for this customer in previous communication."
         if day == "D+2":
             if language == "REGIONAL":
-                return f"{readable} is recommended because SMS is a suitable follow-up channel based on the customer's past communication history."
-            return f"{readable} is recommended because SMS is a suitable early post-due follow-up channel for this customer."
+                return f"{readable} is recommended as a post-due reminder. Regional language communication may help improve customer understanding and response."
+            return f"{readable} is recommended as a post-due reminder because SMS has remained suitable for follow-up after the due date."
         if day == "D+3":
-            return f"{readable} is recommended because SMS has shown better suitability for post-due follow-up communication."
-        if day == "D+4":
-            if language == "REGIONAL":
-                return f"{readable} is recommended because regional SMS can improve customer reach based on past digital communication behavior."
-            return f"{readable} is recommended because SMS is suitable for continued post-due follow-up based on past activity."
+            return f"{readable} is recommended because SMS remains a suitable follow-up channel if payment is still pending."
         if day == "D+5":
-            return f"{readable} is recommended because SMS remains the preferred follow-up channel based on previous response patterns."
+            return f"{readable} is recommended because SMS remains a suitable follow-up option if the account still requires attention."
         if has_exact_success or has_channel_success:
-            return f"{readable} is recommended because SMS has shown a positive response pattern for this customer."
+            return f"{readable} is recommended because SMS has worked well for this customer in previous communication."
         if language == "REGIONAL" and is_postdue:
-            return f"{readable} is recommended because regional SMS may improve customer reach after the EMI due date."
+            return f"{readable} is recommended because regional language communication may help improve customer understanding and response."
         if is_predue and totals["SMS"] >= max(totals["WH"], totals["VOICE"]):
-            return f"{readable} is recommended because SMS has been frequently used and is suitable before the EMI due date."
-        return f"{readable} is recommended because SMS is a suitable channel based on the customer's past campaign activity."
+            return f"{readable} is recommended because SMS has been a suitable communication channel for this customer before the due date."
+        return f"{readable} is recommended because it is aligned with the customer's past communication pattern."
 
     if channel == "WH":
         if has_exact_success or has_channel_success or totals["WH"] >= max(totals["SMS"], totals["VOICE"]):
-            return f"{readable} is recommended because WhatsApp has shown better engagement in the customer's past communication history."
-        return f"{readable} is recommended because the customer has relevant past digital communication activity."
+            return f"{readable} is recommended because WhatsApp has been an effective communication channel for this customer in earlier interactions."
+        return f"{readable} is recommended because it is a suitable digital reminder option for this customer."
 
     if channel == "VOICE":
         if has_exact_success or has_channel_success:
-            return f"{readable} is recommended because past voice communication has shown a positive response signal."
-        return f"{readable} is recommended as an alternate contact option based on the customer's overall communication pattern."
+            return f"{readable} is recommended because direct customer interaction has shown a positive response in earlier communication."
+        return f"{readable} is recommended because direct customer interaction may be helpful for this account."
 
-    return f"{readable} is recommended based on the customer's past communication history."
+    return f"{readable} is recommended because it is aligned with the customer's past communication pattern."
 
 def _business_alternate_reason_for_label(label: str, day: str, source_row: pd.Series | None) -> str:
     parts = _strategy_parts(label)
     if not parts:
-        return "campaign is kept as an alternate option based on the customer's past communication pattern."
+        return "An alternate communication option can be used if additional follow-up is required."
 
     channel, _hour, language = parts
     readable = _readable_strategy(label)
     if channel == "SMS":
-        if day == "D-5":
-            return f"{readable} is kept as an alternate option because SMS can be used as an early reminder."
         if day == "D-1":
-            return f"{readable} is kept as an alternate option for a final reminder before the EMI date."
-        if day == "D+2":
-            return f"{readable} is kept as an alternate option because SMS is a suitable follow-up channel based on past communication history."
+            return f"{readable} can be used as a final reminder before the EMI due date."
         if day == "D+3":
-            return f"{readable} is kept as an alternate option because SMS has shown suitability for post-due follow-up communication."
-        if day == "D+4":
-            if language == "REGIONAL":
-                return f"{readable} is kept as an alternate option because regional SMS can improve customer reach based on past digital communication behavior."
-            return f"{readable} is kept as an alternate option because SMS is suitable for continued post-due follow-up."
+            return f"{readable} can be used as an alternate reminder if payment is still pending."
         if day == "D+5":
-            return f"{readable} is kept as an alternate option because SMS remains a suitable follow-up channel based on previous response patterns."
-        return f"{readable} is kept as an alternate option because SMS has shown a positive response pattern for this customer."
+            return f"{readable} can be used as a follow-up option if the account still requires attention."
+        return f"{readable} can be used as an alternate reminder if additional follow-up is required."
 
     if channel == "WH":
-        return f"{readable} is kept as an alternate option because WhatsApp has shown engagement in the customer's past communication history."
+        return f"{readable} can be used as an alternate reminder if additional follow-up is required."
 
     if channel == "VOICE":
-        return f"{readable} is kept as an alternate contact option based on the customer's communication pattern."
+        return f"{readable} can be used as an alternate option if direct customer interaction is required."
 
-    return f"{readable} is kept as an alternate option based on the customer's past communication history."
+    return f"{readable} can be used as an alternate option if additional follow-up is required."
 
 
 def build_prediction_reason(
@@ -307,7 +290,7 @@ def build_prediction_reason(
         first_label = ranked_labels[0] if ranked_labels else "-"
         alternate_label = next((label for label in ranked_labels[1:] if label != "-"), None)
         if first_label == "-" and alternate_label is not None:
-            payload[day] = "No campaign is the primary recommendation; " + _business_alternate_reason_for_label(
+            payload[day] = _no_campaign_reason(day) + " " + _business_alternate_reason_for_label(
                 alternate_label,
                 day,
                 source_row,
