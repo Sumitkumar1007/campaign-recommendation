@@ -316,6 +316,21 @@ def test_auth_and_status_route() -> None:
     assert payload["currentDrift"] == 4.8
 
 
+def test_auth_invalid_credentials_returns_clear_message() -> None:
+    service = build_service()
+    app = AIMLApiApp(service)
+
+    status, payload = invoke(
+        app,
+        method="POST",
+        path="/api/v1/auth",
+        body={"username": "aiml", "password": "wrong"},
+    )
+
+    assert status.startswith("401")
+    assert payload == {"message": "Username or password is incorrect."}
+
+
 def test_unknown_api_path_returns_not_found_before_auth() -> None:
     service = build_service()
     app = AIMLApiApp(service)

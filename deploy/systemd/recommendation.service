@@ -11,7 +11,7 @@ WorkingDirectory=/home/ubuntu/aiml/recommendation
 Environment=PYTHONUNBUFFERED=1
 Environment=API_HOST=0.0.0.0
 Environment=API_PORT=8040
-Environment=GUNICORN_WORKERS=4
+Environment=GUNICORN_WORKERS=1
 Environment=GUNICORN_THREADS=8
 Environment=GUNICORN_TIMEOUT=300
 EnvironmentFile=-/home/ubuntu/aiml/recommendation/.env

@@ -885,7 +885,7 @@ class AIMLApiService:
         username = str(payload.get("username", ""))
         password = str(payload.get("password", ""))
         if not self.auth_manager.authenticate(username, password):
-            return HTTPStatus.UNAUTHORIZED, {"message": "Authentication failed."}
+            return HTTPStatus.UNAUTHORIZED, {"message": "Username or password is incorrect."}
         return HTTPStatus.OK, self.auth_manager.issue_token(username)
 
     def model_status(self) -> tuple[int, dict[str, Any]]:
