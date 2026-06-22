@@ -86,7 +86,7 @@ def safe_emi_date_sql(alias: str = "c") -> sql.Composed:
     return sql.SQL(
         """
         CASE
-            WHEN {alias}.emi_date ~ '^[0-9]{2}/[0-9]{2}/[0-9]{4}$'
+            WHEN {alias}.emi_date ~ '^[0-9]{{2}}/[0-9]{{2}}/[0-9]{{4}}$'
              AND split_part({alias}.emi_date, '/', 2)::int BETWEEN 1 AND 12
              AND split_part({alias}.emi_date, '/', 1)::int BETWEEN 1 AND 31
              AND split_part({alias}.emi_date, '/', 3)::int BETWEEN 1900 AND 2999
