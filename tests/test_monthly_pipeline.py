@@ -496,7 +496,7 @@ def test_resolve_campaign_vendors_reads_all_vendors_from_json_list() -> None:
         logger=__import__("logging").getLogger("test_vendor"),
     )
 
-    assert vendors == ["kaleyra", "prutech"]
+    assert vendors == ["kaleyra", "prutech-cpass", "prutech"]
 
 
 def test_resolve_campaign_vendors_normalizes_csv_vendor_variants() -> None:
@@ -519,7 +519,7 @@ def test_resolve_campaign_vendors_normalizes_csv_vendor_variants() -> None:
         logger=__import__("logging").getLogger("test_vendor"),
     )
 
-    assert vendors == ["prutech", "kaleyra"]
+    assert vendors == ["prutech-cpass", "prutech", "kaleyra"]
 
 
 def test_resolve_campaign_vendors_by_mode_reads_service_specific_keys() -> None:
@@ -550,8 +550,8 @@ def test_resolve_campaign_vendors_by_mode_reads_service_specific_keys() -> None:
 
     assert vendors == {
         "SMS": ["kaleyra", "prutech"],
-        "VOICE": ["value", "prutech"],
-        "WHATSAPP": ["prutech", "kaleyra"],
+        "VOICE": ["value-first", "prutech-cpass"],
+        "WHATSAPP": ["prutech-v2", "kaleyra"],
     }
 
 
@@ -587,7 +587,7 @@ def test_resolve_active_campaign_vendors_by_mode_reads_current_month_active_serv
 
     assert vendors == {
         "SMS": ["kaleyra"],
-        "VOICE": ["prutech"],
+        "VOICE": ["prutech-cpass"],
         "WHATSAPP": ["kaleyra"],
     }
 
@@ -618,7 +618,7 @@ def test_resolve_campaign_vendors_supports_active_service_json_values() -> None:
         logger=__import__("logging").getLogger("test_vendor"),
     )
 
-    assert vendors["SMS"] == ["kaleyra", "prutech"]
+    assert vendors["SMS"] == ["kaleyra", "prutech-cpass"]
 
 
 def test_resolve_campaign_vendors_by_mode_filters_to_active_vendors() -> None:
@@ -660,8 +660,8 @@ def test_resolve_campaign_vendors_by_mode_filters_to_active_vendors() -> None:
 
     assert vendors == {
         "SMS": ["kaleyra"],
-        "VOICE": ["prutech"],
-        "WHATSAPP": ["prutech", "kaleyra"],
+        "VOICE": ["prutech-cpass"],
+        "WHATSAPP": ["prutech-v2", "kaleyra"],
     }
 
 

@@ -794,13 +794,11 @@ def _normalize_vendor_token(raw_value: object) -> str | None:
     if not vendor:
         return None
 
-    token = vendor.replace("_", "-").split("-", 1)[0].strip().lower()
+    token = vendor.replace("_", "-").strip().lower()
     if not token:
         return None
 
     alias_map = {
-        "prutech": "prutech",
-        "kaleyra": "kaleyra",
         "kaylera": "kaleyra",
     }
     return alias_map.get(token, token)
