@@ -1019,13 +1019,15 @@ def _load_prediction_context_lookup(prediction_file: Path, prediction_month_labe
 def _mapping_prediction_reason(row: pd.Series, context_lookup: dict[str, dict[str, object]]) -> str:
     loan_reasons = context_lookup.get(str(row["loan_number"]), {}).get("reasons", {})
     parts: list[str] = []
+    seen: set[str] = set()
     for day in str(row["date"]).split(","):
         day = day.strip()
         if not day:
             continue
         reason = loan_reasons.get(day)
-        if reason:
-            parts.append(f"{day}: {reason}")
+        if reason and reason not in seen:
+            seen.add(reason)
+            parts.append(reason)
     if parts:
         return " ".join(parts)
     return "Reason not available from prediction output for this campaign mapping."

@@ -409,7 +409,7 @@ def test_build_campaign_mappings_includes_business_readable_reason(tmp_path: Pat
 
     assert "prediction_reason" in mappings.columns
     assert mappings.loc[0, "language"] == "HINDI"
-    assert mappings.loc[0, "prediction_reason"].startswith("D-5: SMS at 9AM in Hindi is recommended")
+    assert mappings.loc[0, "prediction_reason"].startswith("SMS at 9AM in Hindi is recommended")
     assert "early reminder" in mappings.loc[0, "prediction_reason"]
 
 
