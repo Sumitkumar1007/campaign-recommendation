@@ -814,8 +814,32 @@ def test_build_prediction_reason_respects_no_campaign_primary_rank() -> None:
     reason = json.loads(build_prediction_reason(prediction_row=prediction_row, source_row=source_row))
 
     assert reason["D+2"] == (
-        "No campaign is recommended as the primary action to avoid frequent follow-up after the due date. "
+        "At this stage, no campaign is recommended to prevent excessive communication with the customer. "
         "SMS at 8AM in Regional language can be used as an alternate reminder if additional follow-up is required."
+    )
+
+
+def test_build_prediction_reason_uses_business_friendly_d_plus_5_language() -> None:
+    prediction_row = pd.Series(
+        {
+            "SOURCE_RISK": "MEDIUM",
+            "D+5": "-|SMS-3PM-ENGLISH",
+        }
+    )
+    source_row = pd.Series(
+        {
+            "RISK": "MEDIUM",
+            "SMS_TOTAL_INTENSITY": 2,
+            "WH_TOTAL_INTENSITY": 0,
+            "VOICE_TOTAL_INTENSITY": 0,
+        }
+    )
+
+    reason = json.loads(build_prediction_reason(prediction_row=prediction_row, source_row=source_row))
+
+    assert reason["D+5"] == (
+        "At this stage, no campaign is recommended to prevent excessive communication with the customer. "
+        "If the account still requires follow-up five days after the Cycle date, an English SMS may be sent at 3:00 PM as the next course of action."
     )
 
 

@@ -165,6 +165,16 @@ def _matching_success_signal(row: pd.Series, label: str) -> tuple[str, float]:
     return (column, value) if value > 0 else ("", 0.0)
 
 
+def _business_friendly_time(hour: str) -> str:
+    normalized = str(hour).upper().strip()
+    if normalized.endswith("AM") or normalized.endswith("PM"):
+        suffix = normalized[-2:]
+        value = normalized[:-2]
+        if value.isdigit():
+            return f"{int(value)}:00 {suffix}"
+    return hour
+
+
 def _readable_strategy(label: str) -> str:
     parts = _strategy_parts(label)
     if not parts:
@@ -199,7 +209,7 @@ def _no_campaign_reason(day: str) -> str:
         return "No campaign is recommended as the primary action on the EMI due date to avoid unnecessary communication."
     if day.startswith("D-"):
         return "No campaign is recommended as the primary action to avoid excessive communication before the due date."
-    return "No campaign is recommended as the primary action to avoid frequent follow-up after the due date."
+    return "At this stage, no campaign is recommended to prevent excessive communication with the customer."
 
 
 def _business_reason_for_label(label: str, day: str, source_row: pd.Series | None) -> str:
@@ -255,7 +265,7 @@ def _business_alternate_reason_for_label(label: str, day: str, source_row: pd.Se
     if not parts:
         return "An alternate communication option can be used if additional follow-up is required."
 
-    channel, _hour, language = parts
+    channel, hour, language = parts
     readable = _readable_strategy(label)
     if channel == "SMS":
         if day == "D-1":
@@ -263,7 +273,9 @@ def _business_alternate_reason_for_label(label: str, day: str, source_row: pd.Se
         if day == "D+3":
             return f"{readable} can be used as an alternate reminder if payment is still pending."
         if day == "D+5":
-            return f"{readable} can be used as a follow-up option if the account still requires attention."
+            time_text = _business_friendly_time(hour)
+            language_text = "regional language" if language == "REGIONAL" else language.title()
+            return f"If the account still requires follow-up five days after the Cycle date, an {language_text} SMS may be sent at {time_text} as the next course of action."
         return f"{readable} can be used as an alternate reminder if additional follow-up is required."
 
     if channel == "WH":
