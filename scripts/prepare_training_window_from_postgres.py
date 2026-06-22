@@ -14,6 +14,7 @@ from fetch_month_from_postgres import (
     default_output_file,
     emi_cycle_dates,
     resolve_scheduler_emi_cycle,
+    safe_emi_date_sql,
     write_query_to_csv,
 )
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
@@ -62,15 +63,20 @@ def parse_args() -> argparse.Namespace:
 
 def latest_available_source_months(conn, schema: str, table: str, raw_month_count: int) -> list[str]:
     table_ref = qualified_identifier(schema, table)
+    parsed_emi_date = safe_emi_date_sql("c")
     query = sql.SQL(
         """
-        SELECT DISTINCT TO_CHAR(DATE_TRUNC('month', TO_DATE(c.emi_date, 'DD/MM/YYYY')), 'YYYY-MM') AS source_month
-        FROM {table_ref} c
-        WHERE c.emi_date IS NOT NULL
+        WITH parsed AS (
+            SELECT {parsed_emi_date} AS parsed_emi_date
+            FROM {table_ref} c
+        )
+        SELECT DISTINCT TO_CHAR(DATE_TRUNC('month', parsed_emi_date), 'YYYY-MM') AS source_month
+        FROM parsed
+        WHERE parsed_emi_date IS NOT NULL
         ORDER BY source_month DESC
         LIMIT %s
         """
-    ).format(table_ref=table_ref)
+    ).format(table_ref=table_ref, parsed_emi_date=parsed_emi_date)
     rows = conn.execute(query, (raw_month_count,)).fetchall()
     months_desc = [row[0] for row in rows if row and row[0]]
     months_desc.sort()

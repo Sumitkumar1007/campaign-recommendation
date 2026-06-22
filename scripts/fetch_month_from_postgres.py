@@ -81,6 +81,35 @@ def default_output_file(source_month: str) -> Path:
 EMI_DATES_CONFIG_KEY = "upload.scheduler.emi-dates"
 
 
+def safe_emi_date_sql(alias: str = "c") -> sql.Composed:
+    alias_identifier = sql.Identifier(alias)
+    return sql.SQL(
+        """
+        CASE
+            WHEN {alias}.emi_date ~ '^[0-9]{2}/[0-9]{2}/[0-9]{4}$'
+             AND split_part({alias}.emi_date, '/', 2)::int BETWEEN 1 AND 12
+             AND split_part({alias}.emi_date, '/', 1)::int BETWEEN 1 AND 31
+             AND split_part({alias}.emi_date, '/', 3)::int BETWEEN 1900 AND 2999
+             AND split_part({alias}.emi_date, '/', 1)::int <= EXTRACT(
+                   DAY FROM (
+                       make_date(
+                           split_part({alias}.emi_date, '/', 3)::int,
+                           split_part({alias}.emi_date, '/', 2)::int,
+                           1
+                       ) + INTERVAL '1 month - 1 day'
+                   )
+               )
+            THEN make_date(
+                split_part({alias}.emi_date, '/', 3)::int,
+                split_part({alias}.emi_date, '/', 2)::int,
+                split_part({alias}.emi_date, '/', 1)::int
+            )
+            ELSE NULL
+        END
+        """
+    ).format(alias=alias_identifier)
+
+
 def current_month(today: pd.Timestamp | None = None) -> str:
     return (today or pd.Timestamp.today()).strftime("%Y-%m")
 
@@ -147,28 +176,45 @@ def emi_cycle_dates(
 
 def build_query(schema: str, table: str) -> sql.Composed:
     table_ref = qualified_identifier(schema, table)
-    where_sql = sql.SQL("TO_DATE(c.emi_date, 'DD/MM/YYYY') = ANY(%(emi_dates)s)")
+    parsed_emi_date = safe_emi_date_sql("src")
 
     return sql.SQL(
         """
+        WITH parsed AS (
+            SELECT
+                src.id,
+                src.apac_card_number,
+                src.comm_status,
+                src.communication_type,
+                src.verbiage_language,
+                src.vertical,
+                src.risk,
+                {parsed_emi_date} AS emi_date,
+                EXTRACT(HOUR FROM date_trunc('hour', src.created_date)) AS hr,
+                CAST(src.created_date AS DATE) AS date,
+                src.collectable_amount,
+                src.created_date,
+                src.last_modified_date
+            FROM {table_ref} src
+        )
         SELECT
-            c.id,
-            c.apac_card_number,
-            c.comm_status,
-            c.communication_type,
-            c.verbiage_language,
-            c.vertical,
-            c.risk,
-            TO_DATE(c.emi_date, 'DD/MM/YYYY') AS emi_date,
-            EXTRACT(HOUR FROM date_trunc('hour', c.created_date)) AS hr,
-            CAST(c.created_date AS DATE) AS date,
-            c.collectable_amount,
-            c.created_date,
-            c.last_modified_date
-        FROM {table_ref} c
-        WHERE {where_sql}
+            id,
+            apac_card_number,
+            comm_status,
+            communication_type,
+            verbiage_language,
+            vertical,
+            risk,
+            emi_date,
+            hr,
+            date,
+            collectable_amount,
+            created_date,
+            last_modified_date
+        FROM parsed
+        WHERE emi_date = ANY(%(emi_dates)s)
         """
-    ).format(table_ref=table_ref, where_sql=where_sql)
+    ).format(table_ref=table_ref, parsed_emi_date=parsed_emi_date)
 
 
 def write_query_to_csv(
