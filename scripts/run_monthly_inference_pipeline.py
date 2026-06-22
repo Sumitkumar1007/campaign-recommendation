@@ -861,11 +861,87 @@ def _candidate_data_config_refs(source_schema: str, target_schema: str) -> list[
     return candidate_refs
 
 
+def _normalize_mode_from_communication_type(value: object) -> str | None:
+    text = str(value or "").strip().upper()
+    if not text:
+        return None
+    return {
+        "SMS": "SMS",
+        "WH": "WHATSAPP",
+        "WHATSAPP": "WHATSAPP",
+        "VOICE": "VOICE",
+        "IVR": "VOICE",
+    }.get(text)
+
+
+def resolve_active_campaign_vendors_by_mode(
+    conn,
+    *,
+    source_schema: str,
+    source_table: str,
+    source_month: str,
+    logger: logging.Logger,
+) -> dict[str, list[str]]:
+    table_ref = qualified_identifier(source_schema, source_table)
+    start_ts = parse_month(source_month).to_timestamp()
+    end_ts = (parse_month(source_month) + 1).to_timestamp()
+    query = sql.SQL(
+        """
+        SELECT communication_type, active_service
+        FROM {table_ref}
+        WHERE created_date >= %s
+          AND created_date < %s
+          AND communication_type IS NOT NULL
+          AND active_service IS NOT NULL
+          AND BTRIM(active_service) <> ''
+        GROUP BY communication_type, active_service
+        """
+    ).format(table_ref=table_ref)
+
+    vendor_map: dict[str, list[str]] = {mode: [] for mode in VENDOR_CONFIG_KEYS}
+    try:
+        rows = conn.execute(query, (start_ts.to_pydatetime(), end_ts.to_pydatetime())).fetchall()
+    except errors.UndefinedTable:
+        conn.rollback()
+        logger.warning(
+            "Active vendor lookup skipped because source table was not found | schema=%s table=%s",
+            source_schema,
+            source_table,
+        )
+        return vendor_map
+    except Exception:
+        logger.exception(
+            "Active vendor lookup failed | schema=%s table=%s source_month=%s",
+            source_schema,
+            source_table,
+            source_month,
+        )
+        conn.rollback()
+        return vendor_map
+
+    for communication_type, active_service in rows:
+        mode = _normalize_mode_from_communication_type(communication_type)
+        vendor = _normalize_vendor_token(active_service)
+        if not mode or not vendor:
+            continue
+        if vendor not in vendor_map[mode]:
+            vendor_map[mode].append(vendor)
+
+    logger.info(
+        "Resolved active campaign vendors from communications | source_month=%s vendor_map=%s",
+        source_month,
+        vendor_map,
+    )
+    return vendor_map
+
+
 def resolve_campaign_vendors_by_mode(
     conn,
     *,
     source_schema: str,
     target_schema: str,
+    source_table: str = "communications",
+    source_month: str | None = None,
     fallback_vendor: str,
     logger: logging.Logger,
 ) -> dict[str, list[str]]:
@@ -921,7 +997,48 @@ def resolve_campaign_vendors_by_mode(
             )
             vendor_map[mode] = [fallback_vendor]
 
-    return vendor_map
+    if not source_month:
+        return vendor_map
+
+    active_vendor_map = resolve_active_campaign_vendors_by_mode(
+        conn,
+        source_schema=source_schema,
+        source_table=source_table,
+        source_month=source_month,
+        logger=logger,
+    )
+    if not any(active_vendor_map.values()):
+        logger.warning(
+            "No active vendors found in communications for source_month=%s. Using configured vendor map.",
+            source_month,
+        )
+        return vendor_map
+
+    filtered_vendor_map: dict[str, list[str]] = {}
+    for mode, configured_vendors in vendor_map.items():
+        active_vendors = active_vendor_map.get(mode, [])
+        if not active_vendors:
+            logger.info(
+                "No active vendors found for mode=%s source_month=%s. Using configured vendors from data_config.",
+                mode,
+                source_month,
+            )
+            filtered_vendor_map[mode] = configured_vendors
+            continue
+        filtered_vendors = [vendor for vendor in active_vendors if vendor in configured_vendors]
+        if not filtered_vendors:
+            logger.warning(
+                "Active vendors did not match configured vendors | mode=%s source_month=%s active_vendors=%s configured_vendors=%s. Using configured vendors from data_config.",
+                mode,
+                source_month,
+                active_vendors,
+                configured_vendors,
+            )
+            filtered_vendor_map[mode] = configured_vendors
+            continue
+        filtered_vendor_map[mode] = filtered_vendors
+
+    return filtered_vendor_map
 
 
 def resolve_campaign_vendors(
@@ -1161,7 +1278,7 @@ def _build_campaign_assignment_groups(
                 )
                 emi_cycle = _resolve_row_emi_cycle(row, emi_cycles)
                 dataset_name = f"{due_type}|{NAME_CHANNEL_BY_MODE[mode]}|{vertical_value}|{language}|{risk_code}|{emi_cycle}"
-                mode_vendors = (vendor_map or {}).get(mode) or vendors or []
+                mode_vendors = (vendor_map[mode] if vendor_map is not None and mode in vendor_map else (vendors or []))
                 for vendor in mode_vendors:
                     base_name = _scheduler_name(
                         due_type=due_type,
@@ -1894,6 +2011,8 @@ def main() -> None:
                         conn,
                         source_schema=args.source_schema,
                         target_schema=args.target_schema,
+                        source_table=args.source_table,
+                        source_month=args.source_month,
                         fallback_vendor=args.campaign_vendor,
                         logger=logger,
                     )

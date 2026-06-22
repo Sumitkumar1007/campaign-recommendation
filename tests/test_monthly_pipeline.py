@@ -31,6 +31,7 @@ from run_monthly_inference_pipeline import (
     build_campaign_mappings,
     build_campaign_recommendations,
     month_label,
+    resolve_active_campaign_vendors_by_mode,
     resolve_campaign_vendors,
     resolve_campaign_vendors_by_mode,
     selected_history_files,
@@ -554,6 +555,43 @@ def test_resolve_campaign_vendors_by_mode_reads_service_specific_keys() -> None:
     }
 
 
+def test_resolve_active_campaign_vendors_by_mode_reads_current_month_active_service() -> None:
+    class DummyResult:
+        def __init__(self, row=None, rows=None):
+            self._row = row
+            self._rows = rows or []
+
+        def fetchone(self):
+            return self._row
+
+        def fetchall(self):
+            return self._rows
+
+    class DummyConn:
+        def execute(self, query, params):
+            if len(params) == 2:
+                return DummyResult(rows=[
+                    ("SMS", "KALEYRA"),
+                    ("VOICE", "PRUTECH-CPASS"),
+                    ("WHATSAPP", "KALEYRA"),
+                ])
+            return DummyResult()
+
+    vendors = resolve_active_campaign_vendors_by_mode(
+        DummyConn(),
+        source_schema="digital_collections",
+        source_table="communications",
+        source_month="2026-06",
+        logger=__import__("logging").getLogger("test_vendor"),
+    )
+
+    assert vendors == {
+        "SMS": ["kaleyra"],
+        "VOICE": ["prutech"],
+        "WHATSAPP": ["kaleyra"],
+    }
+
+
 def test_resolve_campaign_vendors_supports_active_service_json_values() -> None:
     class DummyResult:
         def __init__(self, row):
@@ -581,6 +619,89 @@ def test_resolve_campaign_vendors_supports_active_service_json_values() -> None:
     )
 
     assert vendors["SMS"] == ["kaleyra", "prutech"]
+
+
+def test_resolve_campaign_vendors_by_mode_filters_to_active_vendors() -> None:
+    class DummyResult:
+        def __init__(self, row=None, rows=None):
+            self._row = row
+            self._rows = rows or []
+
+        def fetchone(self):
+            return self._row
+
+        def fetchall(self):
+            return self._rows
+
+    class DummyConn:
+        def execute(self, query, params):
+            if len(params) == 2:
+                return DummyResult(rows=[
+                    ("SMS", "KALEYRA"),
+                    ("VOICE", "PRUTECH-CPASS"),
+                ])
+            key = params[0]
+            values = {
+                "sms.service.vendor-list": ("kaleyra,prutech",),
+                "voice.service.vendor-list": ("value-first,prutech-cpass",),
+                "whatsapp.service.vendor-list": ("prutech-v2,kaleyra",),
+            }
+            return DummyResult(row=values.get(key))
+
+    vendors = resolve_campaign_vendors_by_mode(
+        DummyConn(),
+        source_schema="digital_collections",
+        target_schema="digital_collections",
+        source_table="communications",
+        source_month="2026-06",
+        fallback_vendor="prutech-cpass",
+        logger=__import__("logging").getLogger("test_vendor"),
+    )
+
+    assert vendors == {
+        "SMS": ["kaleyra"],
+        "VOICE": ["prutech"],
+        "WHATSAPP": ["prutech", "kaleyra"],
+    }
+
+
+def test_build_campaign_recommendations_honors_empty_vendor_map(tmp_path: Path) -> None:
+    prediction_file = tmp_path / "predictions_empty_vendor_map.csv"
+    pd.DataFrame(
+        {
+            "SOURCE_RISK": ["HIGH"],
+            "Loan_number": ["L1"],
+            "SOURCE_MONTH_USED": ["APR-2026"],
+            "MONTH": ["MAY-2026"],
+            "EMI_DATE": ["05/04/2026"],
+            "D-5": ["SMS-9AM-HINDI"],
+            "D-4": ["-"],
+            "D-3": ["-"],
+            "D-2": ["-"],
+            "D-1": ["-"],
+            "D": ["-"],
+            "D+1": ["-"],
+            "D+2": ["-"],
+            "D+3": ["-"],
+            "D+4": ["-"],
+            "D+5": ["-"],
+        }
+    ).to_csv(prediction_file, index=False)
+
+    campaigns, mappings = __import__("run_monthly_inference_pipeline")._prepare_campaign_outputs(
+        prediction_file,
+        source_month_label="APR-2026",
+        prediction_month_label="MAY-2026",
+        model_name="catboost_3m",
+        emi_cycles=[5],
+        vertical="LAP",
+        vendors=["prutech"],
+        vendor_map={"SMS": [], "VOICE": [], "WHATSAPP": []},
+        run_date=pd.Timestamp("2026-04-08").to_pydatetime(),
+    )
+
+    assert campaigns.empty
+    assert mappings.empty
 
 
 def test_predict_top_k_by_risk_uses_bucket_quota() -> None:
