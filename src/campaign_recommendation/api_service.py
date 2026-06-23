@@ -25,7 +25,7 @@ from psycopg import sql
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-VENV_PYTHON = REPO_ROOT / "venv" / "bin" / "python"
+DEFAULT_VENV_PYTHON = REPO_ROOT / "venv" / "bin" / "python"
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 LOG_DIR = REPO_ROOT / "artifacts" / "logs"
 MODEL_DIR = REPO_ROOT / "artifacts" / "models"
@@ -37,6 +37,13 @@ AI_CONFIG_UPDATE_INITIAL_DELAY_SECONDS = float(os.getenv("AI_CONFIG_UPDATE_INITI
 AI_CONFIG_UPDATE_WAIT_TIMEOUT_SECONDS = float(os.getenv("AI_CONFIG_UPDATE_WAIT_TIMEOUT_SECONDS", "60"))
 AI_CONFIG_UPDATE_WAIT_INTERVAL_SECONDS = float(os.getenv("AI_CONFIG_UPDATE_WAIT_INTERVAL_SECONDS", "1"))
 API_TIMEZONE = ZoneInfo("Asia/Kolkata")
+
+
+def resolve_venv_python() -> Path:
+    configured = os.getenv("VENV_PYTHON", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return DEFAULT_VENV_PYTHON
 
 
 def load_dotenv(path: Path | None = None) -> None:
@@ -1377,7 +1384,7 @@ class AIMLApiService:
 
     def _build_prepare_training_command(self, *, months: int) -> list[str]:
         return [
-            str(VENV_PYTHON),
+            str(resolve_venv_python()),
             str(SCRIPTS_DIR / "prepare_training_window_from_postgres.py"),
             "--months",
             str(months),
@@ -1400,7 +1407,7 @@ class AIMLApiService:
     ) -> list[str]:
         if model_name == "logistic":
             command = [
-                str(VENV_PYTHON),
+                str(resolve_venv_python()),
                 str(SCRIPTS_DIR / "train_next_month_strategy_model_logistic.py"),
                 "--model-file",
                 str(model_file),
@@ -1411,7 +1418,7 @@ class AIMLApiService:
             ]
         elif model_name in {"catboost", "catboost_3m"}:
             command = [
-                str(VENV_PYTHON),
+                str(resolve_venv_python()),
                 str(SCRIPTS_DIR / "train_next_month_strategy_model_catboost.py"),
                 "--history-window-months",
                 str(months),
@@ -1426,7 +1433,7 @@ class AIMLApiService:
             ]
         else:
             command = [
-                str(VENV_PYTHON),
+                str(resolve_venv_python()),
                 str(SCRIPTS_DIR / "train_next_month_strategy_model.py"),
                 "--model-file",
                 str(model_file),
@@ -1448,7 +1455,7 @@ class AIMLApiService:
 
     def _build_inference_command(self, *, source_month: str, predict_month: str, model_name: str) -> list[str]:
         return [
-            str(VENV_PYTHON),
+            str(resolve_venv_python()),
             str(SCRIPTS_DIR / "run_monthly_inference_pipeline.py"),
             "--source-month",
             source_month,
@@ -1466,7 +1473,7 @@ class AIMLApiService:
 
     def _build_export_command(self, *, source_month: str, predict_month: str, model_name: str) -> list[str]:
         command = [
-            str(VENV_PYTHON),
+            str(resolve_venv_python()),
             str(SCRIPTS_DIR / "export_recommendation_workbooks.py"),
             "--source-month",
             source_month,

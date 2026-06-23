@@ -331,6 +331,19 @@ def test_auth_invalid_credentials_returns_clear_message() -> None:
     assert payload == {"message": "Username or password is incorrect."}
 
 
+def test_build_inference_command_uses_venv_python_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = build_service()
+    monkeypatch.setenv("VENV_PYTHON", "/opt/custom/venv/bin/python")
+
+    command = service._build_inference_command(
+        source_month="2026-06",
+        predict_month="2026-07",
+        model_name="catboost_3m",
+    )
+
+    assert command[0] == "/opt/custom/venv/bin/python"
+
+
 def test_unknown_api_path_returns_not_found_before_auth() -> None:
     service = build_service()
     app = AIMLApiApp(service)
