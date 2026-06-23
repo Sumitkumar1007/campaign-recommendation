@@ -217,6 +217,107 @@ def build_query(schema: str, table: str) -> sql.Composed:
     ).format(table_ref=table_ref, parsed_emi_date=parsed_emi_date)
 
 
+def build_audit_summary(conn, *, schema: str, table: str, emi_dates: list[pd.Timestamp]) -> dict[str, object]:
+    table_ref = qualified_identifier(schema, table)
+    parsed_emi_date = safe_emi_date_sql("src")
+    params = {"emi_dates": [date.date() for date in emi_dates]}
+
+    aggregate_query = sql.SQL(
+        """
+        WITH parsed AS (
+            SELECT
+                NULLIF(BTRIM(src.emi_date), '') AS raw_emi_date,
+                NULLIF(BTRIM(src.communication_type), '') AS communication_type,
+                {parsed_emi_date} AS parsed_emi_date
+            FROM {table_ref} src
+        )
+        SELECT
+            COUNT(*) AS total_source_rows,
+            COUNT(*) FILTER (WHERE parsed_emi_date IS NULL) AS invalid_emi_date_rows,
+            COUNT(*) FILTER (WHERE parsed_emi_date IS NOT NULL) AS valid_emi_date_rows,
+            COUNT(*) FILTER (WHERE parsed_emi_date = ANY(%(emi_dates)s)) AS matched_emi_date_rows,
+            COUNT(*) FILTER (WHERE parsed_emi_date IS NOT NULL AND parsed_emi_date <> ALL(%(emi_dates)s)) AS excluded_emi_date_rows
+        FROM parsed
+        """
+    ).format(table_ref=table_ref, parsed_emi_date=parsed_emi_date)
+    aggregate_row = conn.execute(aggregate_query, params).fetchone()
+
+    invalid_values_query = sql.SQL(
+        """
+        WITH parsed AS (
+            SELECT
+                NULLIF(BTRIM(src.emi_date), '') AS raw_emi_date,
+                {parsed_emi_date} AS parsed_emi_date
+            FROM {table_ref} src
+        )
+        SELECT raw_emi_date, COUNT(*) AS row_count
+        FROM parsed
+        WHERE parsed_emi_date IS NULL
+          AND raw_emi_date IS NOT NULL
+        GROUP BY raw_emi_date
+        ORDER BY row_count DESC, raw_emi_date
+        LIMIT 20
+        """
+    ).format(table_ref=table_ref, parsed_emi_date=parsed_emi_date)
+    invalid_rows = conn.execute(invalid_values_query).fetchall()
+
+    excluded_values_query = sql.SQL(
+        """
+        WITH parsed AS (
+            SELECT
+                NULLIF(BTRIM(src.emi_date), '') AS raw_emi_date,
+                {parsed_emi_date} AS parsed_emi_date
+            FROM {table_ref} src
+        )
+        SELECT raw_emi_date, COUNT(*) AS row_count
+        FROM parsed
+        WHERE parsed_emi_date IS NOT NULL
+          AND parsed_emi_date <> ALL(%(emi_dates)s)
+          AND raw_emi_date IS NOT NULL
+        GROUP BY raw_emi_date
+        ORDER BY row_count DESC, raw_emi_date
+        LIMIT 20
+        """
+    ).format(table_ref=table_ref, parsed_emi_date=parsed_emi_date)
+    excluded_rows = conn.execute(excluded_values_query, params).fetchall()
+
+    matched_type_query = sql.SQL(
+        """
+        WITH parsed AS (
+            SELECT
+                NULLIF(BTRIM(src.communication_type), '') AS communication_type,
+                {parsed_emi_date} AS parsed_emi_date
+            FROM {table_ref} src
+        )
+        SELECT COALESCE(communication_type, 'NULL') AS communication_type, COUNT(*) AS row_count
+        FROM parsed
+        WHERE parsed_emi_date = ANY(%(emi_dates)s)
+        GROUP BY COALESCE(communication_type, 'NULL')
+        ORDER BY row_count DESC, communication_type
+        """
+    ).format(table_ref=table_ref, parsed_emi_date=parsed_emi_date)
+    matched_type_rows = conn.execute(matched_type_query, params).fetchall()
+
+    return {
+        "row_counts": {
+            "total_source_rows": int(aggregate_row[0] or 0),
+            "invalid_emi_date_rows": int(aggregate_row[1] or 0),
+            "valid_emi_date_rows": int(aggregate_row[2] or 0),
+            "matched_emi_date_rows": int(aggregate_row[3] or 0),
+            "excluded_emi_date_rows": int(aggregate_row[4] or 0),
+        },
+        "matched_communication_type_counts": {
+            str(row[0]): int(row[1]) for row in matched_type_rows
+        },
+        "top_invalid_emi_date_values": {
+            str(row[0]): int(row[1]) for row in invalid_rows
+        },
+        "top_excluded_emi_date_values": {
+            str(row[0]): int(row[1]) for row in excluded_rows
+        },
+    }
+
+
 def write_query_to_csv(
     conn,
     query: sql.Composed,
@@ -264,6 +365,7 @@ def main() -> None:
     with connect_db(config) as conn:
         emi_cycle = resolve_scheduler_emi_cycle(conn, schema=args.schema)
         emi_dates = emi_cycle_dates(emi_cycle, fetch_month=fetch_month)
+        audit_summary = build_audit_summary(conn, schema=args.schema, table=args.table, emi_dates=emi_dates)
         params = {"emi_dates": [date.date() for date in emi_dates]}
         row_count = write_query_to_csv(
             conn,
@@ -276,6 +378,17 @@ def main() -> None:
     formatted_dates = ", ".join(date.strftime("%d/%m/%Y") for date in emi_dates)
     print(f"Fetched {row_count:,} rows for EMI dates: {formatted_dates}")
     print(f"Saved raw month extract to {output_file}")
+    print(
+        "Fetch audit summary | "
+        + json.dumps(
+            {
+                "fetch_month": fetch_month,
+                "emi_dates": [date.strftime("%d/%m/%Y") for date in emi_dates],
+                **audit_summary,
+            },
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":

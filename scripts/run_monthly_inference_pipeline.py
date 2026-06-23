@@ -1012,31 +1012,39 @@ def resolve_campaign_vendors_by_mode(
         )
         return vendor_map
 
-    filtered_vendor_map: dict[str, list[str]] = {}
-    for mode, configured_vendors in vendor_map.items():
-        active_vendors = active_vendor_map.get(mode, [])
+    final_vendor_map: dict[str, list[str]] = {}
+    for mode, active_vendors in active_vendor_map.items():
+        configured_vendors = vendor_map.get(mode, [])
         if not active_vendors:
             logger.info(
-                "No active vendors found for mode=%s source_month=%s. Using configured vendors from data_config.",
+                "No active_service vendors found for mode=%s source_month=%s. Using configured vendors from data_config.",
                 mode,
                 source_month,
             )
-            filtered_vendor_map[mode] = configured_vendors
+            final_vendor_map[mode] = configured_vendors
             continue
-        filtered_vendors = [vendor for vendor in active_vendors if vendor in configured_vendors]
-        if not filtered_vendors:
+
+        matched_vendors = [vendor for vendor in active_vendors if vendor in configured_vendors]
+        if not matched_vendors:
             logger.warning(
-                "Active vendors did not match configured vendors | mode=%s source_month=%s active_vendors=%s configured_vendors=%s. Using configured vendors from data_config.",
+                "active_service vendors did not match data_config vendors | mode=%s source_month=%s active_vendors=%s configured_vendors=%s. Using configured vendors from data_config.",
                 mode,
                 source_month,
                 active_vendors,
                 configured_vendors,
             )
-            filtered_vendor_map[mode] = configured_vendors
+            final_vendor_map[mode] = configured_vendors
             continue
-        filtered_vendor_map[mode] = filtered_vendors
 
-    return filtered_vendor_map
+        logger.info(
+            "Resolved final vendors from active_service -> data_config flow | mode=%s source_month=%s final_vendors=%s",
+            mode,
+            source_month,
+            matched_vendors,
+        )
+        final_vendor_map[mode] = matched_vendors
+
+    return final_vendor_map
 
 
 def resolve_campaign_vendors(

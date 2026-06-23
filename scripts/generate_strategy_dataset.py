@@ -310,6 +310,72 @@ def process_chunk(
     return feature_counts, strategy_counts, risk_counts
 
 
+def summarize_chunk_audit(
+    chunk: pd.DataFrame,
+    sample_cards: set[str] | None = None,
+) -> dict[str, object]:
+    df = chunk.copy()
+    df["APAC_CARD_NUMBER"] = df["apac_card_number"].fillna("").astype(str).str.strip()
+    sample_mask = df["APAC_CARD_NUMBER"].isin(sample_cards) if sample_cards is not None else pd.Series(True, index=df.index)
+    scoped = df.loc[sample_mask].copy()
+
+    raw_comm_type = scoped["communication_type"].fillna("").astype(str).str.strip().str.upper()
+    normalized_comm_type = raw_comm_type.map(COMM_TYPE_MAP)
+    risk = normalize_risk(scoped["risk"]) if "risk" in scoped.columns else pd.Series("UNKNOWN", index=scoped.index)
+    emi_date = pd.to_datetime(scoped["emi_date"], errors="coerce").dt.normalize()
+    event_date = pd.to_datetime(scoped["date"], errors="coerce").dt.normalize()
+    created_ts = pd.to_datetime(scoped["created_date"], errors="coerce")
+
+    required_mask = (
+        scoped["APAC_CARD_NUMBER"].ne("")
+        & risk.ne("UNKNOWN")
+        & normalized_comm_type.notna()
+        & emi_date.notna()
+        & event_date.notna()
+        & created_ts.notna()
+    )
+    offsets = (event_date - emi_date).dt.days
+    within_window = offsets.between(-5, 5, inclusive="both")
+    day_zero = offsets.eq(0)
+    kept_mask = required_mask & within_window & ~day_zero
+
+    unsupported_counts = raw_comm_type[normalized_comm_type.isna()].replace({"": "EMPTY"}).value_counts().to_dict()
+    return {
+        "total_rows": int(len(df)),
+        "sample_filtered_rows": int((~sample_mask).sum()) if sample_cards is not None else 0,
+        "blank_apac_rows": int(scoped["APAC_CARD_NUMBER"].eq("").sum()),
+        "unknown_risk_rows": int(risk.eq("UNKNOWN").sum()),
+        "unsupported_comm_type_rows": int(normalized_comm_type.isna().sum()),
+        "invalid_emi_date_rows": int(emi_date.isna().sum()),
+        "invalid_event_date_rows": int(event_date.isna().sum()),
+        "invalid_created_date_rows": int(created_ts.isna().sum()),
+        "outside_day_window_rows": int((required_mask & ~within_window).sum()),
+        "day_zero_rows": int((required_mask & day_zero).sum()),
+        "kept_model_rows": int(kept_mask.sum()),
+        "unsupported_comm_type_counts": {str(key): int(value) for key, value in unsupported_counts.items()},
+    }
+
+
+def merge_audit_counts(target: dict[str, object], current: dict[str, object]) -> dict[str, object]:
+    for key, value in current.items():
+        if isinstance(value, dict):
+            existing = target.setdefault(key, {})
+            for sub_key, sub_value in value.items():
+                existing[sub_key] = int(existing.get(sub_key, 0)) + int(sub_value)
+        else:
+            target[key] = int(target.get(key, 0)) + int(value)
+    return target
+
+
+def log_dataset_audit(audit_counts: dict[str, object], *, csv_files: list[Path], output_file: Path) -> None:
+    payload = {
+        "input_files": [path.name for path in csv_files],
+        "output_file": str(output_file),
+        **audit_counts,
+    }
+    print("Strategy dataset audit summary | " + json.dumps(payload, sort_keys=True))
+
+
 def collect_sample_cards(
     csv_files: list[Path],
     chunksize: int,
@@ -362,6 +428,7 @@ def build_dataset(
     feature_parts: list[pd.DataFrame] = []
     strategy_parts: list[pd.DataFrame] = []
     risk_parts: list[pd.DataFrame] = []
+    audit_counts: dict[str, object] = {}
     sample_cards = (
         collect_sample_cards(csv_files, chunksize, sample_size)
         if sample_size > 0
@@ -371,6 +438,7 @@ def build_dataset(
     for csv_file in csv_files:
         print(f"Processing {csv_file.name} ...")
         for chunk in pd.read_csv(csv_file, usecols=USECOLS, chunksize=chunksize):
+            merge_audit_counts(audit_counts, summarize_chunk_audit(chunk, sample_cards=sample_cards))
             feature_counts, strategy_counts, risk_counts = process_chunk(
                 chunk,
                 sample_cards=sample_cards,
@@ -478,6 +546,7 @@ def build_dataset(
     ]
     wide.to_csv(output_file, index=False)
     print(f"Saved {len(wide):,} rows to {output_file}")
+    log_dataset_audit(audit_counts, csv_files=csv_files, output_file=output_file)
 
 
 def main() -> None:

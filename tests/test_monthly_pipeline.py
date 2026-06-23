@@ -621,6 +621,46 @@ def test_resolve_campaign_vendors_supports_active_service_json_values() -> None:
     assert vendors["SMS"] == ["kaleyra", "prutech-cpass"]
 
 
+def test_resolve_campaign_vendors_by_mode_uses_active_service_then_data_config() -> None:
+    class DummyResult:
+        def __init__(self, row=None, rows=None):
+            self._row = row
+            self._rows = rows or []
+
+        def fetchone(self):
+            return self._row
+
+        def fetchall(self):
+            return self._rows
+
+    class DummyConn:
+        def execute(self, query, params):
+            if len(params) == 2:
+                return DummyResult(rows=[
+                    ("VOICE", "PRUTECH-CPASS"),
+                    ("VOICE", "VALUE-FIRST"),
+                ])
+            key = params[0]
+            values = {
+                "sms.service.vendor-list": ("kaleyra,prutech",),
+                "voice.service.vendor-list": ("value-first,prutech-cpass",),
+                "whatsapp.service.vendor-list": ("prutech-v2,kaleyra",),
+            }
+            return DummyResult(row=values.get(key))
+
+    vendors = resolve_campaign_vendors_by_mode(
+        DummyConn(),
+        source_schema="digital_collections",
+        target_schema="digital_collections",
+        source_table="communications",
+        source_month="2026-06",
+        fallback_vendor="prutech-cpass",
+        logger=__import__("logging").getLogger("test_vendor"),
+    )
+
+    assert vendors["VOICE"] == ["prutech-cpass", "value-first"]
+
+
 def test_resolve_campaign_vendors_by_mode_filters_to_active_vendors() -> None:
     class DummyResult:
         def __init__(self, row=None, rows=None):
