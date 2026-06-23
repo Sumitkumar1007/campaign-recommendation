@@ -642,6 +642,49 @@ def test_http_server_end_to_end_routes() -> None:
         thread.join(timeout=5)
 
 
+def test_successful_training_persists_zero_drift(monkeypatch: pytest.MonkeyPatch) -> None:
+    service = AIMLApiService(
+        config=build_config(),
+        auth_manager=AuthManager("aiml", "secret", "top-secret", 60),
+        job_runner=DummyJobRunner(),
+        logger=logging.getLogger("test_aiml_api"),
+        ai_config_repo=DummyAIConfigRepo(),
+        api_audit_repo=DummyApiAuditRepo(),
+    )
+    service.ai_config_repo.entries["TRN_OK"] = {"transaction_id": "TRN_OK"}
+    service.ai_config_repo.entries["TRN_MODEL"] = {
+        "transaction_id": "TRN_MODEL",
+        "type": "TRAINING",
+        "status": "COMPLETED",
+        "model_version": "v1.1.0",
+        "modified_on": "2026-06-09T11:00:00",
+    }
+
+    monkeypatch.setattr(api_service_module, "run_logged_subprocess", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        api_service_module,
+        "read_metrics_snapshot",
+        lambda model_name: {"modelVersion": model_name, "currentAccuracy": 81.2, "driftPercentage": 9.9},
+    )
+
+    service._run_training_job(
+        transaction_id="TRN_OK",
+        payload={
+            "transactionId": "TRN_OK",
+            "months": 3,
+            "model": "catboost_3m",
+            "currentModelVersion": "v1.1.0",
+            "modelVersion": "v1.1.1",
+        },
+    )
+
+    assert service.ai_config_repo.updated[-1]["status"] == "COMPLETED"
+    assert service.ai_config_repo.updated[-1]["model_version"] == "v1.1.1"
+    assert service.ai_config_repo.updated[-1]["drift"] == 0.0
+    assert json.loads(service.ai_config_repo.updated[-1]["message"])["driftPercentage"] == 0.0
+    assert json.loads(service.api_audit_repo.updated[-1]["response_body"])["driftPercentage"] == 0.0
+
+
 def test_failed_training_keeps_current_model_version(monkeypatch: pytest.MonkeyPatch) -> None:
     service = AIMLApiService(
         config=build_config(),

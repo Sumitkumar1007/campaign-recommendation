@@ -1177,15 +1177,16 @@ class AIMLApiService:
                 metrics_file,
                 model_file,
             )
+            training_drift = 0.0
             duration_ms = int((time.perf_counter() - started_at) * 1000)
             self._safe_update_ai_configuration_entry(
                 log_context="training_completed",
                 transaction_id=transaction_id,
                 status="COMPLETED",
-                message=json_dumps_compact({"transactionId": transaction_id, "status": "COMPLETED", "message": "Processing completed.", "modelVersion": target_model_version, "currentAccuracy": snapshot.get("currentAccuracy"), "driftPercentage": snapshot.get("driftPercentage")}),
+                message=json_dumps_compact({"transactionId": transaction_id, "status": "COMPLETED", "message": "Processing completed.", "modelVersion": target_model_version, "currentAccuracy": snapshot.get("currentAccuracy"), "driftPercentage": training_drift}),
                 model_version=target_model_version,
                 accuracy=snapshot.get("currentAccuracy"),
-                drift=snapshot.get("driftPercentage"),
+                drift=training_drift,
                 entry_type="TRAINING",
                 training_window=str(months),
             )
@@ -1200,7 +1201,7 @@ class AIMLApiService:
                     "message": "Processing completed.",
                     "modelVersion": target_model_version,
                     "currentAccuracy": snapshot.get("currentAccuracy"),
-                    "driftPercentage": snapshot.get("driftPercentage"),
+                    "driftPercentage": training_drift,
                 }),
                 status="COMPLETED",
                 message="Processing completed.",
