@@ -263,28 +263,28 @@ def _business_reason_for_label(label: str, day: str, source_row: pd.Series | Non
 def _business_alternate_reason_for_label(label: str, day: str, source_row: pd.Series | None) -> str:
     parts = _strategy_parts(label)
     if not parts:
-        return "An alternate communication option can be used if additional follow-up is required."
+        return "An alternate communication option may be used if additional follow-up is required."
 
     channel, hour, language = parts
-    readable = _readable_strategy(label)
+    time_text = _business_friendly_time(hour)
+    language_text = "Regional language" if language == "REGIONAL" else language.title()
+
     if channel == "SMS":
         if day == "D-1":
-            return f"{readable} can be used as a final reminder before the EMI due date."
+            return f"If a final reminder is required before the EMI due date, a {language_text} SMS may be sent at {time_text}."
         if day == "D+3":
-            return f"{readable} can be used as an alternate reminder if payment is still pending."
+            return f"If payment is still pending at this stage, a {language_text} SMS may be sent at {time_text} as the next course of action."
         if day == "D+5":
-            time_text = _business_friendly_time(hour)
-            language_text = "regional language" if language == "REGIONAL" else language.title()
             return f"If the account still requires follow-up five days after the Cycle date, an {language_text} SMS may be sent at {time_text} as the next course of action."
-        return f"{readable} can be used as an alternate reminder if additional follow-up is required."
+        return f"If additional follow-up is required, a {language_text} SMS may be sent at {time_text} as the next course of action."
 
     if channel == "WH":
-        return f"{readable} can be used as an alternate reminder if additional follow-up is required."
+        return f"If additional follow-up is required, a {language_text} WhatsApp message may be sent at {time_text} as the next course of action."
 
     if channel == "VOICE":
-        return f"{readable} can be used as an alternate option if direct customer interaction is required."
+        return f"If direct customer interaction is required, a {language_text} voice call may be initiated at {time_text} as the next course of action."
 
-    return f"{readable} can be used as an alternate option if additional follow-up is required."
+    return f"If additional follow-up is required, the next communication may be initiated at {time_text} in {language_text}."
 
 
 def build_prediction_reason(

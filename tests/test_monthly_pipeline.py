@@ -976,7 +976,7 @@ def test_build_prediction_reason_respects_no_campaign_primary_rank() -> None:
 
     assert reason["D+2"] == (
         "At this stage, no campaign is recommended to prevent excessive communication with the customer. "
-        "SMS at 8AM in Regional language can be used as an alternate reminder if additional follow-up is required."
+        "If additional follow-up is required, a Regional language SMS may be sent at 8:00 AM as the next course of action."
     )
 
 
