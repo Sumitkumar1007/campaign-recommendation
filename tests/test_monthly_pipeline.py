@@ -1010,7 +1010,7 @@ def test_build_prediction_reason_explains_no_history_blank_predictions() -> None
     reason = json.loads(build_prediction_reason(prediction_row=prediction_row, source_row=None))
 
     assert reason["D-5"] == (
-        "No campaign is recommended as the primary action to avoid excessive communication before the due date."
+        "At this stage, no campaign is recommended to prevent excessive communication with the customer."
     )
     assert set(reason) == set(DAY_COLUMNS)
 

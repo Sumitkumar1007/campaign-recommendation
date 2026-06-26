@@ -206,9 +206,7 @@ def _has_channel_success(source_row: pd.Series | None, channel: str) -> bool:
 
 def _no_campaign_reason(day: str) -> str:
     if day == "D":
-        return "No campaign is recommended as the primary action on the EMI due date to avoid unnecessary communication."
-    if day.startswith("D-"):
-        return "No campaign is recommended as the primary action to avoid excessive communication before the due date."
+        return "At this stage, no campaign is recommended on the EMI due date to avoid unnecessary communication with the customer."
     return "At this stage, no campaign is recommended to prevent excessive communication with the customer."
 
 
@@ -231,15 +229,15 @@ def _business_reason_for_label(label: str, day: str, source_row: pd.Series | Non
         if day == "D-4":
             return f"{readable} is recommended because SMS has been an effective communication channel for this customer in earlier interactions."
         if day == "D+1":
-            return f"{readable} is recommended as an immediate post-due follow-up, as SMS has worked well for this customer in previous communication."
+            return f"As an immediate follow-up after the Cycle date, {readable} is recommended because SMS has shown a positive response pattern in earlier customer communication."
         if day == "D+2":
             if language == "REGIONAL":
-                return f"{readable} is recommended as a post-due reminder. Regional language communication may help improve customer understanding and response."
-            return f"{readable} is recommended as a post-due reminder because SMS has remained suitable for follow-up after the due date."
+                return f"For continued follow-up after the Cycle date, {readable} is recommended because regional language communication may help improve customer understanding and response."
+            return f"For continued follow-up after the Cycle date, {readable} is recommended because SMS has remained a suitable communication option for this customer."
         if day == "D+3":
-            return f"{readable} is recommended because SMS remains a suitable follow-up channel if payment is still pending."
+            return f"If payment is still pending at this stage, {readable} is recommended because SMS remains a suitable follow-up option for this customer."
         if day == "D+5":
-            return f"{readable} is recommended because SMS remains a suitable follow-up option if the account still requires attention."
+            return f"If the account still requires attention at this stage, {readable} is recommended because SMS remains a suitable communication option for follow-up."
         if has_exact_success or has_channel_success:
             return f"{readable} is recommended because SMS has worked well for this customer in previous communication."
         if language == "REGIONAL" and is_postdue:
@@ -271,18 +269,22 @@ def _business_alternate_reason_for_label(label: str, day: str, source_row: pd.Se
 
     if channel == "SMS":
         if day == "D-1":
-            return f"If a final reminder is required before the EMI due date, a {language_text} SMS may be sent at {time_text}."
+            article = "an" if language_text[:1].lower() in {"a", "e", "i", "o", "u"} else "a"
+            return f"If a final reminder is required before the EMI due date, {article} {language_text} SMS may be sent at {time_text} as the next course of action."
+        article = "an" if language_text[:1].lower() in {"a", "e", "i", "o", "u"} else "a"
         if day == "D+3":
-            return f"If payment is still pending at this stage, a {language_text} SMS may be sent at {time_text} as the next course of action."
+            return f"If payment is still pending at this stage, {article} {language_text} SMS may be sent at {time_text} as the next course of action."
         if day == "D+5":
-            return f"If the account still requires follow-up five days after the Cycle date, an {language_text} SMS may be sent at {time_text} as the next course of action."
-        return f"If additional follow-up is required, a {language_text} SMS may be sent at {time_text} as the next course of action."
+            return f"If the account still requires follow-up five days after the Cycle date, {article} {language_text} SMS may be sent at {time_text} as the next course of action."
+        return f"If additional follow-up is required, {article} {language_text} SMS may be sent at {time_text} as the next course of action."
 
     if channel == "WH":
-        return f"If additional follow-up is required, a {language_text} WhatsApp message may be sent at {time_text} as the next course of action."
+        article = "an" if language_text[:1].lower() in {"a", "e", "i", "o", "u"} else "a"
+        return f"If additional follow-up is required, {article} {language_text} WhatsApp message may be sent at {time_text} as the next course of action."
 
     if channel == "VOICE":
-        return f"If direct customer interaction is required, a {language_text} voice call may be initiated at {time_text} as the next course of action."
+        article = "an" if language_text[:1].lower() in {"a", "e", "i", "o", "u"} else "a"
+        return f"If direct customer interaction is required, {article} {language_text} voice call may be initiated at {time_text} as the next course of action."
 
     return f"If additional follow-up is required, the next communication may be initiated at {time_text} in {language_text}."
 
