@@ -17,7 +17,14 @@ if str(SCRIPTS_DIR) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from fetch_month_from_postgres import _extract_scheduler_emi_cycle, emi_cycle_dates, month_bounds
+from fetch_month_from_postgres import (
+    _extract_scheduler_emi_cycle,
+    _extract_scheduler_emi_dates,
+    configured_prediction_month_from_emi_dates,
+    configured_source_month_from_emi_dates,
+    emi_cycle_dates,
+    month_bounds,
+)
 from generate_strategy_dataset import bucket_send_hour, candidate_hours as dataset_candidate_hours, process_chunk
 
 from quartz_job_data import build_mcollect_job_data, serialize_quartz_job_data_map
@@ -75,10 +82,23 @@ def test_extract_scheduler_emi_cycle_reads_multiple_days_from_config_dates() -> 
     assert _extract_scheduler_emi_cycle(["05-06-2026", "10-06-2026", "05-07-2026"]) == [5, 10]
 
 
+def test_extract_scheduler_emi_dates_reads_full_config_dates() -> None:
+    dates = _extract_scheduler_emi_dates(["15/06/2026", "05/06/2026", "15/06/2026"])
+
+    assert [date.strftime("%d/%m/%Y") for date in dates] == ["05/06/2026", "15/06/2026"]
+
+
 def test_emi_cycle_dates_use_current_month_and_year() -> None:
     dates = emi_cycle_dates([5, 31], today=pd.Timestamp("2026-01-21"))
 
     assert [date.strftime("%d/%m/%Y") for date in dates] == ["05/01/2026", "31/01/2026"]
+
+
+def test_configured_months_follow_full_emi_date_month() -> None:
+    emi_dates = _extract_scheduler_emi_dates(["15/07/2026"])
+
+    assert configured_prediction_month_from_emi_dates(emi_dates) == "2026-07"
+    assert configured_source_month_from_emi_dates(emi_dates) == "2026-06"
 
 
 def test_selected_history_files_uses_previous_two_months_plus_latest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -114,7 +114,7 @@ def current_month(today: pd.Timestamp | None = None) -> str:
     return (today or pd.Timestamp.today()).strftime("%Y-%m")
 
 
-def _extract_scheduler_emi_cycle(raw_value: object) -> list[int]:
+def _extract_scheduler_emi_dates(raw_value: object) -> list[pd.Timestamp]:
     if raw_value is None:
         return []
     if isinstance(raw_value, list):
@@ -131,20 +131,26 @@ def _extract_scheduler_emi_cycle(raw_value: object) -> list[int]:
             items = parsed
         else:
             items = [part.strip() for part in str(parsed).split(",") if part.strip()]
-    cycles: list[int] = []
-    seen: set[int] = set()
+    emi_dates: list[pd.Timestamp] = []
+    seen: set[pd.Timestamp] = set()
     for item in items:
         try:
-            day = pd.to_datetime(str(item).strip(), dayfirst=True, errors="raise").day
+            emi_date = pd.to_datetime(str(item).strip(), dayfirst=True, errors="raise").normalize()
         except Exception:
             continue
-        if day not in seen:
-            seen.add(day)
-            cycles.append(day)
+        if emi_date not in seen:
+            seen.add(emi_date)
+            emi_dates.append(emi_date)
+    emi_dates.sort()
+    return emi_dates
+
+
+def _extract_scheduler_emi_cycle(raw_value: object) -> list[int]:
+    cycles = {int(emi_date.day) for emi_date in _extract_scheduler_emi_dates(raw_value)}
     return sorted(cycles)
 
 
-def resolve_scheduler_emi_cycle(conn, *, schema: str) -> list[int]:
+def resolve_scheduler_emi_dates(conn, *, schema: str) -> list[pd.Timestamp]:
     candidate_refs = [sql.Identifier("data_config")]
     if schema:
         candidate_refs.append(qualified_identifier(schema, "data_config"))
@@ -156,10 +162,25 @@ def resolve_scheduler_emi_cycle(conn, *, schema: str) -> list[int]:
             continue
         if not row:
             continue
-        cycles = _extract_scheduler_emi_cycle(row[0])
-        if cycles:
-            return cycles
-    raise ValueError(f"Could not resolve EMI cycle from data_config key {EMI_DATES_CONFIG_KEY!r}.")
+        emi_dates = _extract_scheduler_emi_dates(row[0])
+        if emi_dates:
+            return emi_dates
+    raise ValueError(f"Could not resolve EMI dates from data_config key {EMI_DATES_CONFIG_KEY!r}.")
+
+
+def configured_prediction_month_from_emi_dates(emi_dates: list[pd.Timestamp]) -> str:
+    if not emi_dates:
+        raise ValueError("No EMI dates configured in data_config.")
+    return emi_dates[-1].strftime("%Y-%m")
+
+
+def configured_source_month_from_emi_dates(emi_dates: list[pd.Timestamp]) -> str:
+    predict_period = pd.Period(configured_prediction_month_from_emi_dates(emi_dates), freq="M")
+    return str(predict_period - 1)
+
+
+def resolve_scheduler_emi_cycle(conn, *, schema: str) -> list[int]:
+    return [int(emi_date.day) for emi_date in resolve_scheduler_emi_dates(conn, schema=schema)]
 
 
 def emi_cycle_dates(
@@ -346,12 +367,6 @@ def write_query_to_csv(
 
 def main() -> None:
     args = parse_args()
-    fetch_month = args.fetch_month or current_month()
-    output_file = (
-        ensure_parent_dir(args.output_file)
-        if args.output_file
-        else ensure_parent_dir(default_output_file(fetch_month))
-    )
 
     config = PostgresConfig(
         host=args.host,
@@ -363,7 +378,14 @@ def main() -> None:
     query = build_query(args.schema, args.table)
 
     with connect_db(config) as conn:
-        emi_cycle = resolve_scheduler_emi_cycle(conn, schema=args.schema)
+        configured_emi_dates = resolve_scheduler_emi_dates(conn, schema=args.schema)
+        fetch_month = args.fetch_month or configured_source_month_from_emi_dates(configured_emi_dates)
+        output_file = (
+            ensure_parent_dir(args.output_file)
+            if args.output_file
+            else ensure_parent_dir(default_output_file(fetch_month))
+        )
+        emi_cycle = [int(emi_date.day) for emi_date in configured_emi_dates]
         emi_dates = emi_cycle_dates(emi_cycle, fetch_month=fetch_month)
         audit_summary = build_audit_summary(conn, schema=args.schema, table=args.table, emi_dates=emi_dates)
         params = {"emi_dates": [date.date() for date in emi_dates]}

@@ -9,6 +9,7 @@ import pandas as pd
 from psycopg import sql
 
 from env_utils import load_dotenv
+from fetch_month_from_postgres import configured_prediction_month_from_emi_dates, resolve_scheduler_emi_dates
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
 from project_paths import CASE_DATA_DIR, ensure_parent_dir
 
@@ -148,8 +149,6 @@ def build_query(schema: str, table: str) -> sql.Composed:
 
 def main() -> None:
     args = parse_args()
-    fetch_month = args.fetch_month or current_month()
-    output_file = ensure_parent_dir(args.output_file) if args.output_file else ensure_parent_dir(default_output_file(fetch_month))
 
     config = PostgresConfig(
         host=args.host,
@@ -161,7 +160,10 @@ def main() -> None:
     query = build_query(args.schema, args.table)
 
     with connect_db(config) as conn:
-        emi_cycle = resolve_scheduler_emi_cycle(conn, schema=args.schema)
+        configured_emi_dates = resolve_scheduler_emi_dates(conn, schema=args.schema)
+        fetch_month = args.fetch_month or configured_prediction_month_from_emi_dates(configured_emi_dates)
+        output_file = ensure_parent_dir(args.output_file) if args.output_file else ensure_parent_dir(default_output_file(fetch_month))
+        emi_cycle = [int(emi_date.day) for emi_date in configured_emi_dates]
         emi_dates = emi_cycle_dates(emi_cycle, fetch_month=fetch_month)
         params = {"emi_dates": emi_dates}
         with conn.cursor() as cur:

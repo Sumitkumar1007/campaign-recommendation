@@ -19,6 +19,7 @@ from psycopg.types.json import Jsonb
 from app_logging import log_step, setup_logging
 from drift_utils import compute_drift_report
 from env_utils import load_dotenv
+from fetch_month_from_postgres import configured_prediction_month_from_emi_dates, configured_source_month_from_emi_dates, resolve_scheduler_emi_dates as resolve_configured_emi_dates
 from pipeline_common import build_feature_matrix, prepare_next_month_dataset, split_by_source_month
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
 from predict_next_month_strategy_catboost import build_prediction_population, load_base_population
@@ -121,13 +122,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--source-month",
-        default=os.getenv("SOURCE_MONTH") or current_month(),
-        help="Source month to process in YYYY-MM format. Defaults to current month.",
+        default=os.getenv("SOURCE_MONTH", "").strip(),
+        help="Source month to process in YYYY-MM format. Defaults to the month before configured EMI date.",
     )
     parser.add_argument(
         "--predict-month",
-        default=os.getenv("PREDICT_MONTH"),
-        help="Target month to predict in YYYY-MM format. Defaults to one month after source month.",
+        default=os.getenv("PREDICT_MONTH", "").strip(),
+        help="Target month to predict in YYYY-MM format. Defaults to the configured EMI date month.",
     )
     parser.add_argument(
         "--model",
@@ -178,7 +179,21 @@ def parse_args() -> argparse.Namespace:
     ]
     if missing:
         parser.error("Missing required environment variables or CLI args: " + ", ".join(missing))
-    if not args.predict_month:
+    config = PostgresConfig(
+        host=args.host,
+        port=args.port,
+        dbname=args.dbname,
+        user=args.user,
+        password=args.password,
+    )
+    if not args.source_month and not args.predict_month:
+        with connect_db(config) as conn:
+            configured_emi_dates = resolve_configured_emi_dates(conn, schema=args.source_schema)
+        args.predict_month = configured_prediction_month_from_emi_dates(configured_emi_dates)
+        args.source_month = configured_source_month_from_emi_dates(configured_emi_dates)
+    elif not args.source_month and args.predict_month:
+        args.source_month = str(parse_month(args.predict_month) - 1)
+    elif args.source_month and not args.predict_month:
         args.predict_month = next_month(args.source_month)
     try:
         validate_month_pair(args.source_month, args.predict_month)
