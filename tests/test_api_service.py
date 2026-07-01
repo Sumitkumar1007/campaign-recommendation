@@ -510,6 +510,41 @@ def test_inference_rejects_non_spec_fields() -> None:
     assert payload == {"transactionId": "TRN2", "status": "FAILED", "message": "Unexpected fields: predictMonth, sourceMonth"}
 
 
+def test_inference_uses_configured_emi_date_months(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = build_config()
+    runner = ImmediateJobRunner()
+    service = CapturingService(
+        config=config,
+        auth_manager=AuthManager("aiml", "secret", "top-secret", 60),
+        job_runner=runner,
+        logger=logging.getLogger("test_aiml_api"),
+        ai_config_repo=DummyAIConfigRepo(),
+        api_audit_repo=DummyApiAuditRepo(),
+    )
+    service.ai_config_repo.entries["TRN_CFG"] = {"transaction_id": "TRN_CFG"}
+    monkeypatch.delenv("SOURCE_MONTH", raising=False)
+    monkeypatch.delenv("PREDICT_MONTH", raising=False)
+    monkeypatch.setattr(service, "_configured_inference_months", lambda: ("2026-06", "2026-07"))
+    app = AIMLApiApp(service)
+    token = service.auth_manager.issue_token("aiml")["access_token"]
+
+    status, payload = invoke(
+        app,
+        method="POST",
+        path="/api/v1/inference",
+        token=token,
+        body={"transactionId": "TRN_CFG"},
+    )
+
+    assert status.startswith("202")
+    assert payload["status"] == "ACCEPTED"
+    assert service.inference_commands
+    assert "--source-month" in service.inference_commands[0]
+    assert "2026-06" in service.inference_commands[0]
+    assert "--predict-month" in service.inference_commands[0]
+    assert "2026-07" in service.inference_commands[0]
+
+
 def test_inference_command_uses_pipeline_without_audit_flag() -> None:
     config = build_config()
     runner = ImmediateJobRunner()

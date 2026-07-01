@@ -152,6 +152,46 @@ def add_months(yyyy_mm: str, delta: int) -> str:
     return f"{next_year:04d}-{next_month:02d}"
 
 
+def extract_scheduler_emi_dates(raw_value: Any) -> list[datetime]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, list):
+        items = raw_value
+    else:
+        text = str(raw_value).strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = text
+        if isinstance(parsed, list):
+            items = parsed
+        else:
+            items = [part.strip() for part in str(parsed).split(",") if part.strip()]
+    emi_dates: list[datetime] = []
+    seen: set[datetime] = set()
+    for item in items:
+        value = str(item).strip()
+        if not value:
+            continue
+        parsed_date = None
+        for fmt in ("%d/%m/%Y", "%d-%m-%Y"):
+            try:
+                parsed_date = datetime.strptime(value, fmt)
+                break
+            except ValueError:
+                continue
+        if parsed_date is None:
+            continue
+        parsed_date = parsed_date.replace(hour=0, minute=0, second=0, microsecond=0)
+        if parsed_date not in seen:
+            seen.add(parsed_date)
+            emi_dates.append(parsed_date)
+    emi_dates.sort()
+    return emi_dates
+
+
 def month_label(yyyy_mm: str) -> str:
     year, month = parse_month(yyyy_mm)
     return datetime(year, month, 1).strftime("%b-%Y").upper()
@@ -1030,6 +1070,29 @@ class AIMLApiService:
             self.logger.warning("Invalid aiml.training.month.duration value in data_config | value=%s", row[0])
             return None
 
+    def _configured_inference_months(self) -> tuple[str, str] | None:
+        query = sql.SQL(
+            "SELECT value FROM {} WHERE key_name = %s LIMIT 1"
+        ).format(qualified_identifier(self.config.target_schema, "data_config"))
+        try:
+            with self.ai_config_repo.connect() as conn:
+                row = conn.execute(query, ("upload.scheduler.emi-dates",)).fetchone()
+        except Exception:
+            self.logger.exception("Failed to read upload.scheduler.emi-dates from data_config")
+            return None
+        if row is None or row[0] in (None, ""):
+            return None
+        emi_dates = extract_scheduler_emi_dates(row[0])
+        if not emi_dates:
+            self.logger.warning(
+                "No valid EMI dates found in data_config | key=upload.scheduler.emi-dates value=%s",
+                row[0],
+            )
+            return None
+        predict_month = emi_dates[-1].strftime("%Y-%m")
+        source_month = add_months(predict_month, -1)
+        return source_month, predict_month
+
     def trigger_training(self, payload: dict[str, Any], request_url: str) -> tuple[int, dict[str, Any]]:
         transaction_id = str(payload.get("transactionId", "")).strip()
         try:
@@ -1085,8 +1148,19 @@ class AIMLApiService:
         if self.job_runner.is_running(transaction_id):
             return HTTPStatus.CONFLICT, failure_response(transaction_id, f"Job already running for {transaction_id}.")
 
-        source_month = os.getenv("SOURCE_MONTH", current_month_yyyy_mm())
-        predict_month = os.getenv("PREDICT_MONTH", add_months(source_month, 1))
+        source_month = os.getenv("SOURCE_MONTH", "").strip()
+        predict_month = os.getenv("PREDICT_MONTH", "").strip()
+        if not source_month and not predict_month:
+            configured_months = self._configured_inference_months()
+            if configured_months is not None:
+                source_month, predict_month = configured_months
+            else:
+                source_month = current_month_yyyy_mm()
+                predict_month = add_months(source_month, 1)
+        elif not source_month and predict_month:
+            source_month = add_months(predict_month, -1)
+        elif source_month and not predict_month:
+            predict_month = add_months(source_month, 1)
         try:
             parse_month(source_month)
             parse_month(predict_month)
