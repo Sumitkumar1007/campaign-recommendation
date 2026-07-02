@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import joblib
+from artifact_versioning import copy_to_latest, next_versioned_path, write_versioned_json
 import pandas as pd
 from joblib import Parallel, delayed
 from pipeline_common import (
@@ -163,6 +164,9 @@ def main() -> None:
     model_file = ensure_parent_dir(args.model_file)
     metrics_file = ensure_parent_dir(args.metrics_file)
     prediction_file = ensure_parent_dir(args.prediction_file)
+    versioned_model_file = next_versioned_path(model_file)
+    versioned_metrics_file = next_versioned_path(metrics_file)
+    versioned_prediction_file = next_versioned_path(prediction_file)
     dataset = prepare_dataset(
         Path(args.feature_file),
         Path(args.schedule_file),
@@ -222,8 +226,9 @@ def main() -> None:
         "target_columns": DAY_COLUMNS,
         "target_offset_months": args.target_offset_months,
     }
-    joblib.dump(model_bundle, model_file)
-    metrics_file.write_text(json.dumps(metrics, indent=2))
+    joblib.dump(model_bundle, versioned_model_file)
+    copy_to_latest(source_path=versioned_model_file, latest_path=model_file)
+    write_versioned_json(payload=metrics, latest_path=metrics_file, versioned_path=versioned_metrics_file)
 
     prediction_rows = prediction_df[prediction_df["TARGET_MONTH"].isna()].copy()
     if not prediction_rows.empty:
@@ -247,19 +252,21 @@ def main() -> None:
         prediction_output = prediction_output[
             ["SOURCE_RISK", "Loan_number", "SOURCE_MONTH_USED", "MONTH", "D-5", "D-4", "D-3", "D-2", "D-1", "D", "D+1", "D+2", "D+3", "D+4", "D+5"]
         ]
-        prediction_output.to_csv(prediction_file, index=False)
+        prediction_output.to_csv(versioned_prediction_file, index=False)
     else:
         pd.DataFrame(
             columns=["SOURCE_RISK", "Loan_number", "SOURCE_MONTH_USED", "MONTH", "D-5", "D-4", "D-3", "D-2", "D-1", "D", "D+1", "D+2", "D+3", "D+4", "D+5"]
-        ).to_csv(prediction_file, index=False)
+        ).to_csv(versioned_prediction_file, index=False)
+
+    copy_to_latest(source_path=versioned_prediction_file, latest_path=prediction_file)
 
     print(f"Training rows: {len(train_df):,}")
     print(f"Validation rows: {len(validation_df):,}")
     print(f"Test rows: {len(test_df):,}")
     print(f"Prediction rows: {len(prediction_rows):,}")
-    print(f"Saved model to {model_file}")
-    print(f"Saved metrics to {metrics_file}")
-    print(f"Saved future predictions to {prediction_file}")
+    print(f"Saved model to {model_file} (versioned copy: {versioned_model_file})")
+    print(f"Saved metrics to {metrics_file} (versioned copy: {versioned_metrics_file})")
+    print(f"Saved future predictions to {prediction_file} (versioned copy: {versioned_prediction_file})")
 
 
 if __name__ == "__main__":

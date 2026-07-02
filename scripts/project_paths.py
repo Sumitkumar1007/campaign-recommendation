@@ -7,7 +7,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS_DIR.parent
 
 DATA_DIR = REPO_ROOT / "data"
-COMMUNICATION_DATA_DIR = DATA_DIR / "communication" / "MFL_COMMUNICATION_DATA"
+COMMUNICATION_DATA_DIR = DATA_DIR / "communication"
 CASE_DATA_DIR = DATA_DIR / "cases"
 TRAINING_DATA_DIR = DATA_DIR / "training"
 SCHEDULE_DATA_DIR = DATA_DIR / "schedules"

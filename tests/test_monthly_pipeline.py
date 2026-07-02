@@ -102,11 +102,11 @@ def test_configured_months_follow_full_emi_date_month() -> None:
 
 
 def test_selected_history_files_uses_previous_two_months_plus_latest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    communication_dir = tmp_path / "data" / "communication" / "MFL_COMMUNICATION_DATA"
+    communication_dir = tmp_path / "data" / "communication"
     communication_dir.mkdir(parents=True)
-    feb = communication_dir / "mfl_recomm_model_FEB2026_comm_data.csv"
-    mar = communication_dir / "mfl_recomm_model_MAR2026_comm_data.csv"
-    latest = communication_dir / "latest_APR2026_comm_data.csv"
+    feb = communication_dir / "comm_data_FEB2026.csv"
+    mar = communication_dir / "comm_data_MAR2026.csv"
+    latest = communication_dir / "comm_data_APR2026.csv"
     for path in [feb, mar, latest]:
         path.write_text("id\n1\n", encoding="utf-8")
 
@@ -116,11 +116,11 @@ def test_selected_history_files_uses_previous_two_months_plus_latest(tmp_path: P
 
 
 def test_selected_history_files_ignores_noncanonical_matches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    communication_dir = tmp_path / "data" / "communication" / "MFL_COMMUNICATION_DATA"
+    communication_dir = tmp_path / "data" / "communication"
     communication_dir.mkdir(parents=True)
-    feb = communication_dir / "mfl_recomm_model_FEB2026_comm_data.csv"
-    mar = communication_dir / "mfl_recomm_model_MAR2026_comm_data.csv"
-    latest = communication_dir / "latest_APR2026_comm_data.csv"
+    feb = communication_dir / "comm_data_FEB2026.csv"
+    mar = communication_dir / "comm_data_MAR2026.csv"
+    latest = communication_dir / "comm_data_APR2026.csv"
     noisy = communication_dir / "backup_MAR2026_comm_data.csv"
     for path in [feb, mar, latest, noisy]:
         path.write_text("id\n1\n", encoding="utf-8")

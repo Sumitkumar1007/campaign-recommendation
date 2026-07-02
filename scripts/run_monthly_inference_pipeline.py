@@ -19,7 +19,12 @@ from psycopg.types.json import Jsonb
 from app_logging import log_step, setup_logging
 from drift_utils import compute_drift_report
 from env_utils import load_dotenv
-from fetch_month_from_postgres import configured_prediction_month_from_emi_dates, configured_source_month_from_emi_dates, resolve_scheduler_emi_dates as resolve_configured_emi_dates
+from fetch_month_from_postgres import (
+    configured_prediction_month_from_emi_dates,
+    configured_source_month_from_emi_dates,
+    default_output_file as default_communication_output_file,
+    resolve_scheduler_emi_dates as resolve_configured_emi_dates,
+)
 from pipeline_common import build_feature_matrix, prepare_next_month_dataset, split_by_source_month
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
 from predict_next_month_strategy_catboost import build_prediction_population, load_base_population
@@ -239,14 +244,28 @@ def month_file_token(period: pd.Period) -> str:
     return period.to_timestamp().strftime("%b%Y").upper()
 
 
-def latest_extract_file(source_month: str) -> Path:
-    token = month_file_token(parse_month(source_month))
-    return COMMUNICATION_DATA_DIR / f"latest_{token}_comm_data.csv"
-
-
-def monthly_extract_file(month: str) -> Path:
+def _communication_extract_candidates(month: str) -> list[Path]:
     token = month_file_token(parse_month(month))
-    return COMMUNICATION_DATA_DIR / f"mfl_recomm_model_{token}_comm_data.csv"
+    candidates = [COMMUNICATION_DATA_DIR / f"comm_data_{token}.csv"]
+    existing = [path for path in candidates if path.exists()]
+    if existing:
+        return existing
+    legacy_candidates = [
+        COMMUNICATION_DATA_DIR / f"latest_{token}_comm_data.csv",
+        COMMUNICATION_DATA_DIR / f"mfl_recomm_model_{token}_comm_data.csv",
+    ]
+    return [path for path in legacy_candidates if path.exists()]
+
+
+def latest_extract_file(source_month: str) -> Path:
+    return default_communication_output_file(source_month)
+
+
+def monthly_extract_file(month: str) -> Path | None:
+    candidates = _communication_extract_candidates(month)
+    if candidates:
+        return candidates[-1]
+    return None
 
 
 def current_cases_file(source_month: str) -> Path:
@@ -260,7 +279,7 @@ def selected_history_files(source_month: str, latest_file: Path) -> list[Path]:
     files: list[Path] = []
     for period in previous_periods:
         monthly_file = monthly_extract_file(str(period))
-        if monthly_file.exists():
+        if monthly_file and monthly_file.exists():
             files.append(monthly_file)
     if latest_file.exists():
         files.append(latest_file)
@@ -1835,8 +1854,8 @@ def main() -> None:
     try:
         source_period = parse_month(args.source_month)
         history_fetches = [
-            (str(source_period - 2), monthly_extract_file(str(source_period - 2))),
-            (str(source_period - 1), monthly_extract_file(str(source_period - 1))),
+            (str(source_period - 2), default_communication_output_file(str(source_period - 2))),
+            (str(source_period - 1), default_communication_output_file(str(source_period - 1))),
             (args.source_month, source_extract_file),
         ]
         with log_step(logger, "fetch_communication_history", source_month=args.source_month):

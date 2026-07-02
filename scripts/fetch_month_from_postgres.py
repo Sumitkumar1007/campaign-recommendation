@@ -75,7 +75,7 @@ def month_bounds(source_month: str) -> tuple[pd.Timestamp, pd.Timestamp]:
 
 def default_output_file(source_month: str) -> Path:
     month_token = pd.Timestamp(f"{source_month}-01").strftime("%b%Y").upper()
-    return COMMUNICATION_DATA_DIR / f"mfl_recomm_model_{month_token}_comm_data.csv"
+    return COMMUNICATION_DATA_DIR / f"comm_data_{month_token}.csv"
 
 
 EMI_DATES_CONFIG_KEY = "upload.scheduler.emi-dates"
