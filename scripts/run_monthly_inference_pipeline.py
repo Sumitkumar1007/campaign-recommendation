@@ -1830,7 +1830,7 @@ def main() -> None:
     source_month_label = month_label(args.source_month)
     prediction_month_label = month_label(args.predict_month)
     source_extract_file = latest_extract_file(args.source_month)
-    source_cases_file = current_cases_file(args.source_month)
+    source_cases_file = current_cases_file(args.predict_month)
 
     try:
         source_period = parse_month(args.source_month)
@@ -1843,7 +1843,7 @@ def main() -> None:
             for fetch_month, output_file in history_fetches:
                 fetch_communication_extract(args, output_file, fetch_month, logger)
         with log_step(logger, "fetch_current_cases", source_month=args.source_month):
-            fetch_current_cases_extract(args, source_cases_file, args.source_month, logger)
+            fetch_current_cases_extract(args, source_cases_file, args.predict_month, logger)
 
         if not csv_has_rows(source_extract_file):
             logger.warning("No latest communication rows found. Skipping prediction run.")
