@@ -73,14 +73,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-source-months",
         nargs="*",
-        default=["NOV-2025", "DEC-2025", "JAN-2026"],
-        help="Source months used for training. For next-month prediction, source NOV predicts DEC, etc.",
+        default=[],
+        help="Optional explicit source months used for training. Defaults to the latest available dataset months.",
     )
     parser.add_argument(
         "--validation-source-months",
         nargs="*",
-        default=["FEB-2026"],
-        help="Source months used for validation.",
+        default=[],
+        help="Optional explicit source months used for validation. Defaults to the latest available dataset months.",
     )
     parser.add_argument(
         "--test-source-months",
@@ -91,8 +91,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prediction-source-months",
         nargs="*",
-        default=["MAR-2026"],
-        help="Source months used for future inference, typically the latest available month.",
+        default=[],
+        help="Optional explicit source months used for future inference. Defaults to the latest available dataset month.",
     )
     parser.add_argument(
         "--n-estimators",
@@ -314,13 +314,26 @@ def main() -> None:
         target_offset_months=args.target_offset_months,
     )
 
-    train_df = split_by_source_month(supervised_df, args.train_source_months, require_target=True)
+    effective_train_source_months = args.train_source_months
+    effective_validation_source_months = args.validation_source_months
+    effective_test_source_months = args.test_source_months
+    effective_prediction_source_months = args.prediction_source_months
+    if not effective_train_source_months:
+        targetable_months = sorted(supervised_df.loc[supervised_df["TARGET_MONTH"].notna(), "SOURCE_MONTH"].dropna().astype(str).unique().tolist())
+        all_months = sorted(supervised_df["SOURCE_MONTH"].dropna().astype(str).unique().tolist())
+        if targetable_months:
+            effective_train_source_months = targetable_months[:-1] if len(targetable_months) >= 2 else targetable_months
+            effective_validation_source_months = targetable_months[-1:] if len(targetable_months) >= 2 else []
+            effective_test_source_months = []
+            effective_prediction_source_months = [all_months[-1]] if all_months else []
+
+    train_df = split_by_source_month(supervised_df, effective_train_source_months, require_target=True)
     validation_df = split_by_source_month(
-        supervised_df, args.validation_source_months, require_target=True
+        supervised_df, effective_validation_source_months, require_target=True
     )
-    test_df = split_by_source_month(supervised_df, args.test_source_months, require_target=True)
+    test_df = split_by_source_month(supervised_df, effective_test_source_months, require_target=True)
     prediction_df = split_by_source_month(
-        supervised_df, args.prediction_source_months, require_target=False
+        supervised_df, effective_prediction_source_months, require_target=False
     )
 
     if train_df.empty:
@@ -338,10 +351,10 @@ def main() -> None:
             f"configured month offset of {args.target_offset_months}."
         ),
         "target_offset_months": args.target_offset_months,
-        "train_source_months": args.train_source_months,
-        "validation_source_months": args.validation_source_months,
-        "test_source_months": args.test_source_months,
-        "prediction_source_months": args.prediction_source_months,
+        "train_source_months": effective_train_source_months,
+        "validation_source_months": effective_validation_source_months,
+        "test_source_months": effective_test_source_months,
+        "prediction_source_months": effective_prediction_source_months,
         "n_estimators": args.n_estimators,
         "n_jobs": args.n_jobs,
         "train_metrics": evaluate_split(pipeline, train_df),

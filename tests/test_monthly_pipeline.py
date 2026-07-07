@@ -45,9 +45,12 @@ from run_monthly_inference_pipeline import (
     validate_month_pair,
 )
 from train_next_month_strategy_model_catboost import (
+    analyze_day_target_variation,
     build_feature_matrix,
     build_rolling_feature_windows,
+    fit_day_model,
     predict_top_k_by_risk,
+    resolve_source_month_splits,
     validate_day_target_variation,
 )
 from pipeline_common import DAY_COLUMNS
@@ -65,11 +68,84 @@ def test_validate_month_pair_rejects_non_adjacent_months() -> None:
         validate_month_pair("2026-04", "2026-06")
 
 
-def test_validate_day_target_variation_rejects_single_class_target() -> None:
+def test_validate_day_target_variation_returns_fallback_value_for_single_class_target() -> None:
     y_train = pd.DataFrame({"D+1": ["-", "-", "-"]})
 
-    with pytest.raises(ValueError, match=r"Training target for D\+1 contains only one unique value: '-' \(rows=3\)\."):
-        validate_day_target_variation("D+1", y_train)
+    assert validate_day_target_variation("D+1", y_train) == "-"
+
+
+def test_fit_day_model_uses_dash_fallback_for_missing_or_single_class_day(tmp_path: Path) -> None:
+    X_train = pd.DataFrame({"feature_a": [1, 2, 3]})
+    y_train = pd.DataFrame({"D+1": ["-", "-", "-"]})
+
+    day, model, encoder = fit_day_model(
+        "D+1",
+        X_train,
+        y_train,
+        iterations=500,
+        learning_rate=0.05,
+        depth=8,
+        checkpoint_dir=tmp_path,
+        checkpoint_metadata={"train_rows": 3},
+    )
+
+    assert day == "D+1"
+    assert encoder.classes_.tolist() == ["-"]
+    output = predict_top_k_by_risk(model, encoder, X_train, pd.Series(["LOW", "MEDIUM", "HIGH"]))
+    assert output.tolist() == ["-", "-", "-"]
+
+
+def test_fit_day_model_uses_constant_non_dash_fallback_for_single_class_day(tmp_path: Path) -> None:
+    X_train = pd.DataFrame({"feature_a": [1, 2, 3]})
+    y_train = pd.DataFrame({"D-1": ["SMS-9AM-ENGLISH", "SMS-9AM-ENGLISH", "SMS-9AM-ENGLISH"]})
+
+    day, model, encoder = fit_day_model(
+        "D-1",
+        X_train,
+        y_train,
+        iterations=500,
+        learning_rate=0.05,
+        depth=8,
+        checkpoint_dir=tmp_path,
+        checkpoint_metadata={"train_rows": 3},
+    )
+
+    assert day == "D-1"
+    assert encoder.classes_.tolist() == ["SMS-9AM-ENGLISH"]
+    output = predict_top_k_by_risk(model, encoder, X_train, pd.Series(["LOW", "MEDIUM", "HIGH"]))
+    assert output.tolist() == ["SMS-9AM-ENGLISH", "SMS-9AM-ENGLISH", "SMS-9AM-ENGLISH"]
+
+
+def test_analyze_day_target_variation_marks_missing_day_data() -> None:
+    y_train = pd.DataFrame(index=[0, 1, 2])
+
+    fallback = analyze_day_target_variation("D-2", y_train, original_day_present=False)
+
+    assert fallback is not None
+    assert fallback["fallback_reason"] == "missing_day_data"
+    assert fallback["fallback_value"] == "-"
+
+
+def test_resolve_source_month_splits_uses_latest_dataset_months_when_defaults_empty() -> None:
+    dataset = pd.DataFrame(
+        {
+            "SOURCE_MONTH": ["JAN-2026", "FEB-2026", "MAR-2026", "APR-2026", "MAY-2026", "JUN-2026"],
+            "TARGET_MONTH": ["FEB-2026", "MAR-2026", "APR-2026", "MAY-2026", "JUN-2026", pd.NA],
+        }
+    )
+
+    train, validation, test, prediction = resolve_source_month_splits(
+        dataset,
+        train_source_months=[],
+        validation_source_months=[],
+        test_source_months=[],
+        prediction_source_months=[],
+    )
+
+    assert train == ["JAN-2026", "FEB-2026", "MAR-2026", "APR-2026"]
+    assert validation == ["MAY-2026"]
+    assert test == []
+    assert prediction == ["JUN-2026"]
 
 
 def test_month_bounds_use_half_open_calendar_window() -> None:
@@ -1021,6 +1097,38 @@ def test_build_prediction_reason_uses_business_friendly_d_plus_5_language() -> N
     assert reason["D+5"] == (
         "At this stage, no campaign is recommended to prevent excessive communication with the customer. "
         "If the account still requires follow-up five days after the Cycle date, an English SMS may be sent at 3:00 PM as the next course of action."
+    )
+
+
+def test_build_prediction_reason_explains_missing_day_fallback() -> None:
+    prediction_row = pd.Series({"SOURCE_RISK": "LOW", "D-1": "-"})
+
+    reason = json.loads(
+        build_prediction_reason(
+            prediction_row=prediction_row,
+            source_row=None,
+            day_fallback_config={"D-1": {"fallback_reason": "missing_day_data", "fallback_value": "-"}},
+        )
+    )
+
+    assert reason["D-1"] == (
+        "No campaign is recommended because historical training data was not available for this day, so the system has defaulted to no communication."
+    )
+
+
+def test_build_prediction_reason_explains_single_unique_value_fallback() -> None:
+    prediction_row = pd.Series({"SOURCE_RISK": "LOW", "D+2": "SMS-9AM-ENGLISH"})
+
+    reason = json.loads(
+        build_prediction_reason(
+            prediction_row=prediction_row,
+            source_row=None,
+            day_fallback_config={"D+2": {"fallback_reason": "single_unique_value", "fallback_value": "SMS-9AM-ENGLISH"}},
+        )
+    )
+
+    assert reason["D+2"] == (
+        "SMS at 9AM in English is recommended because historical training data for this day contained only one unique outcome, so the system has applied that same recommendation consistently."
     )
 
 

@@ -289,10 +289,23 @@ def _business_alternate_reason_for_label(label: str, day: str, source_row: pd.Se
     return f"If additional follow-up is required, the next communication may be initiated at {time_text} in {language_text}."
 
 
+def _fallback_prediction_reason(day: str, fallback_config: dict[str, str], predicted_label: str) -> str:
+    fallback_reason = fallback_config.get("fallback_reason")
+    if fallback_reason == "missing_day_data":
+        return "No campaign is recommended because historical training data was not available for this day, so the system has defaulted to no communication."
+    if fallback_reason == "single_unique_value":
+        if predicted_label == "-":
+            return "No campaign is recommended because historical training data for this day contained only one unique outcome, so the system has defaulted to no communication."
+        readable = _readable_strategy(predicted_label)
+        return f"{readable} is recommended because historical training data for this day contained only one unique outcome, so the system has applied that same recommendation consistently."
+    return "The recommendation for this day used fallback logic because standard training data was not available."
+
+
 def build_prediction_reason(
     *,
     prediction_row: pd.Series,
     source_row: pd.Series | None,
+    day_fallback_config: dict[str, dict[str, str]] | None = None,
 ) -> str:
     payload: dict[str, str] = {}
     for day in DAY_COLUMNS:
@@ -302,6 +315,10 @@ def build_prediction_reason(
 
         ranked_labels = _ranked_business_labels(prediction_row.get(day, "-"))
         first_label = ranked_labels[0] if ranked_labels else "-"
+        fallback_info = (day_fallback_config or {}).get(day)
+        if fallback_info is not None:
+            payload[day] = _fallback_prediction_reason(day, fallback_info, first_label)
+            continue
         alternate_label = next((label for label in ranked_labels[1:] if label != "-"), None)
         if first_label == "-" and alternate_label is not None:
             payload[day] = _no_campaign_reason(day) + " " + _business_alternate_reason_for_label(
@@ -338,6 +355,7 @@ def main() -> None:
             bundle = joblib.load(model_file)
             target_offset_months = int(bundle.get("target_offset_months", 1))
             history_window_months = int(bundle.get("history_window_months", 1))
+            day_fallback_config = bundle.get("day_fallback_config", {})
             logger.info(
                 "Loaded model bundle | target_offset_months=%s history_window_months=%s feature_columns=%s",
                 target_offset_months,
@@ -415,6 +433,7 @@ def main() -> None:
                     build_prediction_reason(
                         prediction_row=prediction_output.iloc[row_idx],
                         source_row=prediction_rows.iloc[row_idx],
+                        day_fallback_config=day_fallback_config,
                     )
                     for row_idx in range(len(prediction_output))
                 ]

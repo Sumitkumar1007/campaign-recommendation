@@ -69,14 +69,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-source-months",
         nargs="*",
-        default=["NOV-2025", "DEC-2025", "JAN-2026"],
-        help="Source months used for training.",
+        default=[],
+        help="Optional explicit source months used for training. Defaults to the latest available dataset months.",
     )
     parser.add_argument(
         "--validation-source-months",
         nargs="*",
-        default=["FEB-2026"],
-        help="Source months used for validation.",
+        default=[],
+        help="Optional explicit source months used for validation. Defaults to the latest available dataset months.",
     )
     parser.add_argument(
         "--test-source-months",
@@ -87,8 +87,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prediction-source-months",
         nargs="*",
-        default=["MAR-2026"],
-        help="Source months used for future inference.",
+        default=[],
+        help="Optional explicit source months used for future inference. Defaults to the latest available dataset month.",
     )
     parser.add_argument(
         "--n-jobs",
@@ -173,13 +173,26 @@ def main() -> None:
         args.target_offset_months,
     )
 
-    train_df = split_by_source_month(dataset, args.train_source_months, require_target=True)
+    effective_train_source_months = args.train_source_months
+    effective_validation_source_months = args.validation_source_months
+    effective_test_source_months = args.test_source_months
+    effective_prediction_source_months = args.prediction_source_months
+    if not effective_train_source_months:
+        targetable_months = sorted(dataset.loc[dataset["TARGET_MONTH"].notna(), "SOURCE_MONTH"].dropna().astype(str).unique().tolist())
+        all_months = sorted(dataset["SOURCE_MONTH"].dropna().astype(str).unique().tolist())
+        if targetable_months:
+            effective_train_source_months = targetable_months[:-1] if len(targetable_months) >= 2 else targetable_months
+            effective_validation_source_months = targetable_months[-1:] if len(targetable_months) >= 2 else []
+            effective_test_source_months = []
+            effective_prediction_source_months = [all_months[-1]] if all_months else []
+
+    train_df = split_by_source_month(dataset, effective_train_source_months, require_target=True)
     validation_df = split_by_source_month(
-        dataset, args.validation_source_months, require_target=True
+        dataset, effective_validation_source_months, require_target=True
     )
-    test_df = split_by_source_month(dataset, args.test_source_months, require_target=True)
+    test_df = split_by_source_month(dataset, effective_test_source_months, require_target=True)
     prediction_df = split_by_source_month(
-        dataset, args.prediction_source_months, require_target=False
+        dataset, effective_prediction_source_months, require_target=False
     )
 
     if train_df.empty:
@@ -208,10 +221,10 @@ def main() -> None:
             f"targets with month offset {args.target_offset_months}."
         ),
         "target_offset_months": args.target_offset_months,
-        "train_source_months": args.train_source_months,
-        "validation_source_months": args.validation_source_months,
-        "test_source_months": args.test_source_months,
-        "prediction_source_months": args.prediction_source_months,
+        "train_source_months": effective_train_source_months,
+        "validation_source_months": effective_validation_source_months,
+        "test_source_months": effective_test_source_months,
+        "prediction_source_months": effective_prediction_source_months,
         "n_jobs": args.n_jobs,
         "max_iter": args.max_iter,
         "train_metrics": evaluate_models(models, label_encoders, X_train, y_train),

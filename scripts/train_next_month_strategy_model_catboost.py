@@ -4,6 +4,9 @@ import argparse
 import json
 import logging
 import time
+from typing import Any
+
+import numpy as np
 from pathlib import Path
 
 import joblib
@@ -82,14 +85,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--train-source-months",
         nargs="*",
-        default=["NOV-2025", "DEC-2025", "JAN-2026"],
-        help="Source months used for training.",
+        default=[],
+        help="Optional explicit source months used for training. Defaults to the latest available dataset months.",
     )
     parser.add_argument(
         "--validation-source-months",
         nargs="*",
-        default=["FEB-2026"],
-        help="Source months used for validation.",
+        default=[],
+        help="Optional explicit source months used for validation. Defaults to the latest available dataset months.",
     )
     parser.add_argument(
         "--test-source-months",
@@ -100,8 +103,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prediction-source-months",
         nargs="*",
-        default=["MAR-2026"],
-        help="Source months used for future inference.",
+        default=[],
+        help="Optional explicit source months used for future inference. Defaults to the latest available dataset month.",
     )
     parser.add_argument(
         "--n-jobs",
@@ -190,15 +193,66 @@ def prepare_dataset(
     )
 
 
-def validate_day_target_variation(day: str, y_train: pd.DataFrame) -> None:
-    value_counts = y_train[day].astype(str).value_counts().sort_index()
-    if len(value_counts) < 2:
-        only_value = value_counts.index[0] if not value_counts.empty else "<empty>"
-        only_count = int(value_counts.iloc[0]) if not value_counts.empty else 0
-        raise ValueError(
-            f"Training target for {day} contains only one unique value: {only_value!r} "
-            f"(rows={only_count})."
-        )
+class ConstantDayModel:
+    def __init__(self, encoded_value: int = 0, class_count: int = 1) -> None:
+        self.encoded_value = int(encoded_value)
+        self.class_count = max(int(class_count), 1)
+
+    def predict(self, X: pd.DataFrame) -> np.ndarray:
+        return np.full(len(X), self.encoded_value, dtype=int)
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        probabilities = np.zeros((len(X), self.class_count), dtype=float)
+        probabilities[:, self.encoded_value] = 1.0
+        return probabilities
+
+
+def analyze_day_target_variation(
+    day: str,
+    y_train: pd.DataFrame,
+    *,
+    original_day_present: bool = True,
+) -> dict[str, str] | None:
+    if not original_day_present:
+        return {
+            "fallback_reason": "missing_day_data",
+            "fallback_value": "-",
+            "log_message": f"Training data for {day} is missing from the D-5 to D+5 window. Defaulting predictions to '-' for this day.",
+        }
+    raw_series = y_train[day] if day in y_train.columns else pd.Series(dtype=object)
+    non_null_values = raw_series.dropna().astype(str).str.strip()
+    non_null_values = non_null_values[non_null_values.ne("")]
+    if non_null_values.empty:
+        return {
+            "fallback_reason": "missing_day_data",
+            "fallback_value": "-",
+            "log_message": f"Training data for {day} is missing from the D-5 to D+5 window. Defaulting predictions to '-' for this day.",
+        }
+    unique_values = sorted(non_null_values.unique().tolist())
+    if len(unique_values) == 1:
+        fallback_value = unique_values[0]
+        if fallback_value == "-":
+            message = f"Training data for {day} has only one unique value '-'. Defaulting predictions to '-' for this day."
+        else:
+            message = f"Training data for {day} has only one unique value {fallback_value!r}. Defaulting predictions to that same value for this day."
+        return {
+            "fallback_reason": "single_unique_value",
+            "fallback_value": fallback_value,
+            "log_message": message,
+        }
+    return None
+
+
+def validate_day_target_variation(day: str, y_train: pd.DataFrame) -> str | None:
+    fallback = analyze_day_target_variation(day, y_train)
+    return None if fallback is None else fallback["fallback_value"]
+
+
+def build_constant_day_fallback(target_value: str) -> tuple[ConstantDayModel, LabelEncoder]:
+    encoder = LabelEncoder()
+    encoder.fit([str(target_value)])
+    model = ConstantDayModel(encoded_value=0, class_count=len(encoder.classes_))
+    return model, encoder
 
 
 def fit_day_model(
@@ -210,20 +264,25 @@ def fit_day_model(
     depth: int,
     checkpoint_dir: Path,
     checkpoint_metadata: dict,
-) -> tuple[str, CatBoostClassifier, LabelEncoder]:
+    fallback_config: dict[str, str] | None = None,
+) -> tuple[str, Any, LabelEncoder]:
     logger = logging.getLogger("catboost_training")
     checkpoint_file = checkpoint_dir / f"{day.replace('+', 'plus').replace('-', 'minus')}.joblib"
+    fallback_config = fallback_config or analyze_day_target_variation(day, y_train)
+    fallback_value = None if fallback_config is None else fallback_config["fallback_value"]
+    expected_metadata = {
+        **checkpoint_metadata,
+        "day": day,
+        "iterations": iterations,
+        "learning_rate": learning_rate,
+        "depth": depth,
+        "feature_columns": X_train.columns.tolist(),
+        "target_value_counts": y_train[day].astype(str).value_counts().sort_index().to_dict(),
+    }
+    if fallback_config is not None:
+        expected_metadata.update({"fallback_value": str(fallback_value), "fallback_reason": fallback_config["fallback_reason"], "model_kind": "constant"})
     if checkpoint_file.exists():
         checkpoint = joblib.load(checkpoint_file)
-        expected_metadata = {
-            **checkpoint_metadata,
-            "day": day,
-            "iterations": iterations,
-            "learning_rate": learning_rate,
-            "depth": depth,
-            "feature_columns": X_train.columns.tolist(),
-            "target_value_counts": y_train[day].astype(str).value_counts().sort_index().to_dict(),
-        }
         if checkpoint.get("metadata") == expected_metadata:
             logger.info("LOAD fit_day_model checkpoint | day=%s path=%s", day, checkpoint_file)
             return day, checkpoint["model"], checkpoint["label_encoder"]
@@ -239,7 +298,47 @@ def fit_day_model(
         learning_rate,
         depth,
     )
-    validate_day_target_variation(day, y_train)
+    if fallback_config is not None:
+        logger.warning(
+            "Using constant fallback for day target | day=%s value=%r reason=%s rows=%s message=%s",
+            day,
+            fallback_value,
+            fallback_config["fallback_reason"],
+            len(y_train),
+            fallback_config["log_message"],
+        )
+        model, encoder = build_constant_day_fallback(fallback_value)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        joblib.dump(
+            {
+                "day": day,
+                "model": model,
+                "label_encoder": encoder,
+                "metadata": {
+                    **checkpoint_metadata,
+                    "day": day,
+                    "iterations": iterations,
+                    "learning_rate": learning_rate,
+                    "depth": depth,
+                    "feature_columns": X_train.columns.tolist(),
+                    "target_value_counts": y_train[day].astype(str).value_counts().sort_index().to_dict(),
+                    "fallback_value": str(fallback_value),
+                    "fallback_reason": fallback_config["fallback_reason"],
+                    "model_kind": "constant",
+                },
+                "classes": encoder.classes_.tolist(),
+            },
+            checkpoint_file,
+        )
+        logger.info(
+            "END fit_day_model | day=%s classes=%s checkpoint=%s elapsed_seconds=%.2f fallback=true",
+            day,
+            len(encoder.classes_),
+            checkpoint_file,
+            time.perf_counter() - start,
+        )
+        return day, model, encoder
+
     train_dir = CATBOOST_INFO_DIR / day
     train_dir.mkdir(parents=True, exist_ok=True)
     encoder = LabelEncoder()
@@ -384,9 +483,19 @@ def main() -> None:
         if len(train_df) < 2:
             raise ValueError(f"Training data insufficient. Found {len(train_df)} training row(s) after month split.")
 
-        y_train = train_df[DAY_COLUMNS].fillna("-")
-        y_validation = validation_df[DAY_COLUMNS].fillna("-")
-        y_test = test_df[DAY_COLUMNS].fillna("-")
+        train_target_frame = train_df.reindex(columns=DAY_COLUMNS)
+        validation_target_frame = validation_df.reindex(columns=DAY_COLUMNS)
+        test_target_frame = test_df.reindex(columns=DAY_COLUMNS)
+        y_train = train_target_frame.fillna("-")
+        y_validation = validation_target_frame.fillna("-")
+        y_test = test_target_frame.fillna("-")
+        day_fallback_config = {
+            day: analyze_day_target_variation(day, train_target_frame, original_day_present=(day in train_df.columns))
+            for day in DAY_COLUMNS
+        }
+        for day, fallback in day_fallback_config.items():
+            if fallback is not None:
+                logger.warning("Day fallback activated | day=%s reason=%s value=%r message=%s", day, fallback["fallback_reason"], fallback["fallback_value"], fallback["log_message"])
         logger.info("Target matrices | train=%s validation=%s test=%s", y_train.shape, y_validation.shape, y_test.shape)
 
         with log_step(logger, "fit_all_day_models", n_jobs=args.n_jobs, days=",".join(DAY_COLUMNS)):
@@ -412,6 +521,7 @@ def main() -> None:
                     args.depth,
                     checkpoint_dir,
                     checkpoint_metadata,
+                    day_fallback_config.get(day),
                 )
                 for day in DAY_COLUMNS
             )
@@ -454,6 +564,7 @@ def main() -> None:
             "target_columns": DAY_COLUMNS,
             "target_offset_months": args.target_offset_months,
             "history_window_months": args.history_window_months,
+            "day_fallback_config": {day: fallback for day, fallback in day_fallback_config.items() if fallback is not None},
         }
 
         with log_step(logger, "save_model_and_metrics"):
