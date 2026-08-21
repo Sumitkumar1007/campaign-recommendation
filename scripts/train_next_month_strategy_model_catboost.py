@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import time
 from typing import Any
 
@@ -17,9 +18,13 @@ from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import LabelEncoder
 
 from app_logging import log_step, setup_logging
-from artifact_versioning import copy_to_latest, next_versioned_directory, next_versioned_path, write_versioned_json
+from env_utils import load_dotenv
+from artifact_versioning import next_versioned_directory, next_versioned_path
+from model_fallbacks import ConstantDayModel, register_legacy_joblib_aliases
 from pipeline_common import (
     DAY_COLUMNS,
+    DAY_WEIGHT_COLUMN_MAP,
+    SCHEDULE_DAY_COLUMNS,
     build_feature_matrix,
     build_rolling_feature_windows,
     month_to_period,
@@ -47,12 +52,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--feature-file",
-        default=str(FEATURE_DATA_DIR / "strategy_monthly_features.csv"),
+        # default=str(FEATURE_DATA_DIR / "strategy_monthly_features.csv"),
+        default=str(FEATURE_DATA_DIR / "strategy_monthly_features_train.csv"),
         help="Monthly aggregated feature CSV.",
     )
     parser.add_argument(
         "--schedule-file",
-        default=str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv"),
+        # default=str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv"),
+        default=str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_train.csv"),
         help="Schedule-style strategy target CSV.",
     )
     parser.add_argument(
@@ -140,9 +147,17 @@ def parse_args() -> argparse.Namespace:
         default=str(CHECKPOINT_DIR / "catboost_3m"),
         help="Directory for per-day model checkpoints.",
     )
+    parser.add_argument(
+        "--model-version",
+        default="",
+        help="Optional model version token used to save version-specific artifacts, for example v002.",
+    )
     return parser.parse_args()
 
 
+
+
+register_legacy_joblib_aliases()
 
 
 def _sorted_month_labels(labels: list[str]) -> list[str]:
@@ -166,14 +181,26 @@ def resolve_source_month_splits(
     )
     all_months = _sorted_month_labels(dataset["SOURCE_MONTH"].dropna().astype(str).unique().tolist())
 
-    if split_by_source_month(dataset, train_source_months, require_target=True).empty and targetable_months:
-        if len(targetable_months) >= 2:
-            effective_train = targetable_months[:-1]
+    has_explicit_split = any([
+        train_source_months,
+        validation_source_months,
+        test_source_months,
+        prediction_source_months,
+    ])
+    if not has_explicit_split and targetable_months:
+        if len(targetable_months) >= 3:
+            effective_train = targetable_months[:-2]
+            effective_validation = targetable_months[-2:-1]
+            effective_test = targetable_months[-1:]
+        elif len(targetable_months) == 2:
+            effective_train = targetable_months[:1]
             effective_validation = targetable_months[-1:]
+            effective_test = []
         else:
             effective_train = targetable_months
             effective_validation = []
-        effective_test = []
+            effective_test = []
+
         effective_prediction = [all_months[-1]] if all_months else []
         return effective_train, effective_validation, effective_test, effective_prediction
 
@@ -193,19 +220,6 @@ def prepare_dataset(
     )
 
 
-class ConstantDayModel:
-    def __init__(self, encoded_value: int = 0, class_count: int = 1) -> None:
-        self.encoded_value = int(encoded_value)
-        self.class_count = max(int(class_count), 1)
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        return np.full(len(X), self.encoded_value, dtype=int)
-
-    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
-        probabilities = np.zeros((len(X), self.class_count), dtype=float)
-        probabilities[:, self.encoded_value] = 1.0
-        return probabilities
-
 
 def analyze_day_target_variation(
     day: str,
@@ -217,7 +231,7 @@ def analyze_day_target_variation(
         return {
             "fallback_reason": "missing_day_data",
             "fallback_value": "-",
-            "log_message": f"Training data for {day} is missing from the D-5 to D+5 window. Defaulting predictions to '-' for this day.",
+            "log_message": f"Training data for {day} is missing from the D-5 to D+20 window. Defaulting predictions to '-' for this day.",
         }
     raw_series = y_train[day] if day in y_train.columns else pd.Series(dtype=object)
     non_null_values = raw_series.dropna().astype(str).str.strip()
@@ -226,7 +240,7 @@ def analyze_day_target_variation(
         return {
             "fallback_reason": "missing_day_data",
             "fallback_value": "-",
-            "log_message": f"Training data for {day} is missing from the D-5 to D+5 window. Defaulting predictions to '-' for this day.",
+            "log_message": f"Training data for {day} is missing from the D-5 to D+20 window. Defaulting predictions to '-' for this day.",
         }
     unique_values = sorted(non_null_values.unique().tolist())
     if len(unique_values) == 1:
@@ -259,6 +273,7 @@ def fit_day_model(
     day: str,
     X_train: pd.DataFrame,
     y_train: pd.DataFrame,
+    sample_weight: np.ndarray | None,
     iterations: int,
     learning_rate: float,
     depth: int,
@@ -270,6 +285,10 @@ def fit_day_model(
     checkpoint_file = checkpoint_dir / f"{day.replace('+', 'plus').replace('-', 'minus')}.joblib"
     fallback_config = fallback_config or analyze_day_target_variation(day, y_train)
     fallback_value = None if fallback_config is None else fallback_config["fallback_value"]
+    sample_weight_enabled = sample_weight is not None
+    sample_weight_min = None if sample_weight is None or len(sample_weight) == 0 else float(np.min(sample_weight))
+    sample_weight_max = None if sample_weight is None or len(sample_weight) == 0 else float(np.max(sample_weight))
+    sample_weight_sum = None if sample_weight is None or len(sample_weight) == 0 else float(np.sum(sample_weight))
     expected_metadata = {
         **checkpoint_metadata,
         "day": day,
@@ -278,6 +297,10 @@ def fit_day_model(
         "depth": depth,
         "feature_columns": X_train.columns.tolist(),
         "target_value_counts": y_train[day].astype(str).value_counts().sort_index().to_dict(),
+        "sample_weight_enabled": sample_weight_enabled,
+        "sample_weight_min": sample_weight_min,
+        "sample_weight_max": sample_weight_max,
+        "sample_weight_sum": sample_weight_sum,
     }
     if fallback_config is not None:
         expected_metadata.update({"fallback_value": str(fallback_value), "fallback_reason": fallback_config["fallback_reason"], "model_kind": "constant"})
@@ -290,13 +313,16 @@ def fit_day_model(
 
     start = time.perf_counter()
     logger.info(
-        "START fit_day_model | day=%s rows=%s columns=%s iterations=%s learning_rate=%s depth=%s",
+        "START fit_day_model | day=%s rows=%s columns=%s iterations=%s learning_rate=%s depth=%s sample_weight_enabled=%s sample_weight_min=%s sample_weight_max=%s",
         day,
         len(X_train),
         len(X_train.columns),
         iterations,
         learning_rate,
         depth,
+        sample_weight_enabled,
+        sample_weight_min,
+        sample_weight_max,
     )
     if fallback_config is not None:
         logger.warning(
@@ -353,7 +379,7 @@ def fit_day_model(
         thread_count=1,
         train_dir=str(train_dir),
     )
-    model.fit(X_train, y_encoded)
+    model.fit(X_train, y_encoded, sample_weight=sample_weight)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     joblib.dump(
         {
@@ -409,7 +435,26 @@ def evaluate_models(models: dict, label_encoders: dict, X: pd.DataFrame, y: pd.D
     }
 
 
+def versioned_artifact_path(base_path: Path, model_version: str) -> Path:
+    token = str(model_version).strip()
+    if not token:
+        raise ValueError("model_version is required for versioned artifact naming.")
+    if not token.lower().startswith("v"):
+        token = f"v{token}"
+    return base_path.with_name(f"{base_path.stem}_{token}{base_path.suffix}")
+
+
+def versioned_checkpoint_dir(base_dir: Path, model_version: str) -> Path:
+    token = str(model_version).strip()
+    if not token:
+        raise ValueError("model_version is required for versioned checkpoint naming.")
+    if not token.lower().startswith("v"):
+        token = f"v{token}"
+    return base_dir.parent / f"{base_dir.name}_{token}"
+
+
 def main() -> None:
+    load_dotenv(override=True)
     args = parse_args()
     logger = setup_logging(args.log_file, "catboost_training")
     logger.info("CatBoost training args: %s", vars(args))
@@ -417,10 +462,14 @@ def main() -> None:
     model_file = ensure_parent_dir(args.model_file)
     metrics_file = ensure_parent_dir(args.metrics_file)
     prediction_file = ensure_parent_dir(args.prediction_file)
-    versioned_model_file = next_versioned_path(model_file)
-    versioned_metrics_file = next_versioned_path(metrics_file)
-    versioned_prediction_file = next_versioned_path(prediction_file)
-    checkpoint_dir = next_versioned_directory(Path(args.checkpoint_dir))
+    if args.model_version.strip():
+        versioned_model_file = versioned_artifact_path(model_file, args.model_version)
+        versioned_metrics_file = versioned_artifact_path(metrics_file, args.model_version)
+        checkpoint_dir = versioned_checkpoint_dir(Path(args.checkpoint_dir), args.model_version)
+    else:
+        versioned_model_file = next_versioned_path(model_file)
+        versioned_metrics_file = next_versioned_path(metrics_file)
+        checkpoint_dir = next_versioned_directory(Path(args.checkpoint_dir))
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -464,6 +513,15 @@ def main() -> None:
                 effective_test_source_months,
                 effective_prediction_source_months,
             )
+            logger.info(
+                "Month split summary | target_offset_months=%s history_window_months=%s train_month_count=%s validation_month_count=%s test_month_count=%s prediction_month_count=%s",
+                args.target_offset_months,
+                args.history_window_months,
+                len(effective_train_source_months),
+                len(effective_validation_source_months),
+                len(effective_test_source_months),
+                len(effective_prediction_source_months),
+            )
 
         if train_df.empty:
             raise ValueError("No training rows found for the selected source months.")
@@ -479,6 +537,13 @@ def main() -> None:
                 X_test.shape,
                 len(X_train.columns),
             )
+            logger.info(
+                "Training rows by source month | train=%s validation=%s test=%s prediction_candidates=%s",
+                train_df["SOURCE_MONTH"].value_counts(sort=False).to_dict(),
+                validation_df["SOURCE_MONTH"].value_counts(sort=False).to_dict(),
+                test_df["SOURCE_MONTH"].value_counts(sort=False).to_dict(),
+                prediction_df["SOURCE_MONTH"].value_counts(sort=False).to_dict(),
+            )
 
         if len(train_df) < 2:
             raise ValueError(f"Training data insufficient. Found {len(train_df)} training row(s) after month split.")
@@ -486,6 +551,13 @@ def main() -> None:
         train_target_frame = train_df.reindex(columns=DAY_COLUMNS)
         validation_target_frame = validation_df.reindex(columns=DAY_COLUMNS)
         test_target_frame = test_df.reindex(columns=DAY_COLUMNS)
+        train_weight_frame = pd.DataFrame(index=train_df.index)
+        for day in DAY_COLUMNS:
+            weight_column = DAY_WEIGHT_COLUMN_MAP[day]
+            train_weight_frame[day] = pd.to_numeric(
+                train_df.get(weight_column, 1.0),
+                errors="coerce",
+            ).fillna(1.0)
         y_train = train_target_frame.fillna("-")
         y_validation = validation_target_frame.fillna("-")
         y_test = test_target_frame.fillna("-")
@@ -500,11 +572,14 @@ def main() -> None:
 
         with log_step(logger, "fit_all_day_models", n_jobs=args.n_jobs, days=",".join(DAY_COLUMNS)):
             completed_checkpoints = sorted(path.name for path in checkpoint_dir.glob("*.joblib"))
+            sample_weight_mode = os.getenv("STRATEGY_USE_STATUS_WEIGHTS", "false").strip().lower()
+            use_sample_weights = sample_weight_mode in {"1", "true", "yes", "on"}
             checkpoint_metadata = {
                 "target_offset_months": args.target_offset_months,
                 "history_window_months": args.history_window_months,
                 "train_source_months": effective_train_source_months,
                 "train_rows": int(len(train_df)),
+                "sample_weight_mode": sample_weight_mode,
             }
             logger.info(
                 "Checkpoint directory | path=%s existing_checkpoints=%s",
@@ -516,6 +591,7 @@ def main() -> None:
                     day,
                     X_train,
                     y_train,
+                    train_weight_frame[day].to_numpy(dtype=float) if use_sample_weights else None,
                     args.iterations,
                     args.learning_rate,
                     args.depth,
@@ -557,6 +633,21 @@ def main() -> None:
             "test_metrics": test_metrics,
         }
 
+        # model_bundle = {
+        #     "models": models,
+        #     "label_encoders": label_encoders,
+        #     "feature_columns": X_train.columns.tolist(),
+        #     "target_columns": DAY_COLUMNS,
+        #     "target_offset_months": args.target_offset_months,
+        #     "history_window_months": args.history_window_months,
+        #     "day_fallback_config": {day: fallback for day, fallback in day_fallback_config.items() if fallback is not None},
+        # }
+
+        if len(X_train) > 10000:
+            baseline_matrix = X_train.sample(n=10000, random_state=42)
+        else:
+            baseline_matrix = X_train.copy()
+
         model_bundle = {
             "models": models,
             "label_encoders": label_encoders,
@@ -565,26 +656,27 @@ def main() -> None:
             "target_offset_months": args.target_offset_months,
             "history_window_months": args.history_window_months,
             "day_fallback_config": {day: fallback for day, fallback in day_fallback_config.items() if fallback is not None},
+            # "baseline_matrix": baseline_matrix,  # <--- Drift calculator will look for this key
         }
 
         with log_step(logger, "save_model_and_metrics"):
+            versioned_model_file.parent.mkdir(parents=True, exist_ok=True)
+            versioned_metrics_file.parent.mkdir(parents=True, exist_ok=True)
             joblib.dump(model_bundle, versioned_model_file)
-            copy_to_latest(source_path=versioned_model_file, latest_path=model_file)
-            write_versioned_json(payload=metrics, latest_path=metrics_file, versioned_path=versioned_metrics_file)
+            versioned_metrics_file.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
             logger.info("Saved versioned model | path=%s bytes=%s", versioned_model_file, versioned_model_file.stat().st_size)
-            logger.info("Updated latest model alias | path=%s bytes=%s", model_file, model_file.stat().st_size)
             logger.info("Saved versioned metrics | path=%s bytes=%s", versioned_metrics_file, versioned_metrics_file.stat().st_size)
-            logger.info("Updated latest metrics alias | path=%s bytes=%s", metrics_file, metrics_file.stat().st_size)
 
         with log_step(logger, "write_predictions"):
             prediction_rows = prediction_df[prediction_df["TARGET_MONTH"].isna()].copy()
             logger.info("Prediction rows needing future target | rows=%s", len(prediction_rows))
             if not prediction_rows.empty:
                 X_pred = build_feature_matrix(prediction_rows).reindex(columns=X_train.columns, fill_value=0)
-                prediction_output = prediction_rows[["APAC_CARD_NUMBER", "SOURCE_MONTH", "RISK"]].copy()
+                output_key = "APAC_CARD_NUMBER" if "APAC_CARD_NUMBER" in prediction_rows.columns else "ENTITY_KEY"
+                prediction_output = prediction_rows[[output_key, "SOURCE_MONTH", "RISK"]].copy()
                 prediction_output = prediction_output.rename(
                     columns={
-                        "APAC_CARD_NUMBER": "Loan_number",
+                        output_key: "Loan_number",
                         "SOURCE_MONTH": "SOURCE_MONTH_USED",
                         "RISK": "SOURCE_RISK",
                     }
@@ -603,16 +695,14 @@ def main() -> None:
                     )
                 prediction_output["D"] = "-"
                 prediction_output = prediction_output[
-                    ["SOURCE_RISK", "Loan_number", "SOURCE_MONTH_USED", "MONTH", "D-5", "D-4", "D-3", "D-2", "D-1", "D", "D+1", "D+2", "D+3", "D+4", "D+5"]
+                    ["SOURCE_RISK", "Loan_number", "SOURCE_MONTH_USED", "MONTH", *SCHEDULE_DAY_COLUMNS]
                 ]
-                prediction_output.to_csv(versioned_prediction_file, index=False)
+                prediction_output.to_csv(prediction_file, index=False)
             else:
                 pd.DataFrame(
-                    columns=["SOURCE_RISK", "Loan_number", "SOURCE_MONTH_USED", "MONTH", "D-5", "D-4", "D-3", "D-2", "D-1", "D", "D+1", "D+2", "D+3", "D+4", "D+5"]
-                ).to_csv(versioned_prediction_file, index=False)
-            copy_to_latest(source_path=versioned_prediction_file, latest_path=prediction_file)
-            logger.info("Saved versioned predictions | path=%s bytes=%s", versioned_prediction_file, versioned_prediction_file.stat().st_size)
-            logger.info("Updated latest predictions alias | path=%s bytes=%s", prediction_file, prediction_file.stat().st_size)
+                    columns=["SOURCE_RISK", "Loan_number", "SOURCE_MONTH_USED", "MONTH", *SCHEDULE_DAY_COLUMNS]
+                ).to_csv(prediction_file, index=False)
+            logger.info("Saved predictions | path=%s bytes=%s", prediction_file, prediction_file.stat().st_size)
 
         print(f"Training rows: {len(train_df):,}")
         print(f"Validation rows: {len(validation_df):,}")
@@ -620,7 +710,7 @@ def main() -> None:
         print(f"Prediction rows: {len(prediction_rows):,}")
         print(f"Saved model to {model_file} (versioned copy: {versioned_model_file})")
         print(f"Saved metrics to {metrics_file} (versioned copy: {versioned_metrics_file})")
-        print(f"Saved future predictions to {prediction_file} (versioned copy: {versioned_prediction_file})")
+        print(f"Saved future predictions to {prediction_file}")
         logger.info("CatBoost training completed successfully.")
     except Exception:
         logger.exception("CatBoost training failed.")

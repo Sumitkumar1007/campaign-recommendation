@@ -699,9 +699,7 @@ FEATURE_MONTH_SOURCE=emi_date
 
 # MLflow registry
 MLFLOW_TRACKING_URI=http://<mlflow_host>:5000
-MLFLOW_EXPERIMENT_NAME=campaign-recommendation
 MLFLOW_REGISTERED_MODEL_NAME=campaign_next_month_catboost_3m
-MLFLOW_RUN_NAME=catboost-3m-may-2026-v1
 
 
 # API service

@@ -22,6 +22,7 @@ from fetch_month_from_postgres import (
     _extract_scheduler_emi_dates,
     configured_prediction_month_from_emi_dates,
     configured_source_month_from_emi_dates,
+    default_output_file as default_communication_output_file,
     emi_cycle_dates,
     month_bounds,
 )
@@ -37,6 +38,7 @@ from export_mcollect_scheduler import (
 from run_monthly_inference_pipeline import (
     build_campaign_mappings,
     build_campaign_recommendations,
+    model_artifact_path,
     month_label,
     resolve_active_campaign_vendors_by_mode,
     resolve_campaign_vendors,
@@ -53,8 +55,15 @@ from train_next_month_strategy_model_catboost import (
     resolve_source_month_splits,
     validate_day_target_variation,
 )
-from pipeline_common import DAY_COLUMNS
+from model_fallbacks import ConstantDayModel, register_legacy_joblib_aliases
+from pipeline_common import DAY_COLUMNS, SCHEDULE_DAY_COLUMNS
 from predict_next_month_strategy_catboost import build_prediction_population, build_prediction_reason
+from generate_prediction_evidence import (
+    build_prediction_evidence as build_pit_prediction_evidence,
+    _prepare_raw_communications,
+    prediction_evidence_file,
+)
+from campaign_recommendation.api_service import bump_model_version
 from campaign_recommendation.recommend import RecommendationPolicy, candidate_hours, generate_candidates
 
 
@@ -66,6 +75,16 @@ def test_validate_month_pair_accepts_adjacent_months() -> None:
 def test_validate_month_pair_rejects_non_adjacent_months() -> None:
     with pytest.raises(ValueError, match="exactly one month after"):
         validate_month_pair("2026-04", "2026-06")
+
+
+def test_bump_model_version_supports_sequential_versions() -> None:
+    assert bump_model_version("v002", fallback="v001") == "v003"
+
+
+def test_model_artifact_path_uses_explicit_model_version(tmp_path: Path) -> None:
+    path = model_artifact_path(tmp_path, "next_month_strategy_catboost_3m", ".joblib", "v002")
+
+    assert path.name == "next_month_strategy_catboost_3m_v002.joblib"
 
 
 def test_validate_day_target_variation_returns_fallback_value_for_single_class_target() -> None:
@@ -93,6 +112,22 @@ def test_fit_day_model_uses_dash_fallback_for_missing_or_single_class_day(tmp_pa
     assert encoder.classes_.tolist() == ["-"]
     output = predict_top_k_by_risk(model, encoder, X_train, pd.Series(["LOW", "MEDIUM", "HIGH"]))
     assert output.tolist() == ["-", "-", "-"]
+
+
+def test_register_legacy_joblib_aliases_exposes_constant_day_model_on_main() -> None:
+    main_module = sys.modules["__main__"]
+    previous = getattr(main_module, "ConstantDayModel", None)
+    if hasattr(main_module, "ConstantDayModel"):
+        delattr(main_module, "ConstantDayModel")
+    try:
+        register_legacy_joblib_aliases()
+        assert getattr(main_module, "ConstantDayModel") is ConstantDayModel
+    finally:
+        if previous is None:
+            if hasattr(main_module, "ConstantDayModel"):
+                delattr(main_module, "ConstantDayModel")
+        else:
+            setattr(main_module, "ConstantDayModel", previous)
 
 
 def test_fit_day_model_uses_constant_non_dash_fallback_for_single_class_day(tmp_path: Path) -> None:
@@ -248,6 +283,30 @@ def test_process_chunk_uses_risk_from_communications_and_emi_month() -> None:
     assert risk_counts.loc[0, "MONTH"] == "MAY-2026"
     assert feature_counts.loc[0, "MONTH"] == "MAY-2026"
     assert strategy_counts.loc[0, "feature"] == "SMS-9AM-ENGLISH"
+
+
+def test_process_chunk_includes_voice_bot_as_voice_channel() -> None:
+    chunk = pd.DataFrame(
+        {
+            "apac_card_number": ["A1"],
+            "comm_status": ["CONNECTED"],
+            "communication_type": ["VOICE_BOT"],
+            "verbiage_language": ["english"],
+            "risk": ["high"],
+            "emi_date": ["2026-05-05"],
+            "date": ["2026-05-06"],
+            "created_date": ["2026-05-06 14:15:00"],
+        }
+    )
+
+    feature_counts, strategy_counts, risk_counts = process_chunk(chunk, month_source="emi_date")
+
+    assert not feature_counts.empty
+    assert not strategy_counts.empty
+    assert risk_counts.loc[0, "RISK"] == "HIGH"
+    assert "VOICE_BOT_SUCCESS_2PM_ENGLISH" in set(feature_counts["feature"])
+    assert "VOICE_BOT_TOTAL_INTENSITY" in set(feature_counts["feature"])
+    assert "VOICE_BOT-2PM-ENGLISH" in set(strategy_counts["feature"])
 
 
 def test_send_hour_rule_clamps_to_9_through_18() -> None:
@@ -632,6 +691,7 @@ def test_resolve_campaign_vendors_by_mode_reads_service_specific_keys() -> None:
             values = {
                 "sms.service.vendor-list": ("kaleyra,prutech",),
                 "voice.service.vendor-list": ("value-first,prutech-cpass",),
+                "voice-bot.service.vendor-list": ("ozonetel,micro-prutech",),
                 "whatsapp.service.vendor-list": ("prutech-v2,kaleyra",),
             }
             return DummyResult(values.get(key))
@@ -647,6 +707,7 @@ def test_resolve_campaign_vendors_by_mode_reads_service_specific_keys() -> None:
     assert vendors == {
         "SMS": ["kaleyra", "prutech"],
         "VOICE": ["value-first", "prutech-cpass"],
+        "VOICE_BOT": ["ozonetel", "micro-prutech"],
         "WHATSAPP": ["prutech-v2", "kaleyra"],
     }
 
@@ -684,6 +745,7 @@ def test_resolve_active_campaign_vendors_by_mode_reads_current_month_active_serv
     assert vendors == {
         "SMS": ["kaleyra"],
         "VOICE": ["prutech-cpass"],
+        "VOICE_BOT": [],
         "WHATSAPP": ["kaleyra"],
     }
 
@@ -702,6 +764,7 @@ def test_resolve_campaign_vendors_supports_active_service_json_values() -> None:
             values = {
                 "sms.service.vendor-list": ('[{"active_Service": "KALEYRA"}, {"active_Service": "PRUTECH-CPASS"}]',),
                 "voice.service.vendor-list": (None,),
+                "voice-bot.service.vendor-list": (None,),
                 "whatsapp.service.vendor-list": (None,),
             }
             return DummyResult(values.get(key))
@@ -735,11 +798,14 @@ def test_resolve_campaign_vendors_by_mode_uses_active_service_then_data_config()
                 return DummyResult(rows=[
                     ("VOICE", "PRUTECH-CPASS"),
                     ("VOICE", "VALUE-FIRST"),
+                    ("VOICE_BOT", "MICRO-PRUTECH"),
+                    ("VOICE_BOT", "OZONETEL"),
                 ])
             key = params[0]
             values = {
                 "sms.service.vendor-list": ("kaleyra,prutech",),
                 "voice.service.vendor-list": ("value-first,prutech-cpass",),
+                "voice-bot.service.vendor-list": ("ozonetel,micro-prutech",),
                 "whatsapp.service.vendor-list": ("prutech-v2,kaleyra",),
             }
             return DummyResult(row=values.get(key))
@@ -755,6 +821,7 @@ def test_resolve_campaign_vendors_by_mode_uses_active_service_then_data_config()
     )
 
     assert vendors["VOICE"] == ["prutech-cpass", "value-first"]
+    assert vendors["VOICE_BOT"] == ["micro-prutech", "ozonetel"]
 
 
 def test_resolve_campaign_vendors_by_mode_filters_to_active_vendors() -> None:
@@ -775,11 +842,13 @@ def test_resolve_campaign_vendors_by_mode_filters_to_active_vendors() -> None:
                 return DummyResult(rows=[
                     ("SMS", "KALEYRA"),
                     ("VOICE", "PRUTECH-CPASS"),
+                    ("VOICE_BOT", "MICRO-PRUTECH"),
                 ])
             key = params[0]
             values = {
                 "sms.service.vendor-list": ("kaleyra,prutech",),
                 "voice.service.vendor-list": ("value-first,prutech-cpass",),
+                "voice-bot.service.vendor-list": ("ozonetel,micro-prutech",),
                 "whatsapp.service.vendor-list": ("prutech-v2,kaleyra",),
             }
             return DummyResult(row=values.get(key))
@@ -797,6 +866,7 @@ def test_resolve_campaign_vendors_by_mode_filters_to_active_vendors() -> None:
     assert vendors == {
         "SMS": ["kaleyra"],
         "VOICE": ["prutech-cpass"],
+        "VOICE_BOT": ["micro-prutech"],
         "WHATSAPP": ["prutech-v2", "kaleyra"],
     }
 
@@ -1116,6 +1186,27 @@ def test_build_prediction_reason_explains_missing_day_fallback() -> None:
     )
 
 
+def test_build_prediction_reason_explains_voice_bot_channel() -> None:
+    prediction_row = pd.Series({
+        "SOURCE_RISK": "LOW",
+        "D+1": "VOICE_BOT-2PM-ENGLISH",
+    })
+    source_row = pd.Series({
+        "RISK": "LOW",
+        "VOICE_BOT_TOTAL_INTENSITY": 2,
+        "VOICE_BOT_SUCCESS_2PM_ENGLISH": 1,
+        "SMS_TOTAL_INTENSITY": 0,
+        "WH_TOTAL_INTENSITY": 0,
+        "VOICE_TOTAL_INTENSITY": 0,
+    })
+
+    reason = json.loads(build_prediction_reason(prediction_row=prediction_row, source_row=source_row))
+
+    assert reason["D+1"] == (
+        "voice bot at 2PM in English is recommended because automated voice bot communication has shown a positive response in earlier interactions."
+    )
+
+
 def test_build_prediction_reason_explains_single_unique_value_fallback() -> None:
     prediction_row = pd.Series({"SOURCE_RISK": "LOW", "D+2": "SMS-9AM-ENGLISH"})
 
@@ -1132,6 +1223,14 @@ def test_build_prediction_reason_explains_single_unique_value_fallback() -> None
     )
 
 
+def test_prediction_evidence_file_uses_required_name(tmp_path: Path) -> None:
+    prediction_file = tmp_path / "2026_07_strategy_predictions_catboost_3m.csv"
+
+    evidence_file = prediction_evidence_file(prediction_file)
+
+    assert evidence_file.name == "2026_07_strategy_predictions_catboost_3m_prediction_evidence.csv"
+
+
 def test_build_prediction_reason_explains_no_history_blank_predictions() -> None:
     prediction_row = pd.Series({"SOURCE_RISK": "LOW", "D-5": "-"})
 
@@ -1140,7 +1239,7 @@ def test_build_prediction_reason_explains_no_history_blank_predictions() -> None
     assert reason["D-5"] == (
         "At this stage, no campaign is recommended to prevent excessive communication with the customer."
     )
-    assert set(reason) == set(DAY_COLUMNS)
+    assert set(reason) == set(SCHEDULE_DAY_COLUMNS)
 
 
 def test_dataset_query_for_uses_mapping_table_filters() -> None:
@@ -1328,3 +1427,131 @@ def test_build_cron_trigger_specs_splits_month_boundaries() -> None:
 
     assert [spec.cron_expression for spec in specs] == ["0 0 9,10 30 4 ?", "0 0 9,10 1 5 ?"]
     assert {spec.trigger_state for spec in specs} == {"PAUSED"}
+
+
+def test_generate_prediction_evidence_aggregates_matching_offsets_across_months() -> None:
+    prediction_rows = pd.DataFrame(
+        [
+            {
+                "Loan_number": "MOB-TEST-AI",
+                "SOURCE_MONTH_USED": "JUN-2026",
+                "MONTH": "JUL-2026",
+                "EMI_DATE": "15/07/2026",
+                "SOURCE_RISK": "MEDIUM",
+                "SOURCE_VERTICAL": "LAP",
+            }
+        ]
+    )
+    raw_communications = pd.DataFrame(
+        [
+            {
+                "APAC_CARD_NUMBER": "MOB-TEST-AI",
+                "emi_date": pd.Timestamp("2026-04-05"),
+                "event_date": pd.Timestamp("2026-04-10"),
+                "COMM_TYPE": "SMS",
+                "LANGUAGE": "ENGLISH",
+                "IS_SUCCESS": True,
+                "hour_bucket": 12,
+            },
+            {
+                "APAC_CARD_NUMBER": "MOB-TEST-AI",
+                "emi_date": pd.Timestamp("2026-05-05"),
+                "event_date": pd.Timestamp("2026-05-10"),
+                "COMM_TYPE": "SMS",
+                "LANGUAGE": "ENGLISH",
+                "IS_SUCCESS": True,
+                "hour_bucket": 12,
+            },
+            {
+                "APAC_CARD_NUMBER": "MOB-TEST-AI",
+                "emi_date": pd.Timestamp("2026-06-05"),
+                "event_date": pd.Timestamp("2026-06-09"),
+                "COMM_TYPE": "SMS",
+                "LANGUAGE": "ENGLISH",
+                "IS_SUCCESS": True,
+                "hour_bucket": 10,
+            },
+        ]
+    )
+    ranked_probability_map = {
+        ("MOB-TEST-AI", "D+5"): [("SMS-12PM-ENGLISH", 0.9), ("SMS-10AM-ENGLISH", 0.05), ("VOICE-9AM-ENGLISH", 0.05)],
+        ("MOB-TEST-AI", "D+4"): [("SMS-10AM-ENGLISH", 0.92), ("SMS-12PM-ENGLISH", 0.04), ("VOICE-9AM-ENGLISH", 0.04)],
+    }
+
+    evidence = build_pit_prediction_evidence(
+        prediction_rows=prediction_rows,
+        raw_communications=raw_communications,
+        ranked_probability_map=ranked_probability_map,
+    )
+
+    d_plus_4 = evidence[evidence["day"] == "D+4"].iloc[0]
+    d_plus_5 = evidence[evidence["day"] == "D+5"].iloc[0]
+
+    assert d_plus_4["SMS_SUCCESS_10AM_ENGLISH"] == 1.0
+    assert d_plus_4["SMS_SUCCESS_12PM_ENGLISH"] == 0.0
+    assert d_plus_4["SMS_TOTAL_INTENSITY"] == 1.0
+    assert d_plus_5["SMS_SUCCESS_12PM_ENGLISH"] == 2.0
+    assert d_plus_5["SMS_SUCCESS_10AM_ENGLISH"] == 0.0
+    assert d_plus_5["SMS_TOTAL_INTENSITY"] == 3.0
+    assert d_plus_5["historical_successfeature1"] == "SMS_SUCCESS_12PM_ENGLISH"
+    assert d_plus_5["historical_successprecentage1"] == 66.67
+
+
+def test_generate_prediction_evidence_combines_same_day_offsets_from_loaded_month_files(tmp_path: Path) -> None:
+    columns = [
+        "apac_card_number",
+        "comm_status",
+        "communication_type",
+        "verbiage_language",
+        "vertical",
+        "risk",
+        "emi_date",
+        "date",
+        "created_date",
+    ]
+    rows_by_file = {
+        "comm_data_APR2026.csv": [
+            ["MOB-TEST-AI", "DELIVERED", "SMS", "English", "LAP", "MEDIUM", "05/04/2026", "10/04/2026", "10/04/2026 12:15:00"],
+        ],
+        "comm_data_MAY2026.csv": [
+            ["MOB-TEST-AI", "DELIVERED", "SMS", "English", "LAP", "MEDIUM", "05/05/2026", "10/05/2026", "10/05/2026 12:30:00"],
+        ],
+        "comm_data_JUN2026.csv": [
+            ["MOB-TEST-AI", "DELIVERED", "SMS", "English", "LAP", "MEDIUM", "05/06/2026", "10/06/2026", "10/06/2026 12:45:00"],
+        ],
+    }
+    files = []
+    for file_name, rows in rows_by_file.items():
+        file_path = tmp_path / file_name
+        pd.DataFrame(rows, columns=columns).to_csv(file_path, index=False)
+        files.append(file_path)
+
+    raw_communications = _prepare_raw_communications(files)
+    prediction_rows = pd.DataFrame(
+        [
+            {
+                "Loan_number": "MOB-TEST-AI",
+                "SOURCE_MONTH_USED": "JUN-2026",
+                "MONTH": "JUL-2026",
+                "EMI_DATE": "15/07/2026",
+                "SOURCE_RISK": "MEDIUM",
+                "SOURCE_VERTICAL": "LAP",
+            }
+        ]
+    )
+
+    evidence = build_pit_prediction_evidence(
+        prediction_rows=prediction_rows,
+        raw_communications=raw_communications,
+        ranked_probability_map={
+            ("MOB-TEST-AI", "D+5"): [("SMS-12PM-ENGLISH", 0.91), ("SMS-9AM-ENGLISH", 0.05), ("WH-9AM-ENGLISH", 0.04)]
+        },
+    )
+
+    d_plus_5 = evidence[evidence["day"] == "D+5"].iloc[0]
+
+    assert d_plus_5["SMS_SUCCESS_12PM_ENGLISH"] == 3.0
+    assert d_plus_5["SMS_TOTAL_INTENSITY"] == 3.0
+    assert d_plus_5["historical_successfeature1"] == "SMS_SUCCESS_12PM_ENGLISH"
+    assert d_plus_5["historical_successprecentage1"] == 100.0
+

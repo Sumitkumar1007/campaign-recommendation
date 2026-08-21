@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 from psycopg import sql
 
+from entity_keys import strategy_use_party_id
 from env_utils import load_dotenv
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
 from project_paths import COMMUNICATION_DATA_DIR, ensure_parent_dir
@@ -32,6 +33,16 @@ def parse_args() -> argparse.Namespace:
         "--table",
         default=os.getenv("SOURCE_TABLE", "communications"),
         help="Source communications table.",
+    )
+    parser.add_argument(
+        "--vertical-column",
+        default=os.getenv("COMMUNICATION_VERTICAL_COLUMN", "vertical"),
+        help="Source column name containing the business vertical for communications.",
+    )
+    parser.add_argument(
+        "--party-id-column",
+        default=os.getenv("COMMUNICATION_PARTY_ID_COLUMN", "party_id"),
+        help="Optional source column name containing party_id for multi-loan history grouping.",
     )
     parser.add_argument(
         "--fetch-month",
@@ -73,9 +84,23 @@ def month_bounds(source_month: str) -> tuple[pd.Timestamp, pd.Timestamp]:
     return start.normalize(), end.normalize()
 
 
-def default_output_file(source_month: str) -> Path:
+def default_output_file(source_month: str, cycle_day: int | None = None) -> Path:
     month_token = pd.Timestamp(f"{source_month}-01").strftime("%b%Y").upper()
-    return COMMUNICATION_DATA_DIR / f"comm_data_{month_token}.csv"
+    if cycle_day is None:
+        return COMMUNICATION_DATA_DIR / f"comm_data_{month_token}.csv"
+    return COMMUNICATION_DATA_DIR / f"comm_data_{month_token}_{int(cycle_day)}.csv"
+
+
+def output_file_for_cycle(source_month: str, cycle_day: int, explicit_output_file: str = "") -> Path:
+    if not explicit_output_file:
+        return default_output_file(source_month, cycle_day)
+    base_output_file = Path(explicit_output_file)
+    suffix = base_output_file.suffix or ".csv"
+    stem = base_output_file.stem
+    cycle_suffix = f"_{int(cycle_day)}"
+    if stem.endswith(cycle_suffix):
+        return base_output_file.with_suffix(suffix)
+    return base_output_file.with_name(f"{stem}{cycle_suffix}{suffix}")
 
 
 EMI_DATES_CONFIG_KEY = "upload.scheduler.emi-dates"
@@ -195,9 +220,14 @@ def emi_cycle_dates(
     return [month_start.replace(day=day) for day in emi_cycle if day <= days_in_month]
 
 
-def build_query(schema: str, table: str) -> sql.Composed:
+def build_query(schema: str, table: str, vertical_column: str, party_id_column: str | None = None) -> sql.Composed:
     table_ref = qualified_identifier(schema, table)
     parsed_emi_date = safe_emi_date_sql("src")
+    vertical_identifier = sql.Identifier(vertical_column)
+    if party_id_column:
+        party_id_select = sql.SQL('src.{} AS party_id').format(sql.Identifier(party_id_column))
+    else:
+        party_id_select = sql.SQL('NULL::TEXT AS party_id')
 
     return sql.SQL(
         """
@@ -208,8 +238,9 @@ def build_query(schema: str, table: str) -> sql.Composed:
                 src.comm_status,
                 src.communication_type,
                 src.verbiage_language,
-                src.vertical,
+                src.{vertical_column} AS vertical,
                 src.risk,
+                {party_id_select},
                 {parsed_emi_date} AS emi_date,
                 EXTRACT(HOUR FROM date_trunc('hour', src.created_date)) AS hr,
                 CAST(src.created_date AS DATE) AS date,
@@ -226,6 +257,7 @@ def build_query(schema: str, table: str) -> sql.Composed:
             verbiage_language,
             vertical,
             risk,
+            party_id,
             emi_date,
             hr,
             date,
@@ -235,7 +267,12 @@ def build_query(schema: str, table: str) -> sql.Composed:
         FROM parsed
         WHERE emi_date = ANY(%(emi_dates)s)
         """
-    ).format(table_ref=table_ref, parsed_emi_date=parsed_emi_date)
+    ).format(
+        table_ref=table_ref,
+        parsed_emi_date=parsed_emi_date,
+        vertical_column=vertical_identifier,
+        party_id_select=party_id_select,
+    )
 
 
 def build_audit_summary(conn, *, schema: str, table: str, emi_dates: list[pd.Timestamp]) -> dict[str, object]:
@@ -375,19 +412,25 @@ def main() -> None:
         user=args.user,
         password=args.password,
     )
-    query = build_query(args.schema, args.table)
+    
+    # Note: Using the new build_query that includes args.vertical_column
+    query = build_query(args.schema, args.table, args.vertical_column, args.party_id_column if strategy_use_party_id() else None)
 
     with connect_db(config) as conn:
         configured_emi_dates = resolve_scheduler_emi_dates(conn, schema=args.schema)
         fetch_month = args.fetch_month or configured_source_month_from_emi_dates(configured_emi_dates)
-        output_file = (
-            ensure_parent_dir(args.output_file)
-            if args.output_file
-            else ensure_parent_dir(default_output_file(fetch_month))
-        )
+        
+        # Determine output file (single file per month, no cycle suffix)
+        if args.output_file:
+            output_file = ensure_parent_dir(Path(args.output_file))
+        else:
+            output_file = ensure_parent_dir(default_output_file(fetch_month))
+            
         emi_cycle = [int(emi_date.day) for emi_date in configured_emi_dates]
         emi_dates = emi_cycle_dates(emi_cycle, fetch_month=fetch_month)
         audit_summary = build_audit_summary(conn, schema=args.schema, table=args.table, emi_dates=emi_dates)
+        
+        # Pass all dates at once
         params = {"emi_dates": [date.date() for date in emi_dates]}
         row_count = write_query_to_csv(
             conn,
@@ -406,12 +449,12 @@ def main() -> None:
             {
                 "fetch_month": fetch_month,
                 "emi_dates": [date.strftime("%d/%m/%Y") for date in emi_dates],
+                "output_file": str(output_file),
                 **audit_summary,
             },
             sort_keys=True,
         )
     )
-
 
 if __name__ == "__main__":
     main()

@@ -8,8 +8,11 @@ import joblib
 import pandas as pd
 
 from app_logging import log_step, setup_logging
+from entity_keys import annotate_entity_key, entity_key_column_name
+from model_fallbacks import register_legacy_joblib_aliases
 from pipeline_common import (
     DAY_COLUMNS,
+    SCHEDULE_DAY_COLUMNS,
     build_feature_matrix,
     month_to_period,
     predict_top_k_by_risk,
@@ -55,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--prediction-source-months",
         nargs="*",
-        default=["MAR-2026"],
+        default=[],
         help="Source months to score for next-month prediction.",
     )
     parser.add_argument(
@@ -68,7 +71,20 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Application log file. Defaults to artifacts/logs/catboost_inference.log.",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    missing = [
+        name
+        for name, value in {
+            "--feature-file": args.feature_file,
+            "--schedule-file": args.schedule_file,
+            "--model-file": args.model_file,
+            "--base-population-file": args.base_population_file,
+        }.items()
+        if not value
+    ]
+    if missing:
+        parser.error("Missing required CLI args: " + ", ".join(missing))
+    return args
 
 
 def _normalize_text(series: pd.Series, default: str = "UNKNOWN") -> pd.Series:
@@ -87,15 +103,17 @@ def load_base_population(base_population_file: Path, source_month_label: str) ->
     if missing:
         raise ValueError(f"Base population file is missing required columns: {sorted(missing)}")
 
+    base = annotate_entity_key(base, loan_column="apac_card_number", party_column="party_id", output_column=entity_key_column_name())
     base["APAC_CARD_NUMBER"] = _normalize_text(base["apac_card_number"], default="")
+    base["ENTITY_KEY"] = _normalize_text(base[entity_key_column_name()], default="")
     base["RISK"] = _normalize_text(base["risk"]).str.upper()
     base["VERTICAL"] = _normalize_text(base["vertical"]).str.upper()
     base["SOURCE_MONTH"] = source_month_label
     base["collectable_amount"] = pd.to_numeric(base["collectable_amount"], errors="coerce").fillna(0.0)
     base["emi_date"] = _normalize_text(base["emi_date"], default="")
-    base = base[base["APAC_CARD_NUMBER"].ne("")].copy()
+    base = base[base["APAC_CARD_NUMBER"].ne("") & base["ENTITY_KEY"].ne("")].copy()
     base = base.drop_duplicates(subset=["APAC_CARD_NUMBER", "emi_date"], keep="first").reset_index(drop=True)
-    return base[["APAC_CARD_NUMBER", "SOURCE_MONTH", "RISK", "VERTICAL", "collectable_amount", "emi_date"]]
+    return base[["APAC_CARD_NUMBER", "ENTITY_KEY", "SOURCE_MONTH", "RISK", "VERTICAL", "collectable_amount", "emi_date"]]
 
 
 def build_prediction_population(
@@ -105,12 +123,13 @@ def build_prediction_population(
     prediction_source_month: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     source_month_period = month_to_period(pd.Series([prediction_source_month])).iloc[0]
+    key_column = "ENTITY_KEY" if "ENTITY_KEY" in dataset.columns else "APAC_CARD_NUMBER"
     feature_rows = dataset[dataset["TARGET_MONTH"].isna()].copy()
     feature_rows = feature_rows[feature_rows["SOURCE_MONTH_PERIOD"].notna()].copy()
     feature_rows = feature_rows[feature_rows["SOURCE_MONTH_PERIOD"] <= source_month_period].copy()
     feature_rows = (
-        feature_rows.sort_values(["APAC_CARD_NUMBER", "SOURCE_MONTH_PERIOD"])
-        .drop_duplicates(subset=["APAC_CARD_NUMBER"], keep="last")
+        feature_rows.sort_values([key_column, "SOURCE_MONTH_PERIOD"])
+        .drop_duplicates(subset=[key_column], keep="last")
         .reset_index(drop=True)
     )
     feature_rows = feature_rows.drop(
@@ -122,7 +141,7 @@ def build_prediction_population(
 
     merged = base_population.merge(
         feature_rows,
-        on=["APAC_CARD_NUMBER", "SOURCE_MONTH"],
+        on=[key_column, "SOURCE_MONTH"],
         how="left",
         indicator=True,
     )
@@ -148,7 +167,7 @@ def _strategy_parts(label: str) -> tuple[str, str, str] | None:
     if len(parts) != 3:
         return None
     channel, hour, language = parts
-    channel_map = {"SMS": "SMS", "WH": "WH", "WHATSAPP": "WH", "IVR": "VOICE", "VOICE": "VOICE"}
+    channel_map = {"SMS": "SMS", "WH": "WH", "WHATSAPP": "WH", "IVR": "VOICE", "VOICE": "VOICE", "VOICE_BOT": "VOICE_BOT"}
     normalized_channel = channel_map.get(channel.upper())
     if not normalized_channel:
         return None
@@ -180,7 +199,7 @@ def _readable_strategy(label: str) -> str:
     if not parts:
         return "no campaign"
     channel, hour, language = parts
-    channel_name = {"SMS": "SMS", "WH": "WhatsApp", "VOICE": "voice call"}.get(channel, channel)
+    channel_name = {"SMS": "SMS", "WH": "WhatsApp", "VOICE": "voice call", "VOICE_BOT": "voice bot"}.get(channel, channel)
     language_name = "Regional language" if language.upper() == "REGIONAL" else language.title()
     return f"{channel_name} at {hour} in {language_name}"
 
@@ -194,7 +213,36 @@ def _channel_totals(source_row: pd.Series | None) -> dict[str, int]:
         "SMS": int(_safe_numeric(source_row.get("SMS_TOTAL_INTENSITY"))) if source_row is not None else 0,
         "WH": int(_safe_numeric(source_row.get("WH_TOTAL_INTENSITY"))) if source_row is not None else 0,
         "VOICE": int(_safe_numeric(source_row.get("VOICE_TOTAL_INTENSITY"))) if source_row is not None else 0,
+        "VOICE_BOT": int(_safe_numeric(source_row.get("VOICE_BOT_TOTAL_INTENSITY"))) if source_row is not None else 0,
     }
+
+
+def _channel_total_for_label(source_row: pd.Series | None, label: str) -> tuple[str, float]:
+    parts = _strategy_parts(label)
+    if not parts:
+        return "", 0.0
+    channel, _hour, _language = parts
+    column = f"{channel}_TOTAL_INTENSITY"
+    return column, _safe_numeric(source_row.get(column)) if source_row is not None else 0.0
+
+
+def _support_percentage(source_row: pd.Series | None, label: str) -> tuple[str, float, str, float]:
+    success_column, success_count = _matching_success_signal(source_row, label)
+    total_column, total_count = _channel_total_for_label(source_row, label)
+    if total_count <= 0 or success_count <= 0:
+        return success_column, success_count, total_column, 0.0
+    return success_column, success_count, total_column, round((success_count / total_count) * 100.0, 2)
+
+
+def _feature_value(source_row: pd.Series | None, column: str) -> float:
+    return _safe_numeric(source_row.get(column)) if source_row is not None else 0.0
+
+
+def _camel_case_feature(column: str) -> str:
+    parts = str(column).lower().split("_")
+    if not parts:
+        return column
+    return parts[0] + "".join(part.capitalize() for part in parts[1:])
 
 
 def _has_channel_success(source_row: pd.Series | None, channel: str) -> bool:
@@ -256,6 +304,11 @@ def _business_reason_for_label(label: str, day: str, source_row: pd.Series | Non
             return f"{readable} is recommended because direct customer interaction has shown a positive response in earlier communication."
         return f"{readable} is recommended because direct customer interaction may be helpful for this account."
 
+    if channel == "VOICE_BOT":
+        if has_exact_success or has_channel_success:
+            return f"{readable} is recommended because automated voice bot communication has shown a positive response in earlier interactions."
+        return f"{readable} is recommended because an automated voice bot reminder may be helpful for this account."
+
     return f"{readable} is recommended because it is aligned with the customer's past communication pattern."
 
 def _business_alternate_reason_for_label(label: str, day: str, source_row: pd.Series | None) -> str:
@@ -286,6 +339,10 @@ def _business_alternate_reason_for_label(label: str, day: str, source_row: pd.Se
         article = "an" if language_text[:1].lower() in {"a", "e", "i", "o", "u"} else "a"
         return f"If direct customer interaction is required, {article} {language_text} voice call may be initiated at {time_text} as the next course of action."
 
+    if channel == "VOICE_BOT":
+        article = "an" if language_text[:1].lower() in {"a", "e", "i", "o", "u"} else "a"
+        return f"If an automated follow-up is required, {article} {language_text} voice bot reminder may be initiated at {time_text} as the next course of action."
+
     return f"If additional follow-up is required, the next communication may be initiated at {time_text} in {language_text}."
 
 
@@ -308,7 +365,7 @@ def build_prediction_reason(
     day_fallback_config: dict[str, dict[str, str]] | None = None,
 ) -> str:
     payload: dict[str, str] = {}
-    for day in DAY_COLUMNS:
+    for day in SCHEDULE_DAY_COLUMNS:
         if day == "D":
             payload[day] = _no_campaign_reason(day)
             continue
@@ -337,7 +394,9 @@ def build_prediction_reason(
 
     return json.dumps(payload, sort_keys=True)
 
+
 def main() -> None:
+    register_legacy_joblib_aliases()
     args = parse_args()
     logger = setup_logging(args.log_file, "catboost_inference")
     logger.info("CatBoost inference args: %s", vars(args))
@@ -371,10 +430,20 @@ def main() -> None:
                 history_window_months=history_window_months,
             )
             logger.info("Prepared inference dataset | rows=%s columns=%s", len(dataset), len(dataset.columns))
+            if not any(str(column).startswith("VOICE_BOT_") for column in dataset.columns):
+                logger.warning("VOICE_BOT channel was not present in the inference input data. Inference will continue without VOICE_BOT history.")
 
         if len(args.prediction_source_months) != 1:
             raise ValueError("Inference with digital_cases base population requires exactly one prediction source month.")
         prediction_source_month = args.prediction_source_months[0]
+        available_dataset_months = sorted(dataset["SOURCE_MONTH"].dropna().astype(str).unique().tolist()) if "SOURCE_MONTH" in dataset.columns else []
+        logger.info(
+            "Inference month summary | prediction_source_month=%s target_offset_months=%s history_window_months=%s available_dataset_source_months=%s",
+            prediction_source_month,
+            target_offset_months,
+            history_window_months,
+            available_dataset_months,
+        )
 
         with log_step(logger, "load_base_population", base_population_file=args.base_population_file):
             base_population = load_base_population(Path(args.base_population_file), prediction_source_month)
@@ -396,6 +465,7 @@ def main() -> None:
 
         if not prediction_rows.empty:
             with log_step(logger, "build_prediction_matrix"):
+                output_key = "APAC_CARD_NUMBER" if "APAC_CARD_NUMBER" in prediction_rows.columns else ("ENTITY_KEY" if "ENTITY_KEY" in prediction_rows.columns else None)
                 X_pred = build_feature_matrix(prediction_rows).reindex(
                     columns=bundle["feature_columns"],
                     fill_value=0,
@@ -403,10 +473,10 @@ def main() -> None:
                 logger.info("Prediction matrix | shape=%s", X_pred.shape)
 
             with log_step(logger, "predict_day_columns", rows=len(X_pred)):
-                prediction_output = prediction_rows[["APAC_CARD_NUMBER", "SOURCE_MONTH", "RISK", "VERTICAL", "emi_date"]].copy()
+                prediction_output = prediction_rows[[output_key, "SOURCE_MONTH", "RISK", "VERTICAL", "emi_date"]].copy()
                 prediction_output = prediction_output.rename(
                     columns={
-                        "APAC_CARD_NUMBER": "Loan_number",
+                        output_key: "Loan_number",
                         "SOURCE_MONTH": "SOURCE_MONTH_USED",
                         "RISK": "SOURCE_RISK",
                         "VERTICAL": "SOURCE_VERTICAL",
@@ -440,10 +510,9 @@ def main() -> None:
                 prediction_outputs.append(prediction_output)
 
         if not blank_rows.empty:
-            blank_output = blank_rows[["APAC_CARD_NUMBER", "SOURCE_MONTH", "RISK", "VERTICAL", "emi_date"]].copy()
+            blank_output = blank_rows[["APAC_CARD_NUMBER" if "APAC_CARD_NUMBER" in blank_rows.columns else "ENTITY_KEY", "SOURCE_MONTH", "RISK", "VERTICAL", "emi_date"]].copy()
             blank_output = blank_output.rename(
-                columns={
-                    "APAC_CARD_NUMBER": "Loan_number",
+                columns={("APAC_CARD_NUMBER" if "APAC_CARD_NUMBER" in blank_rows.columns else "ENTITY_KEY"): "Loan_number",
                     "SOURCE_MONTH": "SOURCE_MONTH_USED",
                     "RISK": "SOURCE_RISK",
                     "VERTICAL": "SOURCE_VERTICAL",
@@ -476,7 +545,7 @@ def main() -> None:
                     "Loan_number",
                     "SOURCE_MONTH_USED",
                     "MONTH",
-                    *DAY_COLUMNS,
+                    *SCHEDULE_DAY_COLUMNS,
                     "PREDICTION_REASON",
                 ]
             )
@@ -491,17 +560,7 @@ def main() -> None:
                     "Loan_number",
                     "SOURCE_MONTH_USED",
                     "MONTH",
-                    "D-5",
-                    "D-4",
-                    "D-3",
-                    "D-2",
-                    "D-1",
-                    "D",
-                    "D+1",
-                    "D+2",
-                    "D+3",
-                    "D+4",
-                    "D+5",
+                    *SCHEDULE_DAY_COLUMNS,
                     "PREDICTION_REASON",
                 ]
             ]

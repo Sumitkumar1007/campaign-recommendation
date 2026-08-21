@@ -92,11 +92,27 @@ class CapturingService(AIMLApiService):
         self.export_commands: list[list[str]] = []
 
     def _run_inference_job(self, *, transaction_id: str, payload: dict[str, object]) -> None:
+        model_name = str(payload["model"])
+        latest_training_version = self.latest_completed_training_model_version()
+        model_version = str(payload.get("modelVersion") or self.current_model_version())
         self.inference_commands.append(
             self._build_inference_command(
                 source_month=str(payload["sourceMonth"]),
                 predict_month=str(payload["predictMonth"]),
-                model_name=str(payload["model"]),
+                model_name=model_name,
+                model_version=model_version,
+                model_file=api_service_module.model_artifact_path(
+                    api_service_module.MODEL_DIR,
+                    f"next_month_strategy_{model_name}",
+                    ".joblib",
+                    latest_training_version,
+                ),
+                metrics_file=api_service_module.model_artifact_path(
+                    api_service_module.METRICS_DIR,
+                    f"next_month_strategy_{model_name}_metrics",
+                    ".json",
+                    latest_training_version,
+                ),
             )
         )
         if self.config.export_after_inference:
@@ -339,6 +355,9 @@ def test_build_inference_command_uses_venv_python_env(monkeypatch: pytest.Monkey
         source_month="2026-06",
         predict_month="2026-07",
         model_name="catboost_3m",
+        model_version="v1.1.0",
+        model_file=Path("/tmp/model.joblib"),
+        metrics_file=Path("/tmp/metrics.json"),
     )
 
     assert command[0] == "/opt/custom/venv/bin/python"
@@ -603,7 +622,7 @@ def test_run_inference_job_completes_when_summary_reader_is_available(monkeypatc
         "run",
         lambda *args, **kwargs: api_service_module.subprocess.CompletedProcess(args[0], 0, stdout="", stderr=""),
     )
-    monkeypatch.setattr(api_service_module, "read_metrics_snapshot", lambda model_name: {"modelVersion": model_name, "currentAccuracy": 78.5, "driftPercentage": 4.8})
+    monkeypatch.setattr(api_service_module, "read_metrics_snapshot", lambda model_name, model_version=None: {"modelVersion": model_version or model_name, "currentAccuracy": 78.5, "driftPercentage": 4.8})
     monkeypatch.setattr(api_service_module, "read_prediction_summary", lambda predict_month: {"drift": {"drift_percentage": 4.8, "overall_psi": 0.12, "max_feature_psi": 0.2, "status": "LOW"}})
 
     service._run_inference_job(
@@ -712,7 +731,7 @@ def test_successful_training_persists_zero_drift(monkeypatch: pytest.MonkeyPatch
     monkeypatch.setattr(
         api_service_module,
         "read_metrics_snapshot",
-        lambda model_name: {"modelVersion": model_name, "currentAccuracy": 81.2, "driftPercentage": 9.9},
+        lambda model_name, model_version=None: {"modelVersion": model_version or model_name, "currentAccuracy": 81.2, "driftPercentage": 9.9},
     )
 
     service._run_training_job(
@@ -756,7 +775,7 @@ def test_failed_training_keeps_current_model_version(monkeypatch: pytest.MonkeyP
             1,
             ["prepare_training_window"],
             stdout="",
-            stderr="ValueError: No rows matched the D-5 to D+5 window.",
+            stderr="ValueError: No rows matched the D-5 to D+20 window.",
         )
 
     monkeypatch.setattr(api_service_module, "run_logged_subprocess", raise_prepare_failure)

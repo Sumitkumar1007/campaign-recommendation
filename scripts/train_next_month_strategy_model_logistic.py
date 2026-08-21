@@ -10,6 +10,7 @@ import pandas as pd
 from joblib import Parallel, delayed
 from pipeline_common import (
     DAY_COLUMNS,
+    SCHEDULE_DAY_COLUMNS,
     build_feature_matrix,
     month_to_period,
     prepare_next_month_dataset,
@@ -263,12 +264,12 @@ def main() -> None:
             prediction_output[day] = encoder.inverse_transform(models[day].predict(X_pred))
         prediction_output["D"] = "-"
         prediction_output = prediction_output[
-            ["SOURCE_RISK", "Loan_number", "SOURCE_MONTH_USED", "MONTH", "D-5", "D-4", "D-3", "D-2", "D-1", "D", "D+1", "D+2", "D+3", "D+4", "D+5"]
+            ["SOURCE_RISK", "Loan_number", "SOURCE_MONTH_USED", "MONTH", *SCHEDULE_DAY_COLUMNS]
         ]
         prediction_output.to_csv(versioned_prediction_file, index=False)
     else:
         pd.DataFrame(
-            columns=["SOURCE_RISK", "Loan_number", "SOURCE_MONTH_USED", "MONTH", "D-5", "D-4", "D-3", "D-2", "D-1", "D", "D+1", "D+2", "D+3", "D+4", "D+5"]
+            columns=["SOURCE_RISK", "Loan_number", "SOURCE_MONTH_USED", "MONTH", *SCHEDULE_DAY_COLUMNS]
         ).to_csv(versioned_prediction_file, index=False)
 
     copy_to_latest(source_path=versioned_prediction_file, latest_path=prediction_file)

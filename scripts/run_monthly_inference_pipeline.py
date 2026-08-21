@@ -18,6 +18,7 @@ from psycopg.types.json import Jsonb
 
 from app_logging import log_step, setup_logging
 from drift_utils import compute_drift_report
+from model_fallbacks import register_legacy_joblib_aliases
 from env_utils import load_dotenv
 from fetch_month_from_postgres import (
     configured_prediction_month_from_emi_dates,
@@ -25,7 +26,15 @@ from fetch_month_from_postgres import (
     default_output_file as default_communication_output_file,
     resolve_scheduler_emi_dates as resolve_configured_emi_dates,
 )
-from pipeline_common import build_feature_matrix, prepare_next_month_dataset, split_by_source_month
+from pipeline_common import (
+    DAY_COLUMNS,
+    POSTDUE_DAY_COLUMNS,
+    PREDUE_DAY_COLUMNS,
+    SCHEDULE_DAY_COLUMNS,
+    build_feature_matrix,
+    prepare_next_month_dataset,
+    split_by_source_month,
+)
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
 from predict_next_month_strategy_catboost import build_prediction_population, load_base_population
 from project_paths import (
@@ -42,9 +51,12 @@ from project_paths import (
 )
 
 
-DAY_COLUMNS = ["D-5", "D-4", "D-3", "D-2", "D-1", "D", "D+1", "D+2", "D+3", "D+4", "D+5"]
-PREDUE_DAYS = ["D-5", "D-4", "D-3", "D-2", "D-1"]
-POSTDUE_DAYS = ["D+1", "D+2", "D+3", "D+4", "D+5"]
+register_legacy_joblib_aliases()
+
+
+PREDUE_DAYS = PREDUE_DAY_COLUMNS
+POSTDUE_DAYS = POSTDUE_DAY_COLUMNS
+ALL_CAMPAIGN_DAYS = SCHEDULE_DAY_COLUMNS
 CAMPAIGN_DAY_ORDER = {day: index for index, day in enumerate([*PREDUE_DAYS, *POSTDUE_DAYS])}
 RISK_CODES = {
     "LOW": "LR",
@@ -57,15 +69,18 @@ MODE_BY_STRATEGY_CHANNEL = {
     "WHATSAPP": "WHATSAPP",
     "IVR": "VOICE",
     "VOICE": "VOICE",
+    "VOICE_BOT": "VOICE_BOT",
 }
 NAME_CHANNEL_BY_MODE = {
     "SMS": "SMS",
     "WHATSAPP": "WA",
     "VOICE": "VOICE",
+    "VOICE_BOT": "VOICE_BOT",
 }
 VENDOR_CONFIG_KEYS = {
     "SMS": "sms.service.vendor-list",
     "VOICE": "voice.service.vendor-list",
+    "VOICE_BOT": "voice-bot.service.vendor-list",
     "WHATSAPP": "whatsapp.service.vendor-list",
 }
 EMI_DATES_CONFIG_KEY = "upload.scheduler.emi-dates"
@@ -156,6 +171,21 @@ def parse_args() -> argparse.Namespace:
         help="MLflow model URI used when --model-serving=mlflow.",
     )
     parser.add_argument(
+        "--model-version",
+        default=os.getenv("MODEL_VERSION", "").strip(),
+        help="Optional model version token, for example v002.",
+    )
+    parser.add_argument(
+        "--model-file",
+        default=os.getenv("MODEL_FILE", "").strip(),
+        help="Optional explicit model file path. Overrides model-version naming.",
+    )
+    parser.add_argument(
+        "--metrics-file",
+        default=os.getenv("METRICS_FILE", "").strip(),
+        help="Optional explicit metrics file path. Overrides model-version naming.",
+    )
+    parser.add_argument(
         "--feature-month-source",
         choices=["emi_date", "created_date"],
         default=os.getenv("FEATURE_MONTH_SOURCE", "emi_date"),
@@ -170,6 +200,18 @@ def parse_args() -> argparse.Namespace:
         "--log-file",
         default=str(LOG_DIR / "monthly_inference_pipeline.log"),
         help="Application log file.",
+    )
+    parser.add_argument(
+        "--prediction-evidence-limit",
+        type=int,
+        default=int(os.getenv("PREDICTION_EVIDENCE_LIMIT", "100")),
+        help="Optional row cap for the generated prediction evidence CSV. Use 0 for no limit.",
+    )
+    parser.add_argument(
+        "--history_window_months",
+        type=int,
+        default=int(os.getenv("HISTORY_WINDOW_MONTHS", "6")),
+        help="Number of months of history to fetch.",
     )
     args = parser.parse_args()
     missing = [
@@ -244,12 +286,33 @@ def month_file_token(period: pd.Period) -> str:
     return period.to_timestamp().strftime("%b%Y").upper()
 
 
+def model_artifact_path(directory: Path, stem: str, suffix: str, model_version: str | None) -> Path:
+    token = str(model_version or "").strip()
+    if token:
+        if not token.lower().startswith("v"):
+            token = f"v{token}"
+        return directory / f"{stem}_{token}{suffix}"
+    return directory / f"{stem}{suffix}"
+
+
+def _communication_file_sort_key(path: Path) -> tuple[int, str]:
+    parts = path.stem.split("_")
+    cycle_token = parts[-1] if len(parts) >= 4 else ""
+    return (int(cycle_token) if cycle_token.isdigit() else 0, path.name)
+
+
 def _communication_extract_candidates(month: str) -> list[Path]:
     token = month_file_token(parse_month(month))
-    candidates = [COMMUNICATION_DATA_DIR / f"comm_data_{token}.csv"]
-    existing = [path for path in candidates if path.exists()]
-    if existing:
-        return existing
+    cycle_candidates = sorted(
+        COMMUNICATION_DATA_DIR.glob(f"comm_data_{token}_*.csv"),
+        key=_communication_file_sort_key,
+    )
+    existing_cycle_candidates = [path for path in cycle_candidates if path.exists()]
+    if existing_cycle_candidates:
+        return existing_cycle_candidates
+    canonical_candidate = COMMUNICATION_DATA_DIR / f"comm_data_{token}.csv"
+    if canonical_candidate.exists():
+        return [canonical_candidate]
     legacy_candidates = [
         COMMUNICATION_DATA_DIR / f"latest_{token}_comm_data.csv",
         COMMUNICATION_DATA_DIR / f"mfl_recomm_model_{token}_comm_data.csv",
@@ -257,15 +320,15 @@ def _communication_extract_candidates(month: str) -> list[Path]:
     return [path for path in legacy_candidates if path.exists()]
 
 
-def latest_extract_file(source_month: str) -> Path:
-    return default_communication_output_file(source_month)
+def latest_extract_files(source_month: str) -> list[Path]:
+    files = _communication_extract_candidates(source_month)
+    if files:
+        return files
+    return [default_communication_output_file(source_month)]
 
 
-def monthly_extract_file(month: str) -> Path | None:
-    candidates = _communication_extract_candidates(month)
-    if candidates:
-        return candidates[-1]
-    return None
+def monthly_extract_files(month: str) -> list[Path]:
+    return _communication_extract_candidates(month)
 
 
 def current_cases_file(source_month: str) -> Path:
@@ -273,16 +336,64 @@ def current_cases_file(source_month: str) -> Path:
     return CASE_DATA_DIR / f"digital_cases_{token}.csv"
 
 
-def selected_history_files(source_month: str, latest_file: Path) -> list[Path]:
+def resolve_drift_baseline_source_months(
+    dataset: pd.DataFrame,
+    *,
+    source_month_label: str,
+    history_window_months: int,
+    metrics_metadata: dict[str, object],
+    baseline_mode: str,
+) -> tuple[list[str], str]:
+    source_month_series = dataset["SOURCE_MONTH"].dropna().astype(str).drop_duplicates()
+    source_month_pairs = []
+    for month in source_month_series.tolist():
+        parsed = pd.to_datetime(month, format="%b-%Y", errors="coerce")
+        if pd.isna(parsed):
+            continue
+        source_month_pairs.append((month, pd.Timestamp(parsed)))
+    source_month_pairs.sort(key=lambda item: item[1])
+    available_source_months = [month for month, _ in source_month_pairs]
+    source_period = pd.to_datetime(source_month_label, format="%b-%Y", errors="coerce")
+
+    recent_source_months: list[str] = []
+    if not pd.isna(source_period):
+        source_timestamp = pd.Timestamp(source_period)
+        recent_source_months = [
+            month
+            for month in available_source_months
+            if not pd.isna(pd.to_datetime(month, format="%b-%Y", errors="coerce"))
+            and pd.Timestamp(pd.to_datetime(month, format="%b-%Y", errors="coerce")) <= source_timestamp
+        ]
+        if history_window_months > 0:
+            recent_source_months = recent_source_months[-history_window_months:]
+
+    if recent_source_months:
+        if baseline_mode == "latest_source_month":
+            return recent_source_months[-1:], "latest_source_month"
+        return recent_source_months, "recent_source_months"
+
+    metrics_months = [
+        str(value)
+        for value in metrics_metadata.get("train_source_months", [])
+        if str(value).strip()
+    ]
+    available_metrics_months = [month for month in metrics_months if month in available_source_months]
+    if available_metrics_months:
+        return available_metrics_months, "metrics_train_source_months"
+
+    return available_source_months, "all_source_months"
+
+
+# def selected_history_files(source_month: str, latest_files: list[Path]) -> list[Path]:
+#     source_period = parse_month(source_month)
+    # previous_periods = [source_period - 2, source_period - 1]
+def selected_history_files(source_month: str, latest_files: list[Path], history_window: int) -> list[Path]:
     source_period = parse_month(source_month)
-    previous_periods = [source_period - 2, source_period - 1]
+    previous_periods = [source_period - i for i in range(history_window - 1, 0, -1)]
     files: list[Path] = []
     for period in previous_periods:
-        monthly_file = monthly_extract_file(str(period))
-        if monthly_file and monthly_file.exists():
-            files.append(monthly_file)
-    if latest_file.exists():
-        files.append(latest_file)
+        files.extend(path for path in monthly_extract_files(str(period)) if path.exists())
+    files.extend(path for path in latest_files if path.exists())
 
     deduped: list[Path] = []
     seen: set[Path] = set()
@@ -361,7 +472,7 @@ def build_prediction_summary(
 ) -> dict[str, object]:
     predictions = pd.read_csv(prediction_file)
     predictions = predictions[predictions["MONTH"] == prediction_month_label].copy()
-    day_columns = ["D-5", "D-4", "D-3", "D-2", "D-1", "D+1", "D+2", "D+3", "D+4", "D+5"]
+    day_columns = DAY_COLUMNS
 
     source_risk_counts = (
         predictions["SOURCE_RISK"].fillna("UNKNOWN").astype(str).value_counts().sort_index().to_dict()
@@ -672,7 +783,7 @@ def store_prediction_snapshots(
     for _, row in df.iterrows():
         payload = {
             day: row[day]
-            for day in ["D-5", "D-4", "D-3", "D-2", "D-1", "D", "D+1", "D+2", "D+3", "D+4", "D+5"]
+            for day in ALL_CAMPAIGN_DAYS
             if day in row.index
         }
         reason_payload = None
@@ -905,6 +1016,7 @@ def _normalize_mode_from_communication_type(value: object) -> str | None:
         "WH": "WHATSAPP",
         "WHATSAPP": "WHATSAPP",
         "VOICE": "VOICE",
+        "VOICE_BOT": "VOICE_BOT",
         "IVR": "VOICE",
     }.get(text)
 
@@ -1101,7 +1213,7 @@ def resolve_campaign_vendors(
     )
     vendors: list[str] = []
     seen: set[str] = set()
-    for mode in ("SMS", "VOICE", "WHATSAPP"):
+    for mode in ("SMS", "VOICE", "VOICE_BOT", "WHATSAPP"):
         for vendor in vendor_map.get(mode, []):
             if vendor not in seen:
                 seen.add(vendor)
@@ -1304,7 +1416,7 @@ def _build_campaign_assignment_groups(
         loan_number = str(row["Loan_number"])
         risk = str(row.get("SOURCE_RISK", row.get("RISK", "LOW"))).upper()
         risk_code = RISK_CODES.get(risk, "LR")
-        for day in [*PREDUE_DAYS, "D", *POSTDUE_DAYS]:
+        for day in ALL_CAMPAIGN_DAYS:
             for strategy in str(row.get(day, "")).split("|"):
                 parsed = _parse_strategy(strategy.strip())
                 if parsed is None:
@@ -1773,6 +1885,24 @@ def store_campaign_mappings(
         cur.executemany(query, rows)
     return len(rows)
 
+def select_drift_feature_columns(
+    feature_columns: list[str],
+    *,
+    excluded_prefixes: list[str],
+    excluded_exact: list[str],
+) -> list[str]:
+    exact = {value.strip() for value in excluded_exact if value.strip()}
+    prefixes = [value.strip() for value in excluded_prefixes if value.strip()]
+    selected = []
+    for column in feature_columns:
+        if column in exact:
+            continue
+        if any(column.startswith(prefix) for prefix in prefixes):
+            continue
+        selected.append(column)
+    return selected
+
+
 def _load_metrics_metadata(metrics_file: Path) -> dict[str, object]:
     if not metrics_file.exists():
         return {}
@@ -1782,21 +1912,211 @@ def _load_metrics_metadata(metrics_file: Path) -> dict[str, object]:
         return {}
 
 
+# def compute_model_drift_metrics(
+#     *,
+#     feature_file: Path,
+#     schedule_file: Path,
+#     base_population_file: Path,
+#     model_file: Path,
+#     metrics_file: Path,
+#     source_month_label: str,
+# ) -> dict[str, object]:
+#     bundle = joblib.load(model_file)
+#     target_offset_months = int(bundle.get("target_offset_months", 1))
+#     history_window_months = int(bundle.get("history_window_months", 1))
+
+#     dataset = prepare_next_month_dataset(
+#         feature_file=feature_file,
+#         schedule_file=schedule_file,
+#         target_offset_months=target_offset_months,
+#         history_window_months=history_window_months,
+#     )
+#     base_population = load_base_population(base_population_file, source_month_label)
+#     prediction_rows, blank_rows = build_prediction_population(
+#         dataset=dataset,
+#         base_population=base_population,
+#         prediction_source_month=source_month_label,
+#     )
+    
+#     metrics_metadata = _load_metrics_metadata(metrics_file)
+#     # Load original training baseline matrix from the bundle
+#     if "baseline_matrix" not in bundle:
+#         raise ValueError("Model bundle is missing 'baseline_matrix'. Please retrain the model to save the baseline.")
+    
+#     baseline_matrix = bundle["baseline_matrix"].reindex(columns=bundle["feature_columns"], fill_value=0)
+#     baseline_source_months = [str(value) for value in metrics_metadata.get("train_source_months", [])]
+    
+#     # Use the FULL inference population (no account matching)
+#     inference_matrix = build_feature_matrix(prediction_rows).reindex(columns=bundle["feature_columns"], fill_value=0)
+
+#     # baseline_source_months, baseline_selection_method = resolve_drift_baseline_source_months(
+#     #     dataset,
+#     #     source_month_label=source_month_label,
+#     #     history_window_months=history_window_months,
+#     #     metrics_metadata=metrics_metadata,
+#     #     baseline_mode=drift_baseline_mode,
+#     # )
+#     # if baseline_source_months:
+#     #     baseline_rows = split_by_source_month(dataset, baseline_source_months, require_target=False)
+#     # else:
+#     #     baseline_rows = dataset.copy()
+#     #     baseline_source_months = sorted(baseline_rows["SOURCE_MONTH"].dropna().astype(str).unique().tolist())
+#     #     baseline_selection_method = "all_source_months"
+
+#     # inference_accounts = set(prediction_rows["APAC_CARD_NUMBER"].dropna().astype(str).tolist())
+#     # baseline_account_count_before = int(baseline_rows["APAC_CARD_NUMBER"].nunique()) if "APAC_CARD_NUMBER" in baseline_rows.columns else 0
+#     # matched_inference_rows = prediction_rows.copy()
+#     # if inference_accounts and "APAC_CARD_NUMBER" in baseline_rows.columns:
+#     #     matched_baseline_rows = baseline_rows[baseline_rows["APAC_CARD_NUMBER"].astype(str).isin(inference_accounts)].copy()
+#     #     matched_account_values = set(matched_baseline_rows["APAC_CARD_NUMBER"].dropna().astype(str).tolist())
+#     #     matched_account_count = int(matched_baseline_rows["APAC_CARD_NUMBER"].nunique())
+#     #     if not matched_baseline_rows.empty and matched_account_values:
+#     #         baseline_rows = matched_baseline_rows
+#     #         matched_inference_rows = prediction_rows[prediction_rows["APAC_CARD_NUMBER"].astype(str).isin(matched_account_values)].copy()
+#     #         baseline_selection_method = f"{baseline_selection_method}_matched_accounts"
+#     #     else:
+#     #         matched_account_count = 0
+#     # else:
+#     #     matched_account_count = 0
+
+#     # drift_feature_columns = select_drift_feature_columns(
+#     #     bundle["feature_columns"],
+#     # )
+#     # baseline_matrix = build_feature_matrix(baseline_rows).reindex(columns=bundle["feature_columns"], fill_value=0)
+#     # inference_matrix = build_feature_matrix(matched_inference_rows).reindex(columns=bundle["feature_columns"], fill_value=0)
+#     # report = compute_drift_report(
+#     #     baseline_df=baseline_matrix,
+#     #     inference_df=inference_matrix,
+#     #     feature_columns=drift_feature_columns,
+#     #     blank_inference_rows=len(blank_rows),
+#     # )
+#     # report["baseline_source_months"] = baseline_source_months
+#     # report["baseline_selection_method"] = baseline_selection_method
+#     # report["drift_baseline_mode"] = drift_baseline_mode
+#     # report["baseline_account_count_before_match"] = baseline_account_count_before
+#     # report["baseline_account_count_after_match"] = int(baseline_rows["APAC_CARD_NUMBER"].nunique()) if "APAC_CARD_NUMBER" in baseline_rows.columns else 0
+#     # report["matched_inference_account_count"] = int(matched_inference_rows["APAC_CARD_NUMBER"].nunique()) if "APAC_CARD_NUMBER" in matched_inference_rows.columns else matched_account_count
+#     # report["inference_account_count"] = int(prediction_rows["APAC_CARD_NUMBER"].nunique()) if "APAC_CARD_NUMBER" in prediction_rows.columns else 0
+#     # report["history_window_months"] = history_window_months
+#     # return report
+
+
+#     drift_feature_columns = select_drift_feature_columns(
+#         bundle["feature_columns"],
+#     )
+    
+#     report = compute_drift_report(
+#         baseline_df=baseline_matrix,
+#         inference_df=inference_matrix,
+#         feature_columns=drift_feature_columns,
+#         blank_inference_rows=len(blank_rows),
+#     )
+    
+#     report["baseline_source_months"] = baseline_source_months
+#     report["baseline_selection_method"] = "training_bundle"
+#     report["drift_baseline_mode"] = "training_bundle"
+#     report["baseline_account_count_before_match"] = len(baseline_matrix)
+#     report["baseline_account_count_after_match"] = len(baseline_matrix)
+#     report["matched_inference_account_count"] = len(inference_matrix)
+#     report["inference_account_count"] = len(inference_matrix)
+#     report["history_window_months"] = history_window_months
+    
+#     return report
+
+
+#logic for calculating drift from mdole file,  from training 
+# def compute_model_drift_metrics(
+#     *,
+#     train_feature_file: Path,
+#     inference_feature_file: Path,
+#     schedule_file: Path,
+#     base_population_file: Path,
+#     model_file: Path,
+#     metrics_file: Path,
+#     source_month_label: str,
+# ) -> dict[str, object]:
+#     bundle = joblib.load(model_file)
+#     target_offset_months = int(bundle.get("target_offset_months", 1))
+#     history_window_months = int(bundle.get("history_window_months", 1))
+
+#     # --- 1. BUILD INFERENCE MATRIX FROM INFERENCE CSV ---
+#     dataset = prepare_next_month_dataset(
+#         feature_file=inference_feature_file,
+#         schedule_file=schedule_file,
+#         target_offset_months=target_offset_months,
+#         history_window_months=history_window_months,
+#     )
+#     base_population = load_base_population(base_population_file, source_month_label)
+#     prediction_rows, blank_rows = build_prediction_population(
+#         dataset=dataset,
+#         base_population=base_population,
+#         prediction_source_month=source_month_label,
+#     )
+#     inference_matrix = build_feature_matrix(prediction_rows).reindex(columns=bundle["feature_columns"], fill_value=0)
+
+#     # --- 2. BUILD BASELINE MATRIX FROM TRAIN CSV ---
+#     metrics_metadata = _load_metrics_metadata(metrics_file)
+#     baseline_source_months = [str(value) for value in metrics_metadata.get("train_source_months", [])]
+    
+#     if not train_feature_file.exists():
+#         raise FileNotFoundError(f"Training feature file not found for drift calculation: {train_feature_file}")
+    
+#     train_df = pd.read_csv(train_feature_file)
+#     # Filter it to only include the months the model actually trained on
+#     if baseline_source_months and "SOURCE_MONTH" in train_df.columns:
+#         train_df = train_df[train_df["SOURCE_MONTH"].astype(str).isin(baseline_source_months)]
+        
+#     # Cap it at 10,000 rows just like the original training script did to keep drift math fast
+#     if len(train_df) > 10000:
+#         train_df = train_df.sample(n=10000, random_state=42)
+        
+#     baseline_matrix = build_feature_matrix(train_df).reindex(columns=bundle["feature_columns"], fill_value=0)
+
+#     # --- 3. CALCULATE DRIFT ---
+#     drift_feature_columns = select_drift_feature_columns(
+#         bundle["feature_columns"],
+#     )
+    
+#     report = compute_drift_report(
+#         baseline_df=baseline_matrix,
+#         inference_df=inference_matrix,
+#         feature_columns=drift_feature_columns,
+#         blank_inference_rows=len(blank_rows),
+#     )
+    
+#     report["baseline_source_months"] = baseline_source_months
+#     report["baseline_selection_method"] = "pooled_train_csv_file"
+#     report["drift_baseline_mode"] = "pooled_train_csv_file"
+#     report["baseline_account_count_before_match"] = len(baseline_matrix)
+#     report["baseline_account_count_after_match"] = len(baseline_matrix)
+#     report["matched_inference_account_count"] = len(inference_matrix)
+#     report["inference_account_count"] = len(inference_matrix)
+#     report["history_window_months"] = history_window_months
+    
+#     return report
+
 def compute_model_drift_metrics(
     *,
-    feature_file: Path,
+    train_feature_file: Path,
+    inference_feature_file: Path,
     schedule_file: Path,
     base_population_file: Path,
     model_file: Path,
     metrics_file: Path,
     source_month_label: str,
 ) -> dict[str, object]:
+    logger = logging.getLogger("monthly_inference_pipeline")
+
+    # --- ADDED: Print inference source month for analysis ---
+    print(f"\n[DRIFT ANALYSIS] Target Inference Source Month: {source_month_label}")
+
     bundle = joblib.load(model_file)
     target_offset_months = int(bundle.get("target_offset_months", 1))
     history_window_months = int(bundle.get("history_window_months", 1))
 
+    # --- 1. BUILD INFERENCE MATRIX FROM INFERENCE CSV ---
     dataset = prepare_next_month_dataset(
-        feature_file=feature_file,
+        feature_file=inference_feature_file,
         schedule_file=schedule_file,
         target_offset_months=target_offset_months,
         history_window_months=history_window_months,
@@ -1807,29 +2127,485 @@ def compute_model_drift_metrics(
         base_population=base_population,
         prediction_source_month=source_month_label,
     )
-
-    metrics_metadata = _load_metrics_metadata(metrics_file)
-    baseline_source_months = [str(value) for value in metrics_metadata.get("train_source_months", []) if str(value).strip()]
-    if baseline_source_months:
-        baseline_rows = split_by_source_month(dataset, baseline_source_months, require_target=True)
-    else:
-        baseline_rows = dataset[dataset["TARGET_MONTH"].notna()].copy()
-        baseline_source_months = sorted(baseline_rows["SOURCE_MONTH"].dropna().astype(str).unique().tolist())
-
-    baseline_matrix = build_feature_matrix(baseline_rows).reindex(columns=bundle["feature_columns"], fill_value=0)
+    
+    # --- ADDED: Print actual distinct months found in the inference data ---
+    actual_inf_months = prediction_rows["SOURCE_MONTH"].dropna().unique().tolist() if "SOURCE_MONTH" in prediction_rows.columns else []
+    print(f"[DRIFT ANALYSIS] Actual Inference Months in Data: {actual_inf_months}")
+    
     inference_matrix = build_feature_matrix(prediction_rows).reindex(columns=bundle["feature_columns"], fill_value=0)
+
+    # --- 2. BUILD BASELINE MATRIX FROM TRAIN CSV ---
+    metrics_metadata = _load_metrics_metadata(metrics_file)
+    baseline_source_months = [str(value) for value in metrics_metadata.get("train_source_months", [])]
+
+    # Use the full pooled training population for drift baseline instead of
+    # collapsing to a single month snapshot.
+    # --- ADDED: Print the baseline months we are comparing against ---
+    print(f"[DRIFT ANALYSIS] Baseline Training Source Months: {baseline_source_months}\n")
+    
+    if not train_feature_file.exists():
+        raise FileNotFoundError(f"Training feature file not found for drift calculation: {train_feature_file}")
+    
+    train_df = pd.read_csv(train_feature_file)
+    
+    # Apply the exact same rolling windows used in training
+    if history_window_months:
+        from pipeline_common import build_rolling_feature_windows
+        train_df = build_rolling_feature_windows(train_df, history_window_months)
+        
+    # Create the SOURCE_MONTH column that build_feature_matrix expects
+    if "MONTH" in train_df.columns:
+        train_df["SOURCE_MONTH"] = train_df["MONTH"]
+        
+    # Filter it to only include the months the model actually trained on
+    if baseline_source_months and "SOURCE_MONTH" in train_df.columns:
+        train_df = train_df[train_df["SOURCE_MONTH"].astype(str).isin(baseline_source_months)]
+        
+    # Cap it at 10,000 rows just like the original training script did to keep drift math fast
+    if len(train_df) > 10000:
+        train_df = train_df.sample(n=10000, random_state=42)
+        
+    baseline_matrix = build_feature_matrix(train_df).reindex(columns=bundle["feature_columns"], fill_value=0)
+
+    # --- 3. CALCULATE DRIFT ---
+    drift_feature_columns = select_drift_feature_columns(
+        bundle["feature_columns"],
+        excluded_prefixes=["SOURCE_MONTH_"],
+        excluded_exact=[],
+    )
+    
     report = compute_drift_report(
         baseline_df=baseline_matrix,
         inference_df=inference_matrix,
-        feature_columns=bundle["feature_columns"],
+        feature_columns=drift_feature_columns,
         blank_inference_rows=len(blank_rows),
     )
+    
     report["baseline_source_months"] = baseline_source_months
+    report["inference_source_month"] = source_month_label  # <-- ADDED to the saved report output!
+    report["baseline_selection_method"] = "pooled_train_csv_file"
+    report["drift_baseline_mode"] = "pooled_train_csv_file"
+    report["excluded_feature_prefixes"] = ["SOURCE_MONTH_"]
+    report["excluded_feature_columns"] = []
+    report["baseline_account_count_before_match"] = len(baseline_matrix)
+    report["baseline_account_count_after_match"] = len(baseline_matrix)
+    report["matched_inference_account_count"] = len(inference_matrix)
+    report["inference_account_count"] = len(inference_matrix)
     report["history_window_months"] = history_window_months
+
+    # Testing-only pooled drift check. This does not change the active drift logic.
+    try:
+        training_test_months = [
+            "OCT-2025",
+            "NOV-2025",
+            "JAN-2026",
+            "FEB-2026",
+            "MAR-2026",
+            "APR-2026",
+        ]
+        inference_test_months = [
+            "MAY-2026",
+            "JUN-2026",
+            "JUL-2026",
+            "AUG-2026",
+        ]
+
+        baseline_frames: list[pd.DataFrame] = []
+        pooled_inference_frames: list[pd.DataFrame] = []
+
+        if "SOURCE_MONTH" in train_df.columns:
+            for month in training_test_months:
+                month_df = train_df[train_df["SOURCE_MONTH"].astype(str) == month].copy()
+                if not month_df.empty:
+                    baseline_frames.append(month_df)
+
+        if "SOURCE_MONTH" in dataset.columns:
+            for month in inference_test_months:
+                month_df = dataset[dataset["SOURCE_MONTH"].astype(str) == month].copy()
+                if not month_df.empty:
+                    pooled_inference_frames.append(month_df)
+
+        if baseline_frames and pooled_inference_frames:
+            baseline_df = pd.concat(baseline_frames, ignore_index=True)
+            pooled_inference_df = pd.concat(pooled_inference_frames, ignore_index=True)
+
+            baseline_df = build_feature_matrix(baseline_df).reindex(columns=bundle["feature_columns"], fill_value=0)
+            pooled_inference_df = build_feature_matrix(pooled_inference_df).reindex(
+                columns=bundle["feature_columns"],
+                fill_value=0,
+            )
+
+            pooled_test_report = compute_drift_report(
+                baseline_df=baseline_df,
+                inference_df=pooled_inference_df,
+                feature_columns=drift_feature_columns,
+            )
+            logger.info(
+                "Testing pooled drift summary | baseline_months=%s inference_months=%s overall_psi=%s status=%s baseline_rows=%s inference_rows=%s",
+                training_test_months,
+                inference_test_months,
+                pooled_test_report.get("overall_psi"),
+                pooled_test_report.get("status"),
+                len(baseline_df),
+                len(pooled_inference_df),
+            )
+        else:
+            logger.info(
+                "Testing pooled drift summary skipped | available_training_months=%s available_inference_months=%s requested_training_months=%s requested_inference_months=%s",
+                sorted(train_df["SOURCE_MONTH"].dropna().astype(str).unique().tolist()) if "SOURCE_MONTH" in train_df.columns else [],
+                sorted(dataset["SOURCE_MONTH"].dropna().astype(str).unique().tolist()) if "SOURCE_MONTH" in dataset.columns else [],
+                training_test_months,
+                inference_test_months,
+            )
+    except Exception:
+        logger.exception("Testing pooled drift summary failed")
+
     return report
 
+##logic changed of main to have same same fetching months as training
+# def main() -> None:
+#     args = parse_args()
+#     run_started_at = datetime.now(timezone.utc)
+#     prediction_file: Path | None = None
+#     prediction_rows = 0
+#     drift_report: dict[str, object] | None = None
+#     logger = setup_logging(args.log_file, "monthly_inference_pipeline")
+#     logger.info(
+#         "Monthly inference args: %s",
+#         {
+#             key: ("***" if key == "password" else value)
+#             for key, value in vars(args).items()
+#         },
+#     )
+#     source_month_label = month_label(args.source_month)
+#     prediction_month_label = month_label(args.predict_month)
+#     source_extract_base_file = default_communication_output_file(args.source_month)
+#     source_cases_file = current_cases_file(args.predict_month)
 
 
+
+#     try:
+#         source_period = parse_month(args.source_month)
+#         # history_fetches = [
+#         #     (str(source_period - 2), default_communication_output_file(str(source_period - 2))),
+#         #     (str(source_period - 1), default_communication_output_file(str(source_period - 1))),
+#         #     (args.source_month, source_extract_base_file),
+#         # ]
+#         history_fetches = []
+#         for i in range(args.history_window_months - 1, 0, -1):
+#             past_month = str(source_period - i)
+#             history_fetches.append((past_month, default_communication_output_file(past_month)))
+#         history_fetches.append((args.source_month, source_extract_base_file))
+#         with log_step(logger, "fetch_communication_history", source_month=args.source_month):
+#             for fetch_month, output_file in history_fetches:
+#                 fetch_communication_extract(args, output_file, fetch_month, logger)
+#         with log_step(logger, "fetch_current_cases", source_month=args.source_month):
+#             fetch_current_cases_extract(args, source_cases_file, args.predict_month, logger)
+
+#         source_extract_files = latest_extract_files(args.source_month)
+#         if not any(csv_has_rows(path) for path in source_extract_files):
+#             logger.warning("No latest communication rows found. Skipping prediction run.")
+#             print(
+#                 f"No latest communication rows found in {[str(path) for path in source_extract_files]}; skipped prediction run."
+#             )
+#             return
+
+#         # history_files = selected_history_files(args.source_month, source_extract_files)
+#         history_files = selected_history_files(args.source_month, source_extract_files, args.history_window_months)
+#         if len(history_files) < 3:
+#             raise FileNotFoundError(
+#                 "Need latest communication file plus previous two month files. "
+#                 f"Found {len(history_files)} files: {[str(path) for path in history_files]}"
+#             )
+#         logger.info("Selected communication history files: %s", [str(path) for path in history_files])
+
+#         with log_step(logger, "prepare_inference_features"):
+#             run_python_script(
+#                 "generate_strategy_dataset.py",
+#                 "--output-file",
+#                 str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+#                 "--month-source",
+#                 args.feature_month_source,
+#                 "--input-files",
+#                 *[str(path) for path in history_files],
+#                 logger=logger,
+#             )
+#         with log_step(logger, "build_schedule_dataset"):
+#             run_python_script(
+#                 "build_strategy_schedule_dataset.py",
+#                 "--input-file",
+#                 str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+#                 "--output-file",
+#                 str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv"),
+#                 logger=logger,
+#             )
+#         with log_step(logger, "build_monthly_features"):
+#             run_python_script(
+#                 "build_monthly_feature_dataset.py",
+#                 "--input-file",
+#                 str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+#                 "--output-file",
+#                 str(FEATURE_DATA_DIR / "strategy_monthly_features.csv"),
+#                 logger=logger,
+#             )
+
+#         if args.model in {"catboost", "catboost_3m"}:
+#             model_suffix = "catboost_3m" if args.model == "catboost_3m" else "catboost"
+#             prediction_file = (
+#                 PREDICTIONS_DIR
+#                 / f"{args.predict_month.replace('-', '_').lower()}_strategy_predictions_{model_suffix}.csv"
+#             )
+#             model_file = Path(args.model_file) if args.model_file else model_artifact_path(
+#                 MODEL_DIR,
+#                 f"next_month_strategy_{model_suffix}",
+#                 ".joblib",
+#                 args.model_version,
+#             )
+#             metrics_file = Path(args.metrics_file) if args.metrics_file else model_artifact_path(
+#                 METRICS_DIR,
+#                 f"next_month_strategy_{model_suffix}_metrics",
+#                 ".json",
+#                 args.model_version,
+#             )
+#             if args.model_serving == "mlflow":
+#                 with log_step(
+#                     logger,
+#                     "download_mlflow_model_bundle",
+#                     model_uri=args.mlflow_model_uri,
+#                     model_file=model_file,
+#                 ):
+#                     download_mlflow_model_bundle(args.mlflow_model_uri, model_file, logger)
+#             if not model_file.exists():
+#                 raise FileNotFoundError(
+#                     f"CatBoost model bundle not found: {model_file}. "
+#                     "Train the CatBoost model once or set MODEL_SERVING=mlflow and MLFLOW_MODEL_URI."
+#                 )
+#             with log_step(
+#                 logger,
+#                 "run_catboost_inference",
+#                 model_file=model_file,
+#                 prediction_file=prediction_file,
+#             ):
+#                 run_python_script(
+#                     "predict_next_month_strategy_catboost.py",
+#                     "--model-file",
+#                     str(model_file),
+#                     "--prediction-file",
+#                     str(prediction_file),
+#                     "--base-population-file",
+#                     str(source_cases_file),
+#                     "--prediction-source-months",
+#                     source_month_label,
+#                     logger=logger,
+#                 )
+#             with log_step(
+#                 logger,
+#                 "build_prediction_evidence",
+#                 prediction_file=prediction_file,
+#                 prediction_evidence_limit=args.prediction_evidence_limit,
+#             ):
+#                 evidence_command = [
+#                     "generate_prediction_evidence.py",
+#                     "--prediction-file",
+#                     str(prediction_file),
+#                     "--model-file",
+#                     str(model_file),
+#                     "--feature-file",
+#                     str(FEATURE_DATA_DIR / "strategy_monthly_features.csv"),
+#                     "--schedule-file",
+#                     str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv"),
+#                     "--base-population-file",
+#                     str(source_cases_file),
+#                     "--month-source",
+#                     args.feature_month_source,
+#                     "--communication-files",
+#                     *[str(path) for path in history_files],
+#                 ]
+#                 if args.prediction_evidence_limit > 0:
+#                     evidence_command.extend(["--limit", str(args.prediction_evidence_limit)])
+#                 run_python_script(
+#                     *evidence_command,
+#                     logger=logger,
+#                 )
+#         else:
+#             prediction_file = (
+#                 PREDICTIONS_DIR
+#                 / f"{args.predict_month.replace('-', '_').lower()}_strategy_predictions_logistic.csv"
+#             )
+#             model_file = MODEL_DIR / "next_month_strategy_logistic.joblib"
+#             metrics_file = METRICS_DIR / "next_month_strategy_logistic_metrics.json"
+#             with log_step(logger, "run_logistic_training_and_inference", prediction_file=prediction_file):
+#                 run_python_script(
+#                     "train_next_month_strategy_model_logistic.py",
+#                     "--model-file",
+#                     str(model_file),
+#                     "--metrics-file",
+#                     str(metrics_file),
+#                     "--prediction-file",
+#                     str(prediction_file),
+#                     "--prediction-source-months",
+#                     source_month_label,
+#                     logger=logger,
+#                 )
+
+#         with log_step(logger, "compute_model_drift", model_file=model_file, metrics_file=metrics_file):
+#             drift_report = compute_model_drift_metrics(
+#                 feature_file=FEATURE_DATA_DIR / "strategy_monthly_features.csv",
+#                 schedule_file=SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv",
+#                 base_population_file=source_cases_file,
+#                 model_file=model_file,
+#                 metrics_file=metrics_file,
+#                 source_month_label=source_month_label,
+#             )
+#             metrics_payload = _load_metrics_metadata(metrics_file)
+#             accuracy_value = None
+#             validation_metrics = metrics_payload.get("validation_metrics") if isinstance(metrics_payload, dict) else None
+#             train_metrics = metrics_payload.get("train_metrics") if isinstance(metrics_payload, dict) else None
+#             accuracy_source = validation_metrics if isinstance(validation_metrics, dict) and validation_metrics.get("average_day_accuracy") is not None else train_metrics
+#             if isinstance(accuracy_source, dict) and accuracy_source.get("average_day_accuracy") is not None:
+#                 accuracy_value = round(float(accuracy_source["average_day_accuracy"]) * 100, 2)
+#             drift_report["current_accuracy"] = accuracy_value
+#             logger.info(
+#                 "Drift summary | baseline_rows=%s inference_rows=%s blank_inference_rows=%s feature_count=%s drift_percentage=%s overall_psi=%s max_feature_psi=%s status=%s",
+#                 drift_report["baseline_rows"],
+#                 drift_report["inference_rows"],
+#                 drift_report["blank_inference_rows"],
+#                 drift_report["feature_count"],
+#                 drift_report["drift_percentage"],
+#                 drift_report["overall_psi"],
+#                 drift_report["max_feature_psi"],
+#                 drift_report["status"],
+#             )
+
+#         if not args.skip_db_store:
+#             with log_step(logger, "store_snapshots", target_schema=args.target_schema):
+#                 config = PostgresConfig(
+#                     host=args.host,
+#                     port=args.port,
+#                     dbname=args.dbname,
+#                     user=args.user,
+#                     password=args.password,
+#                 )
+#                 with connect_db(config) as conn:
+#                     campaign_vendor_map = resolve_campaign_vendors_by_mode(
+#                         conn,
+#                         source_schema=args.source_schema,
+#                         target_schema=args.target_schema,
+#                         source_table=args.source_table,
+#                         source_month=args.source_month,
+#                         fallback_vendor=args.campaign_vendor,
+#                         logger=logger,
+#                     )
+#                     configured_emi_dates = resolve_scheduler_emi_dates(
+#                         conn,
+#                         source_schema=args.source_schema,
+#                         target_schema=args.target_schema,
+#                         logger=logger,
+#                     )
+#                     prediction_rows = store_prediction_snapshots(
+#                         conn,
+#                         args.target_schema,
+#                         args.prediction_table,
+#                         prediction_file,
+#                         prediction_month_label,
+#                         args.model,
+#                     )
+#                     campaign_df, mapping_df = _prepare_campaign_outputs(
+#                         prediction_file,
+#                         source_month_label=source_month_label,
+#                         prediction_month_label=prediction_month_label,
+#                         model_name=args.model,
+#                         emi_cycles=_derive_emi_cycles_from_dates(configured_emi_dates),
+#                         vertical=args.campaign_vertical,
+#                         vendors=_extract_campaign_vendors(args.campaign_vendor) or [args.campaign_vendor],
+#                         vendor_map=campaign_vendor_map,
+#                         configured_emi_dates=configured_emi_dates or [],
+#                     )
+#                     campaign_rows = store_campaign_recommendations(
+#                         conn,
+#                         args.target_schema,
+#                         args.campaign_table,
+#                         campaign_df,
+#                         source_month_label=source_month_label,
+#                         prediction_month_label=prediction_month_label,
+#                         model_name=args.model,
+#                     )
+#                     mapping_rows = store_campaign_mappings(
+#                         conn,
+#                         args.target_schema,
+#                         args.campaign_mapping_table,
+#                         mapping_df,
+#                         source_month_label=source_month_label,
+#                         prediction_month_label=prediction_month_label,
+#                         model_name=args.model,
+#                     )
+#                     conn.commit()
+#                 print(f"Stored {prediction_rows:,} prediction snapshots in Postgres")
+#                 print(f"Stored {campaign_rows:,} campaign recommendation snapshots in Postgres")
+#                 print(f"Stored {mapping_rows:,} campaign mapping snapshots in Postgres")
+#         else:
+#             campaign_vendors = []
+#             configured_emi_dates = []
+#             campaign_df, mapping_df = _prepare_campaign_outputs(
+#                 prediction_file,
+#                 source_month_label=source_month_label,
+#                 prediction_month_label=prediction_month_label,
+#                 model_name=args.model,
+#                 emi_cycles=_derive_emi_cycles_from_dates(configured_emi_dates),
+#                 vertical=args.campaign_vertical,
+#                 vendors=_extract_campaign_vendors(args.campaign_vendor) or [args.campaign_vendor],
+#                 configured_emi_dates=configured_emi_dates or [],
+#             )
+
+#         # summary = build_prediction_summary(
+#         #     prediction_file=prediction_file,
+#         #     source_month_label=source_month_label,
+#         #     prediction_month_label=prediction_month_label,
+#         #     model_name=args.model,
+#         #     campaign_df=campaign_df,
+#         #     mapping_df=mapping_df,
+#         # )
+#         # if drift_report is not None:
+#         #     summary["drift"] = {
+#         #         key: value
+#         #         for key, value in drift_report.items()
+#         #         if key != "feature_metrics"
+#         #     }
+#         # summary_path = write_prediction_summary(
+#         #     summary=summary,
+#         #     output_path=prediction_summary_path(args.predict_month),
+#         #     logger=logger,
+#         # )
+
+#         summary = build_prediction_summary(
+#             prediction_file=prediction_file,
+#             source_month_label=source_month_label,
+#             prediction_month_label=prediction_month_label,
+#             model_name=args.model,
+#             campaign_df=campaign_df,
+#             mapping_df=mapping_df,
+#         )
+#         if drift_report is not None:
+#             # --- CHANGED: Save the full drift report including feature_metrics ---
+#             summary["drift"] = drift_report
+            
+#         summary_path = write_prediction_summary(
+#             summary=summary,
+#             output_path=prediction_summary_path(args.predict_month),
+#             logger=logger,
+#         )
+
+#         print(f"Prediction file: {prediction_file}")
+#         print(f"Metrics file: {metrics_file}")
+#         print(f"Prediction summary: {summary_path}")
+#         logger.info("Monthly inference completed successfully.")
+#     except Exception as exc:
+#         logger.exception("Monthly inference failed.")
+#         raise
+
+
+# if __name__ == "__main__":
+#     main()
 
 
 def main() -> None:
@@ -1848,28 +2624,69 @@ def main() -> None:
     )
     source_month_label = month_label(args.source_month)
     prediction_month_label = month_label(args.predict_month)
-    source_extract_file = latest_extract_file(args.source_month)
+    
+    # --- DYNAMIC HISTORY WINDOW: Read directly from local model file ---
+    if args.model in {"catboost", "catboost_3m"}:
+        model_suffix = "catboost_3m" if args.model == "catboost_3m" else "catboost"
+        model_file = Path(args.model_file) if args.model_file else model_artifact_path(
+            MODEL_DIR,
+            f"next_month_strategy_{model_suffix}",
+            ".joblib",
+            args.model_version,
+        )
+        
+        if model_file.exists():
+            bundle = joblib.load(model_file)
+            if "history_window_months" in bundle:
+                args.history_window_months = int(bundle["history_window_months"])
+                logger.info(
+                    "Loaded local model bundle from %s | Dynamically set history_window_months=%s",
+                    model_file,
+                    args.history_window_months,
+                )
+    # -------------------------------------------------------------------
+
+    source_extract_base_file = default_communication_output_file(args.source_month)
     source_cases_file = current_cases_file(args.predict_month)
 
     try:
         source_period = parse_month(args.source_month)
-        history_fetches = [
-            (str(source_period - 2), default_communication_output_file(str(source_period - 2))),
-            (str(source_period - 1), default_communication_output_file(str(source_period - 1))),
-            (args.source_month, source_extract_file),
-        ]
+        history_fetches = []
+        for i in range(args.history_window_months - 1, 0, -1):
+            past_month = str(source_period - i)
+            history_fetches.append((past_month, default_communication_output_file(past_month)))
+        history_fetches.append((args.source_month, source_extract_base_file))
+        history_months = [fetch_month for fetch_month, _ in history_fetches]
+        logger.info(
+            "Inference month summary | source_month=%s source_month_label=%s prediction_month=%s prediction_month_label=%s history_window_months=%s communication_history_months=%s cases_month=%s",
+            args.source_month,
+            source_month_label,
+            args.predict_month,
+            prediction_month_label,
+            args.history_window_months,
+            history_months,
+            args.predict_month,
+        )
         with log_step(logger, "fetch_communication_history", source_month=args.source_month):
             for fetch_month, output_file in history_fetches:
                 fetch_communication_extract(args, output_file, fetch_month, logger)
         with log_step(logger, "fetch_current_cases", source_month=args.source_month):
             fetch_current_cases_extract(args, source_cases_file, args.predict_month, logger)
 
-        if not csv_has_rows(source_extract_file):
+        source_extract_files = latest_extract_files(args.source_month)
+        if not any(csv_has_rows(path) for path in source_extract_files):
             logger.warning("No latest communication rows found. Skipping prediction run.")
-            print(f"No latest communication rows found in {source_extract_file}; skipped prediction run.")
+            print(
+                f"No latest communication rows found in {[str(path) for path in source_extract_files]}; skipped prediction run."
+            )
             return
 
-        history_files = selected_history_files(args.source_month, source_extract_file)
+        history_files = selected_history_files(args.source_month, source_extract_files, args.history_window_months)
+        logger.info(
+            "Inference selected history files | months=%s files=%s",
+            history_months,
+            [str(path) for path in history_files],
+        )
         if len(history_files) < 3:
             raise FileNotFoundError(
                 "Need latest communication file plus previous two month files. "
@@ -1877,33 +2694,62 @@ def main() -> None:
             )
         logger.info("Selected communication history files: %s", [str(path) for path in history_files])
 
+        # with log_step(logger, "prepare_inference_features"):
+        #     run_python_script(
+        #         "generate_strategy_dataset.py",
+        #         "--output-file",
+        #         str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+        #         "--month-source",
+        #         args.feature_month_source,
+        #         "--input-files",
+        #         *[str(path) for path in history_files],
+        #         logger=logger,
+        #     )
         with log_step(logger, "prepare_inference_features"):
             run_python_script(
                 "generate_strategy_dataset.py",
                 "--output-file",
-                str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+                str(TRAINING_DATA_DIR / "strategy_training_dataset_inference.csv"),  # <-- CHANGED
                 "--month-source",
                 args.feature_month_source,
                 "--input-files",
                 *[str(path) for path in history_files],
                 logger=logger,
             )
+        # with log_step(logger, "build_schedule_dataset"):
+        #     run_python_script(
+        #         "build_strategy_schedule_dataset.py",
+        #         "--input-file",
+        #         str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+        #         "--output-file",
+        #         str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv"),
+        #         logger=logger,
+        #     )
         with log_step(logger, "build_schedule_dataset"):
             run_python_script(
                 "build_strategy_schedule_dataset.py",
                 "--input-file",
-                str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+                str(TRAINING_DATA_DIR / "strategy_training_dataset_inference.csv"),  # <-- CHANGED
                 "--output-file",
-                str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv"),
+                str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv"),  # <-- CHANGED
                 logger=logger,
             )
+        # with log_step(logger, "build_monthly_features"):
+        #     run_python_script(
+        #         "build_monthly_feature_dataset.py",
+        #         "--input-file",
+        #         str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+        #         "--output-file",
+        #         str(FEATURE_DATA_DIR / "strategy_monthly_features.csv"),
+        #         logger=logger,
+        #     )
         with log_step(logger, "build_monthly_features"):
             run_python_script(
                 "build_monthly_feature_dataset.py",
                 "--input-file",
-                str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+                str(TRAINING_DATA_DIR / "strategy_training_dataset_inference.csv"),  # <-- CHANGED
                 "--output-file",
-                str(FEATURE_DATA_DIR / "strategy_monthly_features.csv"),
+                str(FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv"),   # <-- CHANGED
                 logger=logger,
             )
 
@@ -1913,20 +2759,23 @@ def main() -> None:
                 PREDICTIONS_DIR
                 / f"{args.predict_month.replace('-', '_').lower()}_strategy_predictions_{model_suffix}.csv"
             )
-            model_file = MODEL_DIR / f"next_month_strategy_{model_suffix}.joblib"
-            metrics_file = METRICS_DIR / f"next_month_strategy_{model_suffix}_metrics.json"
-            if args.model_serving == "mlflow":
-                with log_step(
-                    logger,
-                    "download_mlflow_model_bundle",
-                    model_uri=args.mlflow_model_uri,
-                    model_file=model_file,
-                ):
-                    download_mlflow_model_bundle(args.mlflow_model_uri, model_file, logger)
+            model_file = Path(args.model_file) if args.model_file else model_artifact_path(
+                MODEL_DIR,
+                f"next_month_strategy_{model_suffix}",
+                ".joblib",
+                args.model_version,
+            )
+            metrics_file = Path(args.metrics_file) if args.metrics_file else model_artifact_path(
+                METRICS_DIR,
+                f"next_month_strategy_{model_suffix}_metrics",
+                ".json",
+                args.model_version,
+            )
+            
             if not model_file.exists():
                 raise FileNotFoundError(
                     f"CatBoost model bundle not found: {model_file}. "
-                    "Train the CatBoost model once or set MODEL_SERVING=mlflow and MLFLOW_MODEL_URI."
+                    "Train the CatBoost model first."
                 )
             with log_step(
                 logger,
@@ -1942,8 +2791,43 @@ def main() -> None:
                     str(prediction_file),
                     "--base-population-file",
                     str(source_cases_file),
-                    "--prediction-source-months",
+                    "--prediction-source-months",   
                     source_month_label,
+                    "--feature-file",
+                    str(FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv"),
+                    "--schedule-file",
+                    str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv"),
+                    logger=logger,
+                )
+            with log_step(
+                logger,
+                "build_prediction_evidence",
+                prediction_file=prediction_file,
+                prediction_evidence_limit=args.prediction_evidence_limit,
+            ):
+                evidence_command = [
+                    "generate_prediction_evidence.py",
+                    "--prediction-file",
+                    str(prediction_file),
+                    "--model-file",
+                    str(model_file),
+                    "--feature-file",
+                    # str(FEATURE_DATA_DIR / "strategy_monthly_features.csv"),
+                    str(FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv"),   # <-- CHANGED
+                    "--schedule-file",
+                    # str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv"),
+                    str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv"),  # <-- CHANGED
+                    "--base-population-file",
+                    str(source_cases_file),
+                    "--month-source",
+                    args.feature_month_source,
+                    "--communication-files",
+                    *[str(path) for path in history_files],
+                ]
+                if args.prediction_evidence_limit > 0:
+                    evidence_command.extend(["--limit", str(args.prediction_evidence_limit)])
+                run_python_script(
+                    *evidence_command,
                     logger=logger,
                 )
         else:
@@ -1969,8 +2853,12 @@ def main() -> None:
 
         with log_step(logger, "compute_model_drift", model_file=model_file, metrics_file=metrics_file):
             drift_report = compute_model_drift_metrics(
-                feature_file=FEATURE_DATA_DIR / "strategy_monthly_features.csv",
-                schedule_file=SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv",
+                # feature_file=FEATURE_DATA_DIR / "strategy_monthly_features.csv",
+                # feature_file=FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv",
+                # schedule_file=SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv",
+                train_feature_file=FEATURE_DATA_DIR / "strategy_monthly_features_train.csv",       # <-- NEW
+                inference_feature_file=FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv", # <-- CHANGED
+                schedule_file=SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv", # <-- CHANGED
                 base_population_file=source_cases_file,
                 model_file=model_file,
                 metrics_file=metrics_file,
@@ -2085,11 +2973,9 @@ def main() -> None:
             mapping_df=mapping_df,
         )
         if drift_report is not None:
-            summary["drift"] = {
-                key: value
-                for key, value in drift_report.items()
-                if key != "feature_metrics"
-            }
+            # --- CHANGED: Save the full drift report including feature_metrics ---
+            summary["drift"] = drift_report
+            
         summary_path = write_prediction_summary(
             summary=summary,
             output_path=prediction_summary_path(args.predict_month),
@@ -2103,7 +2989,6 @@ def main() -> None:
     except Exception as exc:
         logger.exception("Monthly inference failed.")
         raise
-
 
 if __name__ == "__main__":
     main()

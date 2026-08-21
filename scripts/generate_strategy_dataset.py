@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import pandas as pd
 
+from entity_keys import annotate_entity_key, entity_key_column_name
+from env_utils import load_dotenv
 from pipeline_common import candidate_hours
 from project_paths import COMMUNICATION_DATA_DIR, REPO_ROOT, TRAINING_DATA_DIR, ensure_parent_dir
 
@@ -27,16 +30,28 @@ COMM_TYPE_MAP = {
     "SMS": "SMS",
     "WHATSAPP": "WH",
     "VOICE": "VOICE",
+    "VOICE_BOT": "VOICE_BOT",
 }
 
 SUCCESS_STATUS_MAP = {
     "SMS": {"DELIVERED", "CLICKED", "SENT"},
     "WH": {"DELIVERED", "READ", "CLICKED", "SENT"},
     "VOICE": {"CONNECTED", "CALL_CONNECTED"},
+    "VOICE_BOT": {"CONNECTED", "CALL_CONNECTED"},
 }
+
+DEFAULT_SUCCESS_SCORES = {
+    "SMS": {"SENT": 0.5, "DELIVERED": 1.0, "CLICKED": 2.0},
+    "WH": {"SENT": 0.5, "DELIVERED": 1.0, "READ": 1.5, "CLICKED": 2.0},
+    "VOICE": {"CONNECTED": 1.0, "CALL_CONNECTED": 1.0},
+    "VOICE_BOT": {"CONNECTED": 1.0, "CALL_CONNECTED": 1.0},
+}
+
+TARGET_SAMPLE_WEIGHT_COLUMN = "TARGET_SAMPLE_WEIGHT"
 
 USECOLS = [
     "apac_card_number",
+    "party_id",
     "comm_status",
     "communication_type",
     "verbiage_language",
@@ -48,11 +63,35 @@ USECOLS = [
 ]
 
 
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def load_weight_config() -> tuple[bool, dict[str, dict[str, float]], float]:
+    enabled = env_flag("STRATEGY_USE_STATUS_WEIGHTS", default=False)
+    raw_scores = os.getenv("STRATEGY_SUCCESS_SCORES_JSON", "").strip()
+    score_map = DEFAULT_SUCCESS_SCORES
+    if raw_scores:
+        parsed = json.loads(raw_scores)
+        score_map = {
+            str(channel).upper(): {
+                str(status).upper(): float(score)
+                for status, score in statuses.items()
+            }
+            for channel, statuses in parsed.items()
+        }
+    positive_boost = float(os.getenv("STRATEGY_SAMPLE_WEIGHT_POSITIVE_BOOST", "1.0"))
+    return enabled, score_map, positive_boost
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Create a wide strategy dataset from MFL communication CSV files "
-            "for D-5 to D+5, excluding D."
+            "for D-5 to D+20, excluding D."
         )
     )
     parser.add_argument(
@@ -60,9 +99,14 @@ def parse_args() -> argparse.Namespace:
         default=str(COMMUNICATION_DATA_DIR),
         help="Directory containing monthly communication CSV files.",
     )
+    # parser.add_argument(
+    #     "--output-file",
+    #     default=str(TRAINING_DATA_DIR / "strategy_training_dataset.csv"),
+    #     help="Path to the final wide CSV output.",
+    # )
     parser.add_argument(
         "--output-file",
-        default=str(TRAINING_DATA_DIR / "strategy_training_dataset.csv"),
+        default=str(TRAINING_DATA_DIR / "strategy_training_dataset_train.csv"),
         help="Path to the final wide CSV output.",
     )
     parser.add_argument(
@@ -187,11 +231,15 @@ def process_chunk(
     sample_cards: set[str] | None = None,
     month_source: str = "emi_date",
     send_hour_window: dict[str, int] | None = None,
+    weighting_enabled: bool = False,
+    success_scores: dict[str, dict[str, float]] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df = chunk.copy()
     if "risk" not in df.columns:
         raise ValueError("Missing required risk column in communication data.")
+    df = annotate_entity_key(df, loan_column="apac_card_number", party_column="party_id", output_column=entity_key_column_name())
     df["APAC_CARD_NUMBER"] = df["apac_card_number"].astype(str).str.strip()
+    key_col = entity_key_column_name()
     if sample_cards is not None:
         df = df[df["APAC_CARD_NUMBER"].isin(sample_cards)].copy()
         if df.empty:
@@ -209,7 +257,7 @@ def process_chunk(
     ).astype("Int64")
 
     df = df[
-        df["APAC_CARD_NUMBER"].ne("")
+        df[key_col].ne("")
         & df["RISK"].ne("UNKNOWN")
         & df["COMM_TYPE"].notna()
         & df["emi_date"].notna()
@@ -218,7 +266,7 @@ def process_chunk(
     ].copy()
 
     df["offset"] = (df["date"] - df["emi_date"]).dt.days
-    df = df[df["offset"].between(-5, 5) & df["offset"].ne(0)].copy()
+    df = df[df["offset"].between(-5, 20) & df["offset"].ne(0)].copy()
     if df.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
@@ -229,9 +277,26 @@ def process_chunk(
         lambda row: row["STATUS"] in SUCCESS_STATUS_MAP[row["COMM_TYPE"]],
         axis=1,
     )
+    score_lookup = {
+        str(channel).upper(): {
+            str(status).upper(): float(score)
+            for status, score in statuses.items()
+        }
+        for channel, statuses in (success_scores or {}).items()
+    }
+    if weighting_enabled:
+        df["SUCCESS_SCORE"] = df.apply(
+            lambda row: score_lookup.get(row["COMM_TYPE"], {}).get(
+                row["STATUS"],
+                1.0 if row["IS_SUCCESS"] else 0.0,
+            ),
+            axis=1,
+        )
+    else:
+        df["SUCCESS_SCORE"] = df["IS_SUCCESS"].astype(float)
 
     totals = (
-        df.groupby(["APAC_CARD_NUMBER", "MONTH", "DAY", "COMM_TYPE"], sort=False)
+        df.groupby([key_col, "MONTH", "DAY", "COMM_TYPE"], sort=False)
         .size()
         .reset_index(name="count")
     )
@@ -240,7 +305,7 @@ def process_chunk(
     failed = (
         df.loc[~df["IS_SUCCESS"]]
         .groupby(
-            ["APAC_CARD_NUMBER", "MONTH", "DAY", "COMM_TYPE", "LANGUAGE"],
+            [key_col, "MONTH", "DAY", "COMM_TYPE", "LANGUAGE"],
             sort=False,
         )
         .size()
@@ -263,10 +328,10 @@ def process_chunk(
         )
         success_features = (
             success.groupby(
-                ["APAC_CARD_NUMBER", "MONTH", "DAY", "feature"],
+                [key_col, "MONTH", "DAY", "feature"],
                 sort=False,
-            )
-            .size()
+            )["SUCCESS_SCORE"]
+            .sum()
             .reset_index(name="count")
         )
         success["strategy"] = (
@@ -278,10 +343,10 @@ def process_chunk(
         )
         strategy_counts = (
             success.groupby(
-                ["APAC_CARD_NUMBER", "MONTH", "DAY", "strategy"],
+                [key_col, "MONTH", "DAY", "strategy"],
                 sort=False,
-            )
-            .size()
+            )["SUCCESS_SCORE"]
+            .sum()
             .reset_index(name="count")
             .rename(columns={"strategy": "feature"})
         )
@@ -290,20 +355,20 @@ def process_chunk(
         strategy_counts = pd.DataFrame()
 
     feature_frames = [
-        totals[["APAC_CARD_NUMBER", "MONTH", "DAY", "feature", "count"]],
+        totals[[key_col, "MONTH", "DAY", "feature", "count"]],
     ]
     if not failed.empty:
         feature_frames.append(
-            failed[["APAC_CARD_NUMBER", "MONTH", "DAY", "feature", "count"]]
+            failed[[key_col, "MONTH", "DAY", "feature", "count"]]
         )
     if not success_features.empty:
         feature_frames.append(
-            success_features[["APAC_CARD_NUMBER", "MONTH", "DAY", "feature", "count"]]
+            success_features[[key_col, "MONTH", "DAY", "feature", "count"]]
         )
 
     feature_counts = pd.concat(feature_frames, ignore_index=True)
     risk_counts = (
-        df.groupby(["APAC_CARD_NUMBER", "MONTH", "DAY"], sort=False)[["RISK", "VERTICAL"]]
+        df.groupby([key_col, "MONTH", "DAY"], sort=False)[["RISK", "VERTICAL"]]
         .last()
         .reset_index()
     )
@@ -315,7 +380,9 @@ def summarize_chunk_audit(
     sample_cards: set[str] | None = None,
 ) -> dict[str, object]:
     df = chunk.copy()
+    df = annotate_entity_key(df, loan_column="apac_card_number", party_column="party_id", output_column=entity_key_column_name())
     df["APAC_CARD_NUMBER"] = df["apac_card_number"].fillna("").astype(str).str.strip()
+    key_col = entity_key_column_name()
     sample_mask = df["APAC_CARD_NUMBER"].isin(sample_cards) if sample_cards is not None else pd.Series(True, index=df.index)
     scoped = df.loc[sample_mask].copy()
 
@@ -327,7 +394,7 @@ def summarize_chunk_audit(
     created_ts = pd.to_datetime(scoped["created_date"], errors="coerce")
 
     required_mask = (
-        scoped["APAC_CARD_NUMBER"].ne("")
+        scoped[key_col].ne("")
         & risk.ne("UNKNOWN")
         & normalized_comm_type.notna()
         & emi_date.notna()
@@ -340,6 +407,7 @@ def summarize_chunk_audit(
     kept_mask = required_mask & within_window & ~day_zero
 
     unsupported_counts = raw_comm_type[normalized_comm_type.isna()].replace({"": "EMPTY"}).value_counts().to_dict()
+    normalized_counts = normalized_comm_type.fillna("UNSUPPORTED").value_counts().to_dict()
     return {
         "total_rows": int(len(df)),
         "sample_filtered_rows": int((~sample_mask).sum()) if sample_cards is not None else 0,
@@ -353,6 +421,7 @@ def summarize_chunk_audit(
         "day_zero_rows": int((required_mask & day_zero).sum()),
         "kept_model_rows": int(kept_mask.sum()),
         "unsupported_comm_type_counts": {str(key): int(value) for key, value in unsupported_counts.items()},
+        "normalized_comm_type_counts": {str(key): int(value) for key, value in normalized_counts.items()},
     }
 
 
@@ -374,6 +443,9 @@ def log_dataset_audit(audit_counts: dict[str, object], *, csv_files: list[Path],
         **audit_counts,
     }
     print("Strategy dataset audit summary | " + json.dumps(payload, sort_keys=True))
+    normalized_counts = payload.get("normalized_comm_type_counts", {})
+    if int(normalized_counts.get("VOICE_BOT", 0)) == 0:
+        print("Strategy dataset warning | VOICE_BOT channel was not present in the training input data.")
 
 
 def collect_sample_cards(
@@ -412,6 +484,7 @@ def build_dataset(
     month_source: str = "emi_date",
     send_hour_window: dict[str, int] | None = None,
 ) -> None:
+    weighting_enabled, success_scores, positive_boost = load_weight_config()
     output_file = ensure_parent_dir(output_file)
     exclude_tokens = {token.upper() for token in (exclude_months or [])}
     if input_files:
@@ -444,6 +517,8 @@ def build_dataset(
                 sample_cards=sample_cards,
                 month_source=month_source,
                 send_hour_window=send_hour_window,
+                weighting_enabled=weighting_enabled,
+                success_scores=success_scores,
             )
             if not feature_counts.empty:
                 feature_parts.append(feature_counts)
@@ -453,17 +528,18 @@ def build_dataset(
                 risk_parts.append(risk_counts)
 
     if not feature_parts:
-        raise ValueError("No rows matched the D-5 to D+5 window.")
+        raise ValueError("No rows matched the D-5 to D+20 window.")
     if not risk_parts:
         raise ValueError("No risk rows found in communication data.")
 
+    key_col = entity_key_column_name()
     features = (
         pd.concat(feature_parts, ignore_index=True)
-        .groupby(["APAC_CARD_NUMBER", "MONTH", "DAY", "feature"], as_index=False)["count"]
+        .groupby([key_col, "MONTH", "DAY", "feature"], as_index=False)["count"]
         .sum()
         .rename(
             columns={
-                "APAC_CARD_NUMBER": "apac_card_number",
+                key_col: "entity_key",
                 "MONTH": "month",
                 "DAY": "day",
             }
@@ -473,11 +549,11 @@ def build_dataset(
     if strategy_parts:
         strategies = (
             pd.concat(strategy_parts, ignore_index=True)
-            .groupby(["APAC_CARD_NUMBER", "MONTH", "DAY", "feature"], as_index=False)["count"]
+            .groupby([key_col, "MONTH", "DAY", "feature"], as_index=False)["count"]
             .sum()
             .rename(
                 columns={
-                    "APAC_CARD_NUMBER": "apac_card_number",
+                    key_col: "entity_key",
                     "MONTH": "month",
                     "DAY": "day",
                 }
@@ -485,12 +561,12 @@ def build_dataset(
         )
     else:
         strategies = pd.DataFrame(
-            columns=["apac_card_number", "month", "day", "feature", "count"]
+            columns=["entity_key", "month", "day", "feature", "count"]
         )
 
     wide = (
         features.pivot_table(
-            index=["apac_card_number", "month", "day"],
+            index=["entity_key", "month", "day"],
             columns="feature",
             values="count",
             aggfunc="sum",
@@ -499,7 +575,7 @@ def build_dataset(
         .reset_index()
         .rename(
             columns={
-                "apac_card_number": "APAC_CARD_NUMBER",
+                "entity_key": "ENTITY_KEY",
                 "month": "MONTH",
                 "day": "DAY",
             }
@@ -507,49 +583,89 @@ def build_dataset(
     )
     risk_df = (
         pd.concat(risk_parts, ignore_index=True)
-        .groupby(["APAC_CARD_NUMBER", "MONTH", "DAY"], as_index=False)[["RISK", "VERTICAL"]]
+        .groupby([key_col, "MONTH", "DAY"], as_index=False)[["RISK", "VERTICAL"]]
         .last()
+        .rename(columns={key_col: "ENTITY_KEY"})
     )
-    wide = wide.merge(risk_df, on=["APAC_CARD_NUMBER", "MONTH", "DAY"], how="left")
+    wide = wide.merge(risk_df, on=["ENTITY_KEY", "MONTH", "DAY"], how="left")
 
     if not strategies.empty:
         strategies = strategies.sort_values(
-            ["apac_card_number", "month", "day", "count", "feature"],
+            ["entity_key", "month", "day", "count", "feature"],
             ascending=[True, True, True, False, True],
         )
         predicted = strategies.drop_duplicates(
-            subset=["apac_card_number", "month", "day"],
+            subset=["entity_key", "month", "day"],
             keep="first",
         ).rename(
             columns={
-                "apac_card_number": "APAC_CARD_NUMBER",
+                "entity_key": "ENTITY_KEY",
                 "month": "MONTH",
                 "day": "DAY",
                 "feature": "PREDICTED_STRATEGY",
             }
         )
+        if weighting_enabled:
+            predicted[TARGET_SAMPLE_WEIGHT_COLUMN] = 1.0 + (
+                predicted["count"].astype(float) * positive_boost
+            )
+        else:
+            predicted[TARGET_SAMPLE_WEIGHT_COLUMN] = 1.0
         wide = wide.merge(
-            predicted[["APAC_CARD_NUMBER", "MONTH", "DAY", "PREDICTED_STRATEGY"]],
-            on=["APAC_CARD_NUMBER", "MONTH", "DAY"],
+            predicted[[
+                "ENTITY_KEY",
+                "MONTH",
+                "DAY",
+                "PREDICTED_STRATEGY",
+                TARGET_SAMPLE_WEIGHT_COLUMN,
+            ]],
+            on=["ENTITY_KEY", "MONTH", "DAY"],
             how="left",
         )
     else:
         wide["PREDICTED_STRATEGY"] = pd.NA
+        wide[TARGET_SAMPLE_WEIGHT_COLUMN] = 1.0
+
+    wide[TARGET_SAMPLE_WEIGHT_COLUMN] = pd.to_numeric(
+        wide[TARGET_SAMPLE_WEIGHT_COLUMN],
+        errors="coerce",
+    ).fillna(1.0)
 
     feature_columns = sorted(
         column
         for column in wide.columns
-        if column not in {"APAC_CARD_NUMBER", "MONTH", "DAY", "RISK", "VERTICAL", "PREDICTED_STRATEGY"}
+        if column not in {"ENTITY_KEY", "MONTH", "DAY", "RISK", "VERTICAL", "PREDICTED_STRATEGY", TARGET_SAMPLE_WEIGHT_COLUMN}
     )
     wide = wide[
-        ["APAC_CARD_NUMBER", "MONTH", "DAY", "RISK", "VERTICAL", *feature_columns, "PREDICTED_STRATEGY"]
+        [
+            "ENTITY_KEY",
+            "MONTH",
+            "DAY",
+            "RISK",
+            "VERTICAL",
+            *feature_columns,
+            TARGET_SAMPLE_WEIGHT_COLUMN,
+            "PREDICTED_STRATEGY",
+        ]
     ]
     wide.to_csv(output_file, index=False)
     print(f"Saved {len(wide):,} rows to {output_file}")
     log_dataset_audit(audit_counts, csv_files=csv_files, output_file=output_file)
+    print(
+        "Strategy dataset weighting | "
+        + json.dumps(
+            {
+                "enabled": weighting_enabled,
+                "positive_boost": positive_boost,
+                "weighted_status_channels": sorted(success_scores),
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def main() -> None:
+    load_dotenv(override=True)
     args = parse_args()
     send_hour_window = load_send_hour_window(args.config_file)
     build_dataset(

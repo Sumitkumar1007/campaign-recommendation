@@ -27,11 +27,13 @@ JOB_CLASS_BY_MODE = {
     "SMS": "com.company.api_test.jobs.BatchSMSJob",
     "WHATSAPP": "com.company.api_test.jobs.BatchWhatsappJob",
     "VOICE": "com.company.api_test.jobs.BatchVoiceJob",
+    "VOICE_BOT": "com.company.api_test.jobs.BatchVoiceJob",
 }
 JOB_GROUP_BY_MODE = {
     "SMS": "SMS",
     "WHATSAPP": "WHATSAPP",
     "VOICE": "VOICE",
+    "VOICE_BOT": "VOICE_BOT",
 }
 
 

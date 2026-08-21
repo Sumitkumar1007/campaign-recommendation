@@ -94,7 +94,7 @@ def _aggregate_history(history_frame: pd.DataFrame) -> pd.DataFrame:
     history = history_frame.copy()
     history["is_sms"] = (history["communication_type"] == "SMS").astype(int)
     history["is_whatsapp"] = (history["communication_type"] == "WHATSAPP").astype(int)
-    history["is_voice"] = (history["communication_type"] == "VOICE").astype(int)
+    history["is_voice"] = history["communication_type"].isin(["VOICE", "VOICE_BOT"]).astype(int)
     history["sms_success"] = history["is_sms"] * history["target_success"]
     history["whatsapp_success"] = history["is_whatsapp"] * history["target_success"]
     history["voice_success"] = history["is_voice"] * history["target_success"]

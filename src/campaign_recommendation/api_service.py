@@ -242,11 +242,35 @@ def format_model_version(version: tuple[int, int, int]) -> str:
     return f"v{version[0]}.{version[1]}.{version[2]}"
 
 
+def parse_sequential_model_version(value: str | None) -> tuple[int, int] | None:
+    if not value:
+        return None
+    cleaned = value.strip()
+    if cleaned.startswith(("v", "V")):
+        cleaned = cleaned[1:]
+    if not cleaned.isdigit():
+        return None
+    return int(cleaned), max(len(cleaned), 3)
+
+
 def bump_model_version(value: str | None, *, fallback: str) -> str:
+    sequential = parse_sequential_model_version(value) or parse_sequential_model_version(fallback)
+    if sequential is not None:
+        version, width = sequential
+        return f"v{version + 1:0{width}d}"
     parsed = parse_model_version(value) or parse_model_version(fallback)
     if parsed is None:
         return fallback
     return format_model_version((parsed[0], parsed[1], parsed[2] + 1))
+
+
+def model_artifact_path(directory: Path, stem: str, suffix: str, model_version: str | None) -> Path:
+    token = str(model_version or "").strip()
+    if token:
+        if not token.lower().startswith("v"):
+            token = f"v{token}"
+        return directory / f"{stem}_{token}{suffix}"
+    return directory / f"{stem}{suffix}"
 
 
 def extract_metrics_snapshot(metrics: dict[str, Any], *, model_name: str) -> dict[str, Any]:
@@ -270,13 +294,16 @@ def extract_metrics_snapshot(metrics: dict[str, Any], *, model_name: str) -> dic
     }
 
 
-def read_metrics_snapshot(model_name: str) -> dict[str, Any]:
-    candidates = [
+def read_metrics_snapshot(model_name: str, model_version: str | None = None) -> dict[str, Any]:
+    candidates = []
+    if model_version:
+        candidates.append(model_artifact_path(METRICS_DIR, f"next_month_strategy_{model_name}_metrics", ".json", model_version))
+    candidates.extend([
         METRICS_DIR / f"next_month_strategy_{model_name}_metrics.json",
         METRICS_DIR / "next_month_strategy_catboost_3m_metrics.json",
         METRICS_DIR / "next_month_strategy_logistic_metrics.json",
         METRICS_DIR / "next_month_strategy_catboost_metrics.json",
-    ]
+    ])
     for path in candidates:
         if path.exists():
             return extract_metrics_snapshot(json.loads(path.read_text(encoding="utf-8")), model_name=model_name)
@@ -571,10 +598,10 @@ class AIConfigurationRepository:
             )
             conn.commit()
 
-    def update_entry(self, *, transaction_id: str, status: str, message: str, model_version: str | None = None, accuracy: float | None = None, drift: float | None = None, entry_type: str | None = None, training_window: str | None = None) -> None:
+    def update_entry(self, *, transaction_id: str, status: str, message: str, model_version: str | None = None, accuracy: float | None = None, drift: float | None = None, entry_type: str | None = None, training_window: str | None = None) -> int:
         with self.connect() as conn:
             self.ensure_table(conn)
-            conn.execute(
+            cursor = conn.execute(
                 sql.SQL(
                     """
                     UPDATE {table_ref}
@@ -604,6 +631,7 @@ class AIConfigurationRepository:
                 ),
             )
             conn.commit()
+            return int(cursor.rowcount or 0)
 
     def fetch_by_transaction_id(self, transaction_id: str) -> dict[str, Any] | None:
         with self.connect() as conn:
@@ -680,8 +708,8 @@ class NoopAIConfigurationRepository:
     def create_entry(self, **kwargs) -> None:
         return None
 
-    def update_entry(self, **kwargs) -> None:
-        return None
+    def update_entry(self, **kwargs) -> int:
+        return 0
 
     def fetch_by_transaction_id(self, transaction_id: str) -> dict[str, Any] | None:
         return None
@@ -806,7 +834,7 @@ class ApiAuditLogRepository:
     ) -> None:
         with self.connect() as conn:
             self.ensure_table(conn)
-            conn.execute(
+            cursor = conn.execute(
                 sql.SQL(
                     """
                     UPDATE {table_ref}
@@ -843,6 +871,43 @@ class ApiAuditLogRepository:
                     reference_number,
                 ),
             )
+            if int(cursor.rowcount or 0) == 0:
+                now = utcnow_naive()
+                conn.execute(
+                    sql.SQL(
+                        """
+                        INSERT INTO {table_ref} (
+                            "type", reference_number, request_url, message, status, request_body, response_body,
+                            created_by, created_on, modified_by, modified_on,
+                            delete_flag, channel, tenant_id, module_name, client_name,
+                            total_records, success_count, failure_count, processing_time_ms
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """
+                    ).format(table_ref=qualified_identifier(self.config.target_schema, self.config.api_audit_table)),
+                    (
+                        entry_type,
+                        reference_number,
+                        request_url,
+                        message,
+                        status,
+                        None,
+                        response_body,
+                        "AIML",
+                        now,
+                        "AIML",
+                        now,
+                        "N",
+                        "API",
+                        "DIGITAL",
+                        "AIML",
+                        "DIGITAL",
+                        str(total_records) if total_records is not None else None,
+                        str(success_count) if success_count is not None else None,
+                        str(failure_count) if failure_count is not None else None,
+                        str(processing_time_ms) if processing_time_ms is not None else None,
+                    ),
+                )
             conn.commit()
 
 
@@ -975,13 +1040,43 @@ class AIMLApiService:
         }
         return HTTPStatus.OK, payload
 
-    def current_model_version(self) -> str:
+    def latest_completed_training_model_version(self) -> str | None:
         latest_training = self.ai_config_repo.fetch_latest(entry_type="TRAINING", status="COMPLETED")
         model_version = (latest_training or {}).get("model_version")
         parsed = parse_model_version(model_version)
-        if parsed is None:
-            return self.config.api_model_base_version
-        return format_model_version(parsed)
+        if parsed is not None:
+            return format_model_version(parsed)
+        sequential = parse_sequential_model_version(model_version)
+        if sequential is not None:
+            version, width = sequential
+            return f"v{version:0{width}d}"
+        return None
+
+    def _normalize_model_version(self, value: Any) -> str | None:
+        parsed = parse_model_version(str(value) if value is not None else None)
+        if parsed is not None:
+            return format_model_version(parsed)
+        sequential = parse_sequential_model_version(str(value) if value is not None else None)
+        if sequential is not None:
+            version, width = sequential
+            return f"v{version:0{width}d}"
+        return None
+
+    def latest_known_model_version(self) -> str | None:
+        for entry_type, status in (
+            ("TRAINING", "COMPLETED"),
+            ("INFERENCE", "COMPLETED"),
+            ("TRAINING", None),
+            ("INFERENCE", None),
+        ):
+            entry = self.ai_config_repo.fetch_latest(entry_type=entry_type, status=status)
+            normalized = self._normalize_model_version((entry or {}).get("model_version"))
+            if normalized is not None:
+                return normalized
+        return None
+
+    def current_model_version(self) -> str:
+        return self.latest_known_model_version() or self.config.api_model_base_version
 
     def next_model_version(self) -> str:
         return bump_model_version(self.current_model_version(), fallback=self.config.api_model_base_version)
@@ -1027,8 +1122,13 @@ class AIMLApiService:
         initial_delay_seconds: float = 0.0,
         **kwargs: Any,
     ) -> None:
+        updated_rows = self.ai_config_repo.update_entry(transaction_id=transaction_id, **kwargs)
+        if updated_rows:
+            return
         self._wait_for_ai_configuration_row(transaction_id, initial_delay_seconds=initial_delay_seconds)
-        self.ai_config_repo.update_entry(transaction_id=transaction_id, **kwargs)
+        updated_rows = self.ai_config_repo.update_entry(transaction_id=transaction_id, **kwargs)
+        if not updated_rows:
+            raise FileNotFoundError(f"transactionId {transaction_id} not found in ai_configurations for update.")
 
     def _safe_update_ai_configuration_entry(self, *, log_context: str, transaction_id: str, **kwargs: Any) -> None:
         try:
@@ -1168,8 +1268,9 @@ class AIMLApiService:
         except ValueError as exc:
             return HTTPStatus.BAD_REQUEST, failure_response(transaction_id, str(exc))
         model_name = self.config.model_name
-        metrics = read_metrics_snapshot(model_name)
-        current_model_version = self.current_model_version()
+        latest_training_version = self.latest_completed_training_model_version()
+        current_model_version = latest_training_version or self.current_model_version()
+        metrics = read_metrics_snapshot(model_name, latest_training_version)
         accepted = {
             "transactionId": transaction_id,
             "status": "ACCEPTED",
@@ -1210,6 +1311,7 @@ class AIMLApiService:
             model_file=model_file,
             prediction_file=prediction_file,
             checkpoint_dir=checkpoint_dir,
+            model_version=target_model_version,
             train_source_months=payload.get("trainSourceMonths"),
             validation_source_months=payload.get("validationSourceMonths"),
             prediction_source_months=payload.get("predictionSourceMonths"),
@@ -1226,14 +1328,28 @@ class AIMLApiService:
             checkpoint_dir,
         )
         try:
+            accepted_response_body = json_dumps_compact({"transactionId": transaction_id, "status": "ACCEPTED", "modelVersion": current_model_version, "message": "Request accepted for processing."})
             self._update_ai_configuration_entry(
                 transaction_id=transaction_id,
                 initial_delay_seconds=AI_CONFIG_UPDATE_INITIAL_DELAY_SECONDS,
                 entry_type="TRAINING",
                 status="ACCEPTED",
-                message=json_dumps_compact({"transactionId": transaction_id, "status": "ACCEPTED", "modelVersion": current_model_version, "message": "Request accepted for processing."}),
+                message=accepted_response_body,
                 training_window=str(months),
                 model_version=current_model_version,
+            )
+            self._safe_create_api_audit_entry(
+                log_context="training_accepted",
+                entry_type="TRAINING",
+                reference_number=transaction_id,
+                request_url=request_url,
+                request_body=json_dumps_compact(payload),
+                response_body=accepted_response_body,
+                status="ACCEPTED",
+                message="Request accepted for processing.",
+                success_count=0,
+                failure_count=0,
+                total_records=0,
             )
             run_logged_subprocess(
                 prepare_command,
@@ -1249,7 +1365,7 @@ class AIMLApiService:
                 step_name="train_model",
                 cwd=REPO_ROOT,
             )
-            snapshot = read_metrics_snapshot(model_name)
+            snapshot = read_metrics_snapshot(model_name, target_model_version)
             self.logger.info(
                 "Training completed | transaction_id=%s current_accuracy=%s drift_percentage=%s metrics_file=%s model_file=%s",
                 transaction_id,
@@ -1333,11 +1449,17 @@ class AIMLApiService:
         source_month = str(payload["sourceMonth"])
         predict_month = str(payload["predictMonth"])
         model_name = str(payload["model"])
-        model_version = self.current_model_version()
+        latest_training_version = self.latest_completed_training_model_version()
+        model_version = latest_training_version or self.current_model_version()
+        model_file = model_artifact_path(MODEL_DIR, f"next_month_strategy_{model_name}", ".joblib", latest_training_version)
+        metrics_file = model_artifact_path(METRICS_DIR, f"next_month_strategy_{model_name}_metrics", ".json", latest_training_version)
         command = self._build_inference_command(
             source_month=source_month,
             predict_month=predict_month,
             model_name=model_name,
+            model_version=model_version,
+            model_file=model_file,
+            metrics_file=metrics_file,
         )
         self.logger.info(
             "Queued inference pipeline | transaction_id=%s source_month=%s predict_month=%s model=%s export_after_inference=%s export_write=%s",
@@ -1349,14 +1471,28 @@ class AIMLApiService:
             self.config.export_write,
         )
         try:
+            accepted_response_body = json_dumps_compact({"transactionId": transaction_id, "status": "ACCEPTED", "driftPercentage": read_metrics_snapshot(model_name, latest_training_version).get("driftPercentage"), "currentAccuracy": read_metrics_snapshot(model_name, latest_training_version).get("currentAccuracy"), "modelVersion": model_version, "message": "Request accepted for processing."})
             self._update_ai_configuration_entry(
                 transaction_id=transaction_id,
                 initial_delay_seconds=AI_CONFIG_UPDATE_INITIAL_DELAY_SECONDS,
                 entry_type="INFERENCE",
                 status="ACCEPTED",
-                message=json_dumps_compact({"transactionId": transaction_id, "status": "ACCEPTED", "driftPercentage": read_metrics_snapshot(model_name).get("driftPercentage"), "currentAccuracy": read_metrics_snapshot(model_name).get("currentAccuracy"), "modelVersion": model_version, "message": "Request accepted for processing."}),
+                message=accepted_response_body,
                 model_version=model_version,
                 training_window="10 days",
+            )
+            self._safe_create_api_audit_entry(
+                log_context="inference_accepted",
+                entry_type="INFERENCE",
+                reference_number=transaction_id,
+                request_url=request_url,
+                request_body=json_dumps_compact(payload),
+                response_body=accepted_response_body,
+                status="ACCEPTED",
+                message="Request accepted for processing.",
+                success_count=0,
+                failure_count=0,
+                total_records=0,
             )
             run_logged_subprocess(
                 command,
@@ -1378,7 +1514,7 @@ class AIMLApiService:
                     step_name="export_recommendation_workbooks",
                     cwd=REPO_ROOT,
                 )
-            snapshot = read_metrics_snapshot(model_name)
+            snapshot = read_metrics_snapshot(model_name, latest_training_version)
             summary = read_prediction_summary(predict_month)
             drift_summary = summary.get("drift") if isinstance(summary.get("drift"), dict) else {}
             response_body = {
@@ -1475,6 +1611,7 @@ class AIMLApiService:
         model_file: Path,
         prediction_file: Path,
         checkpoint_dir: Path,
+        model_version: str,
         train_source_months: Any,
         validation_source_months: Any,
         prediction_source_months: Any,
@@ -1504,6 +1641,8 @@ class AIMLApiService:
                 str(prediction_file),
                 "--checkpoint-dir",
                 str(checkpoint_dir),
+                "--model-version",
+                str(model_version),
             ]
         else:
             command = [
@@ -1527,7 +1666,16 @@ class AIMLApiService:
                 command.extend(str(value) for value in values)
         return command
 
-    def _build_inference_command(self, *, source_month: str, predict_month: str, model_name: str) -> list[str]:
+    def _build_inference_command(
+        self,
+        *,
+        source_month: str,
+        predict_month: str,
+        model_name: str,
+        model_version: str,
+        model_file: Path,
+        metrics_file: Path,
+    ) -> list[str]:
         return [
             str(resolve_venv_python()),
             str(SCRIPTS_DIR / "run_monthly_inference_pipeline.py"),
@@ -1537,12 +1685,18 @@ class AIMLApiService:
             predict_month,
             "--model",
             model_name,
+            "--model-version",
+            model_version,
+            "--model-file",
+            str(model_file),
+            "--metrics-file",
+            str(metrics_file),
             "--feature-month-source",
             self.config.feature_month_source,
-            "--campaign-vertical",
-            self.config.campaign_vertical,
-            "--campaign-vendor",
-            self.config.campaign_vendor,
+            # "--campaign-vertical",
+            # self.config.campaign_vertical,
+            # "--campaign-vendor",
+            # self.config.campaign_vendor,
         ]
 
     def _build_export_command(self, *, source_month: str, predict_month: str, model_name: str) -> list[str]:

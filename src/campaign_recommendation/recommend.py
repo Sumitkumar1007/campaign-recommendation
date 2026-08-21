@@ -12,6 +12,7 @@ CHANNEL_LABELS = {
     "SMS": "SMS",
     "WHATSAPP": "WH",
     "VOICE": "IVR",
+    "VOICE_BOT": "VOICE_BOT",
 }
 
 @dataclass(frozen=True)

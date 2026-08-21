@@ -16,6 +16,7 @@ from sklearn.multioutput import MultiOutputClassifier
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
+from pipeline_common import DAY_COLUMNS, SCHEDULE_DAY_COLUMNS
 from project_paths import (
     METRICS_DIR,
     MODEL_DIR,
@@ -25,7 +26,6 @@ from project_paths import (
     ensure_parent_dir,
 )
 
-DAY_COLUMNS = ["D-5", "D-4", "D-3", "D-2", "D-1", "D+1", "D+2", "D+3", "D+4", "D+5"]
 NON_FEATURE_COLUMNS = DAY_COLUMNS + ["TARGET_MONTH", "TARGET_MONTH_PERIOD", "TARGET_RISK"]
 
 
@@ -391,12 +391,12 @@ def main() -> None:
         prediction_output = pd.concat([prediction_output, preds.reset_index(drop=True)], axis=1)
         prediction_output["D"] = "-"
         prediction_output = prediction_output[
-            ["RISK", "Loan_number", "SOURCE_MONTH_USED", "PREDICTION_MONTH", "D-5", "D-4", "D-3", "D-2", "D-1", "D", "D+1", "D+2", "D+3", "D+4", "D+5"]
+            ["RISK", "Loan_number", "SOURCE_MONTH_USED", "PREDICTION_MONTH", *SCHEDULE_DAY_COLUMNS]
         ]
         prediction_output.to_csv(versioned_prediction_file, index=False)
     else:
         pd.DataFrame(
-            columns=["RISK", "Loan_number", "SOURCE_MONTH_USED", "PREDICTION_MONTH", "D-5", "D-4", "D-3", "D-2", "D-1", "D", "D+1", "D+2", "D+3", "D+4", "D+5"]
+            columns=["RISK", "Loan_number", "SOURCE_MONTH_USED", "PREDICTION_MONTH", *SCHEDULE_DAY_COLUMNS]
         ).to_csv(versioned_prediction_file, index=False)
 
     copy_to_latest(source_path=versioned_prediction_file, latest_path=prediction_file)

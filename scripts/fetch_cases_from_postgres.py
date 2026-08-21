@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 from psycopg import sql
 
+from entity_keys import strategy_use_party_id
 from env_utils import load_dotenv
 from fetch_month_from_postgres import configured_prediction_month_from_emi_dates, resolve_scheduler_emi_dates
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
@@ -31,6 +32,16 @@ def parse_args() -> argparse.Namespace:
         "--table",
         default=os.getenv("CASES_TABLE", "digital_cases"),
         help="Source digital cases table.",
+    )
+    parser.add_argument(
+        "--vertical-column",
+        default=os.getenv("CASES_VERTICAL_COLUMN", "vertical"),
+        help="Source column name containing the business vertical for digital cases.",
+    )
+    parser.add_argument(
+        "--party-id-column",
+        default=os.getenv("CASES_PARTY_ID_COLUMN", "party_id"),
+        help="Optional source column name containing party_id for multi-loan history grouping.",
     )
     parser.add_argument(
         "--fetch-month",
@@ -130,21 +141,27 @@ def default_output_file(source_month: str) -> Path:
     return CASE_DATA_DIR / f"digital_cases_{month_token}.csv"
 
 
-def build_query(schema: str, table: str) -> sql.Composed:
+def build_query(schema: str, table: str, vertical_column: str, party_id_column: str | None = None) -> sql.Composed:
     table_ref = qualified_identifier(schema, table)
     where_sql = sql.SQL("d.emi_date = ANY(%(emi_dates)s)")
+    vertical_identifier = sql.Identifier(vertical_column)
+    if party_id_column:
+        party_id_select = sql.SQL('d.{} AS party_id').format(sql.Identifier(party_id_column))
+    else:
+        party_id_select = sql.SQL('NULL::TEXT AS party_id')
     return sql.SQL(
         """
         SELECT
             d.apac_card_number,
             d.risk,
-            d.vertical,
+            d.{vertical_column} AS vertical,
             d.outstanding_balance AS collectable_amount,
-            d.emi_date
+            d.emi_date,
+            {party_id_select}
         FROM {table_ref} d
         WHERE {where_sql}
         """
-    ).format(table_ref=table_ref, where_sql=where_sql)
+    ).format(table_ref=table_ref, where_sql=where_sql, vertical_column=vertical_identifier, party_id_select=party_id_select)
 
 
 def main() -> None:
@@ -157,7 +174,7 @@ def main() -> None:
         user=args.user,
         password=args.password,
     )
-    query = build_query(args.schema, args.table)
+    query = build_query(args.schema, args.table, args.vertical_column, args.party_id_column if strategy_use_party_id() else None)
 
     with connect_db(config) as conn:
         configured_emi_dates = resolve_scheduler_emi_dates(conn, schema=args.schema)

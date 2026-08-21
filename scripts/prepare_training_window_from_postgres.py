@@ -37,6 +37,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--password", default=os.getenv("PGPASSWORD"))
     parser.add_argument("--schema", default=os.getenv("SOURCE_SCHEMA", "digital_collections"))
     parser.add_argument("--table", default=os.getenv("SOURCE_TABLE", "communications"))
+    parser.add_argument(
+        "--vertical-column",
+        default=os.getenv("COMMUNICATION_VERTICAL_COLUMN", "vertical"),
+        help="Source column name containing the business vertical for communications.",
+    )
+    parser.add_argument(
+        "--party-id-column",
+        default=os.getenv("COMMUNICATION_PARTY_ID_COLUMN", "party_id"),
+        help="Optional source column name containing party_id for multi-loan history grouping.",
+    )
     parser.add_argument("--months", type=int, required=True, help="Requested historical source-month window for training.")
     parser.add_argument("--month-source", choices=["emi_date", "created_date"], default=os.getenv("FEATURE_MONTH_SOURCE", "emi_date"))
     parser.add_argument("--fetch-size", type=int, default=100_000)
@@ -92,14 +102,16 @@ def fetch_month_extracts(args: argparse.Namespace, logger: logging.Logger, month
         password=args.password,
     )
     files: list[Path] = []
-    query = build_query(args.schema, args.table)
+    query = build_query(args.schema, args.table, args.vertical_column, args.party_id_column if os.getenv("STRATEGY_USE_PARTY_ID", "false").strip().lower() in {"1", "true", "yes", "on"} else None)
     logger.info(
-        "Opening source DB connection for training extract | host=%s port=%s dbname=%s schema=%s table=%s months=%s",
+        "Opening source DB connection for training extract | host=%s port=%s dbname=%s schema=%s table=%s vertical_column=%s party_id_column=%s months=%s",
         args.host,
         args.port,
         args.dbname,
         args.schema,
         args.table,
+        args.vertical_column,
+        args.party_id_column,
         months,
     )
     with connect_db(config) as conn:
@@ -132,9 +144,9 @@ def fetch_month_extracts(args: argparse.Namespace, logger: logging.Logger, month
 
 
 def build_training_artifacts(input_files: list[Path], month_source: str, logger: logging.Logger) -> None:
-    training_output = TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"
-    schedule_output = SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv"
-    feature_output = FEATURE_DATA_DIR / "strategy_monthly_features.csv"
+    training_output = TRAINING_DATA_DIR / "strategy_training_dataset_train.csv"
+    schedule_output = SCHEDULE_DATA_DIR / "strategy_schedule_dataset_train.csv"
+    feature_output = FEATURE_DATA_DIR / "strategy_monthly_features_train.csv"
     with log_step(logger, "generate_strategy_dataset", input_files=','.join(str(path) for path in input_files)):
         run_python_script(
             "generate_strategy_dataset.py",
@@ -182,12 +194,14 @@ def main() -> None:
             password=args.password,
         )
         logger.info(
-            "Preparing training window | months=%s host=%s dbname=%s schema=%s table=%s month_source=%s",
+            "Preparing training window | months=%s host=%s dbname=%s schema=%s table=%s vertical_column=%s party_id_column=%s month_source=%s",
             args.months,
             args.host,
             args.dbname,
             args.schema,
             args.table,
+            args.vertical_column,
+            args.party_id_column,
             args.month_source,
         )
         logger.info("Connecting to source DB to resolve latest available source months")

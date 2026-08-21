@@ -5,8 +5,13 @@ from pathlib import Path
 import pandas as pd
 
 
-DAY_COLUMNS = ["D-5", "D-4", "D-3", "D-2", "D-1", "D+1", "D+2", "D+3", "D+4", "D+5"]
-NON_FEATURE_COLUMNS = DAY_COLUMNS + ["TARGET_MONTH", "TARGET_MONTH_PERIOD", "TARGET_RISK", "VERTICAL"]
+PREDUE_DAY_COLUMNS = [f"D-{day}" for day in range(5, 0, -1)]
+POSTDUE_DAY_COLUMNS = [f"D+{day}" for day in range(1, 21)]
+DAY_COLUMNS = [*PREDUE_DAY_COLUMNS, *POSTDUE_DAY_COLUMNS]
+SCHEDULE_DAY_COLUMNS = [*PREDUE_DAY_COLUMNS, "D", *POSTDUE_DAY_COLUMNS]
+DAY_WEIGHT_COLUMN_MAP = {day: f"{day}__WEIGHT" for day in DAY_COLUMNS}
+DAY_WEIGHT_COLUMNS = [DAY_WEIGHT_COLUMN_MAP[day] for day in DAY_COLUMNS]
+NON_FEATURE_COLUMNS = DAY_COLUMNS + DAY_WEIGHT_COLUMNS + ["TARGET_MONTH", "TARGET_MONTH_PERIOD", "TARGET_RISK", "VERTICAL"]
 RISK_TOP_K = {
     "LOW": 1,
     "MEDIUM": 2,
@@ -38,30 +43,31 @@ def build_rolling_feature_windows(
     history_window_months: int,
 ) -> pd.DataFrame:
     features = features.copy()
+    key_column = "ENTITY_KEY" if "ENTITY_KEY" in features.columns else "APAC_CARD_NUMBER"
     features["MONTH_PERIOD"] = month_to_period(features["MONTH"])
     features = features.dropna(subset=["MONTH_PERIOD"])
     features = (
-        features.sort_values(["APAC_CARD_NUMBER", "MONTH_PERIOD"])
-        .drop_duplicates(subset=["APAC_CARD_NUMBER", "MONTH_PERIOD"], keep="last")
+        features.sort_values([key_column, "MONTH_PERIOD"])
+        .drop_duplicates(subset=[key_column, "MONTH_PERIOD"], keep="last")
         .reset_index(drop=True)
     )
 
     numeric_columns = [
         col
         for col in features.columns
-        if col not in {"APAC_CARD_NUMBER", "MONTH", "RISK", "VERTICAL", "MONTH_PERIOD"}
+        if col not in {key_column, "MONTH", "RISK", "VERTICAL", "MONTH_PERIOD"}
     ]
     if features.empty:
-        return features[["APAC_CARD_NUMBER", "MONTH", *numeric_columns, "RISK"]].copy()
+        return features[[key_column, "MONTH", *numeric_columns, "RISK"]].copy()
 
     features[numeric_columns] = features[numeric_columns].fillna(0)
     rolled_numeric = (
-        features.groupby("APAC_CARD_NUMBER", sort=False)[numeric_columns]
+        features.groupby(key_column, sort=False)[numeric_columns]
         .rolling(window=history_window_months, min_periods=1)
         .sum()
         .reset_index(level=0, drop=True)
     )
-    rolled = features[["APAC_CARD_NUMBER", "MONTH_PERIOD"]].copy()
+    rolled = features[[key_column, "MONTH_PERIOD"]].copy()
     rolled[numeric_columns] = rolled_numeric[numeric_columns]
     rolled["MONTH"] = (
         rolled["MONTH_PERIOD"].dt.to_timestamp().dt.strftime("%b-%Y").str.upper()
@@ -69,8 +75,8 @@ def build_rolling_feature_windows(
     rolled["RISK"] = features["RISK"].fillna("UNKNOWN").astype(str).str.upper().values
     if "VERTICAL" in features.columns:
         rolled["VERTICAL"] = features["VERTICAL"].fillna("UNKNOWN").astype(str).str.upper().values
-        return rolled[["APAC_CARD_NUMBER", "MONTH", *numeric_columns, "RISK", "VERTICAL"]]
-    return rolled[["APAC_CARD_NUMBER", "MONTH", *numeric_columns, "RISK"]]
+        return rolled[[key_column, "MONTH", *numeric_columns, "RISK", "VERTICAL"]]
+    return rolled[[key_column, "MONTH", *numeric_columns, "RISK"]]
 
 
 def prepare_next_month_dataset(
@@ -81,6 +87,7 @@ def prepare_next_month_dataset(
 ) -> pd.DataFrame:
     features = pd.read_csv(feature_file).copy()
     schedule = pd.read_csv(schedule_file).copy()
+    key_column = "ENTITY_KEY" if "ENTITY_KEY" in features.columns or "ENTITY_KEY" in schedule.columns else "APAC_CARD_NUMBER"
     if history_window_months is not None:
         features = build_rolling_feature_windows(features, history_window_months)
 
@@ -91,24 +98,33 @@ def prepare_next_month_dataset(
 
     schedule["TARGET_MONTH"] = schedule["MONTH"]
     schedule["TARGET_MONTH_PERIOD"] = month_to_period(schedule["TARGET_MONTH"])
-    schedule = schedule.rename(
-        columns={
-            "Loan_number": "APAC_CARD_NUMBER",
-            "RISK": "TARGET_RISK",
-        }
-    )
+    if key_column == "ENTITY_KEY":
+        schedule = schedule.rename(columns={"RISK": "TARGET_RISK"})
+    else:
+        schedule = schedule.rename(columns={"Loan_number": key_column, "RISK": "TARGET_RISK"})
     schedule = schedule.drop(columns=["MONTH"])
+    for column in DAY_WEIGHT_COLUMNS:
+        if column not in schedule.columns:
+            schedule[column] = 1.0
 
     return features.merge(
         schedule[
-            ["APAC_CARD_NUMBER", "TARGET_MONTH", "TARGET_MONTH_PERIOD", "TARGET_RISK", *DAY_COLUMNS]
+            [
+                key_column,
+                "TARGET_MONTH",
+                "TARGET_MONTH_PERIOD",
+                "TARGET_RISK",
+                *DAY_COLUMNS,
+                *DAY_WEIGHT_COLUMNS,
+            ]
         ],
-        on=["APAC_CARD_NUMBER", "TARGET_MONTH_PERIOD"],
+        on=[key_column, "TARGET_MONTH_PERIOD"],
         how="left",
     )
 
 
 def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
+    active_key = "ENTITY_KEY" if "ENTITY_KEY" in df.columns else "APAC_CARD_NUMBER"
     feature_df = df.drop(columns=NON_FEATURE_COLUMNS, errors="ignore").copy()
     feature_df["RISK"] = feature_df["RISK"].fillna("UNKNOWN")
     feature_df["SOURCE_MONTH"] = feature_df["SOURCE_MONTH"].fillna("UNKNOWN")
@@ -117,7 +133,7 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
         columns=["SOURCE_MONTH", "RISK"],
         dummy_na=False,
     )
-    feature_df = feature_df.drop(columns=["APAC_CARD_NUMBER", "SOURCE_MONTH_PERIOD", "VERTICAL"], errors="ignore")
+    feature_df = feature_df.drop(columns=[active_key, "SOURCE_MONTH_PERIOD", "VERTICAL"], errors="ignore")
     return feature_df.fillna(0)
 
 
