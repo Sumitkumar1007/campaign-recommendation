@@ -67,6 +67,22 @@ def parse_args() -> argparse.Namespace:
         help="Current-month digital cases CSV used as full prediction base population.",
     )
     parser.add_argument(
+        "--prepared-dataset-file",
+        default=str(FEATURE_DATA_DIR / "strategy_model_input_inference.csv"),
+        help="Audit CSV containing the prepared inference model input after month-lag feature expansion.",
+    )
+    parser.add_argument(
+        "--daywise-prepared-dataset-file",
+        default=str(FEATURE_DATA_DIR / "strategy_model_input_inference_daywise.csv"),
+        help="Audit CSV showing one prepared inference input row per entity/source month/day.",
+    )
+    parser.add_argument(
+        "--model-input-audit-row-limit",
+        type=int,
+        default=100,
+        help="Number of base rows to expand in day-wise model-input audit files. Use 0 for all rows.",
+    )
+    parser.add_argument(
         "--log-file",
         default=None,
         help="Application log file. Defaults to artifacts/logs/catboost_inference.log.",
@@ -85,6 +101,67 @@ def parse_args() -> argparse.Namespace:
     if missing:
         parser.error("Missing required CLI args: " + ", ".join(missing))
     return args
+
+
+def write_inference_daywise_model_input_audit(
+    *,
+    output_file: Path,
+    prediction_rows: pd.DataFrame,
+    X_pred: pd.DataFrame,
+    prediction_output: pd.DataFrame,
+    output_key: str,
+    row_limit: int,
+    logger,
+) -> None:
+    audit_source = prediction_rows.copy()
+    feature_source = X_pred.copy()
+    prediction_source = prediction_output.copy()
+    if row_limit > 0:
+        audit_source = audit_source.head(row_limit).copy()
+        feature_source = feature_source.head(row_limit).copy()
+        prediction_source = prediction_source.head(row_limit).copy()
+
+    feature_columns = feature_source.columns.tolist()
+    records: list[dict[str, object]] = []
+    for row_position, (_, row) in enumerate(audit_source.iterrows()):
+        feature_values = feature_source.iloc[row_position].to_dict()
+        prediction_row = prediction_source.iloc[row_position]
+        for day in DAY_COLUMNS:
+            records.append(
+                {
+                    output_key: row.get(output_key),
+                    "SOURCE_MONTH": row.get("SOURCE_MONTH"),
+                    "PREDICTION_MONTH": prediction_row.get("MONTH"),
+                    "RISK": row.get("RISK"),
+                    "VERTICAL": row.get("VERTICAL"),
+                    "emi_date": row.get("emi_date"),
+                    "day": day,
+                    "predictedStrategy": prediction_row.get(day),
+                    **feature_values,
+                }
+            )
+
+    output_file = ensure_parent_dir(output_file)
+    output_columns = [
+        output_key,
+        "SOURCE_MONTH",
+        "PREDICTION_MONTH",
+        "RISK",
+        "VERTICAL",
+        "emi_date",
+        "day",
+        "predictedStrategy",
+        *feature_columns,
+    ]
+    pd.DataFrame(records).reindex(columns=output_columns).to_csv(output_file, index=False)
+    logger.info(
+        "Saved day-wise inference model input audit | path=%s rows=%s source_rows=%s expanded_days=%s feature_columns=%s",
+        output_file,
+        len(records),
+        len(audit_source),
+        len(DAY_COLUMNS),
+        len(feature_columns),
+    )
 
 
 def _normalize_text(series: pd.Series, default: str = "UNKNOWN") -> pd.Series:
@@ -471,6 +548,16 @@ def main() -> None:
                     fill_value=0,
                 )
                 logger.info("Prediction matrix | shape=%s", X_pred.shape)
+                prepared_dataset_file = ensure_parent_dir(args.prepared_dataset_file)
+                inference_model_input = prediction_rows[[output_key, "SOURCE_MONTH", "RISK", "VERTICAL", "emi_date"]].copy()
+                inference_model_input = pd.concat([inference_model_input.reset_index(drop=True), X_pred.reset_index(drop=True)], axis=1)
+                inference_model_input.to_csv(prepared_dataset_file, index=False)
+                logger.info(
+                    "Saved actual inference model input dataset | path=%s rows=%s columns=%s",
+                    prepared_dataset_file,
+                    len(inference_model_input),
+                    len(inference_model_input.columns),
+                )
 
             with log_step(logger, "predict_day_columns", rows=len(X_pred)):
                 prediction_output = prediction_rows[[output_key, "SOURCE_MONTH", "RISK", "VERTICAL", "emi_date"]].copy()
@@ -507,6 +594,15 @@ def main() -> None:
                     )
                     for row_idx in range(len(prediction_output))
                 ]
+                write_inference_daywise_model_input_audit(
+                    output_file=Path(args.daywise_prepared_dataset_file),
+                    prediction_rows=prediction_rows,
+                    X_pred=X_pred,
+                    prediction_output=prediction_output,
+                    output_key=output_key,
+                    row_limit=args.model_input_audit_row_limit,
+                    logger=logger,
+                )
                 prediction_outputs.append(prediction_output)
 
         if not blank_rows.empty:

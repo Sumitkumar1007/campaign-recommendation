@@ -57,26 +57,33 @@ def build_rolling_feature_windows(
         for col in features.columns
         if col not in {key_column, "MONTH", "RISK", "VERTICAL", "MONTH_PERIOD"}
     ]
+    lag_columns = [
+        f"{column}_M{lag}"
+        for column in numeric_columns
+        for lag in range(1, history_window_months + 1)
+    ]
     if features.empty:
-        return features[[key_column, "MONTH", *numeric_columns, "RISK"]].copy()
+        base_columns = [key_column, "MONTH", *lag_columns, "RISK"]
+        if "VERTICAL" in features.columns:
+            base_columns.append("VERTICAL")
+        return pd.DataFrame(columns=base_columns)
 
     features[numeric_columns] = features[numeric_columns].fillna(0)
-    rolled_numeric = (
-        features.groupby(key_column, sort=False)[numeric_columns]
-        .rolling(window=history_window_months, min_periods=1)
-        .sum()
-        .reset_index(level=0, drop=True)
-    )
-    rolled = features[[key_column, "MONTH_PERIOD"]].copy()
-    rolled[numeric_columns] = rolled_numeric[numeric_columns]
+    lagged_parts = [features[[key_column, "MONTH_PERIOD"]].copy()]
+    for lag in range(1, history_window_months + 1):
+        shifted = features.groupby(key_column, sort=False)[numeric_columns].shift(lag - 1)
+        lagged_parts.append(shifted.add_suffix(f"_M{lag}"))
+
+    rolled = pd.concat(lagged_parts, axis=1)
     rolled["MONTH"] = (
         rolled["MONTH_PERIOD"].dt.to_timestamp().dt.strftime("%b-%Y").str.upper()
     )
     rolled["RISK"] = features["RISK"].fillna("UNKNOWN").astype(str).str.upper().values
+    rolled[lag_columns] = rolled[lag_columns].fillna(0)
     if "VERTICAL" in features.columns:
         rolled["VERTICAL"] = features["VERTICAL"].fillna("UNKNOWN").astype(str).str.upper().values
-        return rolled[[key_column, "MONTH", *numeric_columns, "RISK", "VERTICAL"]]
-    return rolled[[key_column, "MONTH", *numeric_columns, "RISK"]]
+        return rolled[[key_column, "MONTH", *lag_columns, "RISK", "VERTICAL"]]
+    return rolled[[key_column, "MONTH", *lag_columns, "RISK"]]
 
 
 def prepare_next_month_dataset(

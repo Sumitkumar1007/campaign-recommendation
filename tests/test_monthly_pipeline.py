@@ -241,7 +241,7 @@ def test_selected_history_files_ignores_noncanonical_matches(tmp_path: Path, mon
     assert selected_history_files("2026-04", latest) == [feb, mar, latest]
 
 
-def test_rolling_feature_window_sums_latest_account_history() -> None:
+def test_rolling_feature_window_keeps_month_wise_lag_history() -> None:
     features = pd.DataFrame(
         {
             "APAC_CARD_NUMBER": ["A1", "A1", "A1"],
@@ -255,12 +255,20 @@ def test_rolling_feature_window_sums_latest_account_history() -> None:
     )
 
     rolled = build_rolling_feature_windows(features, history_window_months=2)
+    january = rolled[rolled["MONTH"] == "JAN-2026"].iloc[0]
     march = rolled[rolled["MONTH"] == "MAR-2026"].iloc[0]
 
-    assert march["SMS_TOTAL_INTENSITY"] == 6
-    assert march["WH_TOTAL_INTENSITY"] == 2
-    assert march["SMS_SUCCESS_9AM_ENGLISH"] == 2
+    assert january["SMS_TOTAL_INTENSITY_M1"] == 1
+    assert january["SMS_TOTAL_INTENSITY_M2"] == 0
+    assert march["SMS_TOTAL_INTENSITY_M1"] == 4
+    assert march["SMS_TOTAL_INTENSITY_M2"] == 2
+    assert march["WH_TOTAL_INTENSITY_M1"] == 1
+    assert march["WH_TOTAL_INTENSITY_M2"] == 1
+    assert march["SMS_SUCCESS_9AM_ENGLISH_M1"] == 2
+    assert march["SMS_SUCCESS_9AM_ENGLISH_M2"] == 0
     assert march["RISK"] == "LOW"
+
+
 
 
 def test_process_chunk_uses_risk_from_communications_and_emi_month() -> None:

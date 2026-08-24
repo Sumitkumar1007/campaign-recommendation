@@ -90,6 +90,22 @@ def parse_args() -> argparse.Namespace:
         help="Number of latest source months to roll into each account feature row.",
     )
     parser.add_argument(
+        "--prepared-dataset-file",
+        default=str(FEATURE_DATA_DIR / "strategy_model_input_train.csv"),
+        help="Audit CSV containing the prepared model input after month-lag feature expansion.",
+    )
+    parser.add_argument(
+        "--daywise-prepared-dataset-file",
+        default=str(FEATURE_DATA_DIR / "strategy_model_input_train_daywise.csv"),
+        help="Audit CSV showing one prepared training input row per entity/source month/day.",
+    )
+    parser.add_argument(
+        "--model-input-audit-row-limit",
+        type=int,
+        default=100,
+        help="Number of base rows to expand in day-wise model-input audit files. Use 0 for all rows.",
+    )
+    parser.add_argument(
         "--train-source-months",
         nargs="*",
         default=[],
@@ -453,6 +469,63 @@ def versioned_checkpoint_dir(base_dir: Path, model_version: str) -> Path:
     return base_dir.parent / f"{base_dir.name}_{token}"
 
 
+def write_training_daywise_model_input_audit(
+    *,
+    output_file: Path,
+    train_df: pd.DataFrame,
+    X_train: pd.DataFrame,
+    row_limit: int,
+    logger: logging.Logger,
+) -> None:
+    audit_source = train_df.copy()
+    feature_source = X_train.copy()
+    if row_limit > 0:
+        audit_source = audit_source.head(row_limit).copy()
+        feature_source = feature_source.head(row_limit).copy()
+
+    key_column = "APAC_CARD_NUMBER" if "APAC_CARD_NUMBER" in audit_source.columns else "ENTITY_KEY"
+    feature_columns = feature_source.columns.tolist()
+    records: list[dict[str, object]] = []
+    for row_position, (_, row) in enumerate(audit_source.iterrows()):
+        feature_values = feature_source.iloc[row_position].to_dict()
+        for day in DAY_COLUMNS:
+            records.append(
+                {
+                    key_column: row.get(key_column),
+                    "SOURCE_MONTH": row.get("SOURCE_MONTH"),
+                    "TARGET_MONTH": row.get("TARGET_MONTH"),
+                    "RISK": row.get("RISK"),
+                    "VERTICAL": row.get("VERTICAL"),
+                    "day": day,
+                    "targetStrategy": row.get(day),
+                    "dayWeight": row.get(DAY_WEIGHT_COLUMN_MAP[day], 1.0),
+                    **feature_values,
+                }
+            )
+
+    output_file = ensure_parent_dir(output_file)
+    output_columns = [
+        key_column,
+        "SOURCE_MONTH",
+        "TARGET_MONTH",
+        "RISK",
+        "VERTICAL",
+        "day",
+        "targetStrategy",
+        "dayWeight",
+        *feature_columns,
+    ]
+    pd.DataFrame(records).reindex(columns=output_columns).to_csv(output_file, index=False)
+    logger.info(
+        "Saved day-wise training model input audit | path=%s rows=%s source_rows=%s expanded_days=%s feature_columns=%s",
+        output_file,
+        len(records),
+        len(audit_source),
+        len(DAY_COLUMNS),
+        len(feature_columns),
+    )
+
+
 def main() -> None:
     load_dotenv(override=True)
     args = parse_args()
@@ -543,6 +616,23 @@ def main() -> None:
                 validation_df["SOURCE_MONTH"].value_counts(sort=False).to_dict(),
                 test_df["SOURCE_MONTH"].value_counts(sort=False).to_dict(),
                 prediction_df["SOURCE_MONTH"].value_counts(sort=False).to_dict(),
+            )
+            prepared_dataset_file = ensure_parent_dir(args.prepared_dataset_file)
+            train_df.to_csv(prepared_dataset_file, index=False)
+            logger.info(
+                "Saved actual training model dataset | path=%s rows=%s columns=%s day_target_rows=%s weight_rows=%s",
+                prepared_dataset_file,
+                len(train_df),
+                len(train_df.columns),
+                int(train_df[DAY_COLUMNS].notna().any(axis=1).sum()),
+                int(train_df[DAY_WEIGHT_COLUMN_MAP.values()].notna().any(axis=1).sum()),
+            )
+            write_training_daywise_model_input_audit(
+                output_file=Path(args.daywise_prepared_dataset_file),
+                train_df=train_df,
+                X_train=X_train,
+                row_limit=args.model_input_audit_row_limit,
+                logger=logger,
             )
 
         if len(train_df) < 2:
