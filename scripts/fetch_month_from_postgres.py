@@ -240,6 +240,7 @@ def build_query(schema: str, table: str, vertical_column: str, party_id_column: 
                 src.verbiage_language,
                 src.{vertical_column} AS vertical,
                 src.risk,
+                src.disposition,
                 {party_id_select},
                 {parsed_emi_date} AS emi_date,
                 EXTRACT(HOUR FROM date_trunc('hour', src.created_date)) AS hr,
@@ -257,6 +258,7 @@ def build_query(schema: str, table: str, vertical_column: str, party_id_column: 
             verbiage_language,
             vertical,
             risk,
+            disposition,
             party_id,
             emi_date,
             hr,
@@ -266,6 +268,9 @@ def build_query(schema: str, table: str, vertical_column: str, party_id_column: 
             last_modified_date
         FROM parsed
         WHERE emi_date = ANY(%(emi_dates)s)
+            AND LOWER(apac_card_number) NOT LIKE '%%test%%'
+            AND apac_card_number NOT LIKE 'PRVCMP%%'
+            AND apac_card_number <> '1234'
         """
     ).format(
         table_ref=table_ref,

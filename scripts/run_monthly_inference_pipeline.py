@@ -852,8 +852,6 @@ def _parse_strategy(strategy: str) -> tuple[str, str, str] | None:
     if mode is None:
         return None
     normalized_language = language.upper().strip()
-    if normalized_language == "REGIONAL":
-        return None
     return mode, _format_scheduler_hour(hour_label), normalized_language
 
 

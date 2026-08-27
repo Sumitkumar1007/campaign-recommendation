@@ -577,7 +577,7 @@ def test_build_campaign_mappings_includes_business_readable_reason(tmp_path: Pat
     assert "early reminder" in mappings.loc[0, "prediction_reason"]
 
 
-def test_build_campaign_recommendations_skips_regional_language(tmp_path: Path) -> None:
+def test_build_campaign_recommendations_includes_regional_language(tmp_path: Path) -> None:
     prediction_file = tmp_path / "predictions.csv"
     pd.DataFrame(
         {
@@ -612,9 +612,9 @@ def test_build_campaign_recommendations_skips_regional_language(tmp_path: Path) 
     )
 
     assert "PREDUE_AIML_SMS_LAP_HINDI_HR_5TH_PRUTECH_080426" in set(output["name"])
-    assert not any("REGIONAL" in name for name in output["name"])
-    assert not any(output["template_name"].str.contains("REGIONAL", na=False))
-    assert not any(output["dataset_name"].str.contains("REGIONAL", na=False))
+    assert any("REGIONAL" in name for name in output["name"])
+    assert any(output["template_name"].str.contains("REGIONAL", na=False))
+    assert any(output["dataset_name"].str.contains("REGIONAL", na=False))
 
 
 def test_build_feature_matrix_removes_identifiers_and_one_hot_encodes() -> None:
