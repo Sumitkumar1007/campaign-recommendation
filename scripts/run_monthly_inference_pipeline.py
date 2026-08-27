@@ -2799,6 +2799,30 @@ def main() -> None:
                     str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv"),
                     logger=logger,
                 )
+            cold_start_output_file = CASE_DATA_DIR / f"new_customer_fallbacks_{args.predict_month.replace('-', '_')}.csv"
+            training_schedule_file = SCHEDULE_DATA_DIR / "strategy_schedule_dataset_train.csv"
+            fallback_schedule_file = training_schedule_file if training_schedule_file.exists() else SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv"
+            with log_step(
+                logger,
+                "apply_new_customer_fallbacks",
+                prediction_file=prediction_file,
+                output_file=cold_start_output_file,
+                schedule_file=fallback_schedule_file,
+            ):
+                run_python_script(
+                    "identify_new_customer_fallbacks.py",
+                    "--cases-file",
+                    str(source_cases_file),
+                    "--communication-files",
+                    *[str(path) for path in history_files],
+                    "--schedule-file",
+                    str(fallback_schedule_file),
+                    "--output-file",
+                    str(cold_start_output_file),
+                    "--prediction-file",
+                    str(prediction_file),
+                    logger=logger,
+                )
             with log_step(
                 logger,
                 "build_prediction_evidence",

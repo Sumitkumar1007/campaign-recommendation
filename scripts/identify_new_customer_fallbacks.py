@@ -37,6 +37,11 @@ def parse_args() -> argparse.Namespace:
         default=str(CASE_DATA_DIR / "new_customer_low_risk_fallbacks.csv"),
         help="Output CSV for new-customer fallback recommendations.",
     )
+    parser.add_argument(
+        "--prediction-file",
+        default="",
+        help="Optional prediction CSV to update in-place for new APACs.",
+    )
     return parser.parse_args()
 
 
@@ -144,6 +149,47 @@ def build_fallback_rows(new_cases: pd.DataFrame, fallback_by_risk: dict[str, dic
     return pd.DataFrame(records)
 
 
+def apply_fallbacks_to_prediction_file(prediction_file: Path, fallback_rows: pd.DataFrame) -> int:
+    if not prediction_file.exists() or fallback_rows.empty:
+        return 0
+    predictions = pd.read_csv(prediction_file, dtype=str).fillna("")
+    if "Loan_number" not in predictions.columns:
+        raise ValueError("Prediction file must contain Loan_number column.")
+
+    fallback_map: dict[tuple[str, str], str] = {
+        (str(row.apacCardNumber).strip(), str(row.day).strip()): str(row.recommendedStrategy).strip() or "-"
+        for row in fallback_rows.itertuples(index=False)
+    }
+    risk_map: dict[str, str] = {
+        str(row.apacCardNumber).strip(): str(row.fallbackRiskUsed).strip().upper() or "LOW"
+        for row in fallback_rows.itertuples(index=False)
+    }
+    reason_map: dict[str, str] = {
+        str(row.apacCardNumber).strip(): str(row.reason).strip()
+        for row in fallback_rows.itertuples(index=False)
+    }
+
+    updated = 0
+    for idx, row in predictions.iterrows():
+        loan = str(row.get("Loan_number", "")).strip()
+        if loan not in risk_map:
+            continue
+        if "SOURCE_RISK" in predictions.columns:
+            predictions.at[idx, "SOURCE_RISK"] = risk_map[loan]
+        for day in DAY_COLUMNS:
+            if day in predictions.columns:
+                predictions.at[idx, day] = fallback_map.get((loan, day), "-")
+        if "D" in predictions.columns:
+            predictions.at[idx, "D"] = "-"
+        if "PREDICTION_REASON" in predictions.columns:
+            predictions.at[idx, "PREDICTION_REASON"] = reason_map[loan]
+        updated += 1
+
+    if updated:
+        predictions.to_csv(prediction_file, index=False)
+    return updated
+
+
 def main() -> None:
     args = parse_args()
     cases_file = Path(args.cases_file)
@@ -156,11 +202,13 @@ def main() -> None:
     fallback_by_risk = build_average_strategy_by_risk(Path(args.schedule_file))
     output = build_fallback_rows(new_cases, fallback_by_risk)
     output.to_csv(output_file, index=False)
+    updated_predictions = apply_fallbacks_to_prediction_file(Path(args.prediction_file), output) if args.prediction_file else 0
 
     print(
         "New customer fallback summary | "
         f"cases={len(case_apacs)} history_apacs={len(history_apacs)} "
-        f"new_cases={len(new_cases)} output_rows={len(output)} output_file={output_file}"
+        f"new_cases={len(new_cases)} output_rows={len(output)} output_file={output_file} "
+        f"updated_predictions={updated_predictions}"
     )
 
 
