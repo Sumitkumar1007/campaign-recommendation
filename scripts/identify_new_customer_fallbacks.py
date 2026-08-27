@@ -91,37 +91,53 @@ def most_common_strategy(values: pd.Series) -> str:
     return str(normalized.value_counts().sort_values(ascending=False).index[0])
 
 
-def build_low_risk_average_strategy(schedule_file: Path) -> dict[str, str]:
+def build_average_strategy_by_risk(schedule_file: Path) -> dict[str, dict[str, str]]:
     schedule = pd.read_csv(schedule_file, dtype=str)
-    if "RISK" in schedule.columns:
-        low_risk = schedule[schedule["RISK"].fillna("").astype(str).str.upper().str.strip().eq("LOW")]
-    else:
-        low_risk = schedule.iloc[0:0]
+    if "RISK" not in schedule.columns:
+        return {
+            "LOW": {
+                day: most_common_strategy(schedule[day]) if day in schedule.columns else "-"
+                for day in DAY_COLUMNS
+            }
+        }
 
-    source = low_risk if not low_risk.empty else schedule
-    return {
-        day: most_common_strategy(source[day]) if day in source.columns else "-"
-        for day in DAY_COLUMNS
-    }
+    schedule["_RISK"] = schedule["RISK"].fillna("").astype(str).str.upper().str.strip()
+    average_by_risk: dict[str, dict[str, str]] = {}
+    for risk, risk_df in schedule.groupby("_RISK", sort=False):
+        if not risk:
+            continue
+        average_by_risk[risk] = {
+            day: most_common_strategy(risk_df[day]) if day in risk_df.columns else "-"
+            for day in DAY_COLUMNS
+        }
+
+    if "LOW" not in average_by_risk:
+        average_by_risk["LOW"] = {
+            day: most_common_strategy(schedule[day]) if day in schedule.columns else "-"
+            for day in DAY_COLUMNS
+        }
+    return average_by_risk
 
 
-def build_fallback_rows(new_cases: pd.DataFrame, fallback_by_day: dict[str, str]) -> pd.DataFrame:
+def build_fallback_rows(new_cases: pd.DataFrame, fallback_by_risk: dict[str, dict[str, str]]) -> pd.DataFrame:
     records: list[dict[str, str]] = []
     for case in new_cases.to_dict("records"):
+        risk = str(case.get("originalRisk", "")).strip().upper() or "LOW"
+        fallback_by_day = fallback_by_risk.get(risk) or fallback_by_risk.get("LOW", {})
         for day in DAY_COLUMNS:
             strategy = fallback_by_day.get(day, "-")
             records.append(
                 {
                     "apacCardNumber": case["apacCardNumber"],
                     "originalRisk": case.get("originalRisk", ""),
-                    "fallbackRiskUsed": "LOW",
+                    "fallbackRiskUsed": risk,
                     "vertical": case.get("vertical", ""),
                     "day": day,
                     "recommendedStrategy": strategy,
                     "isActionable": "false" if strategy == "-" else "true",
                     "reason": (
                         "No communication history found for this APAC. "
-                        "LOW-risk average historical strategy is used as cold-start fallback."
+                        f"{risk}-risk average historical strategy is used as cold-start fallback."
                     ),
                 }
             )
@@ -137,8 +153,8 @@ def main() -> None:
     case_apacs = load_case_apacs(cases_file)
     history_apacs = load_history_apacs(communication_files)
     new_cases = case_apacs[~case_apacs["apacCardNumber"].isin(history_apacs)].copy()
-    fallback_by_day = build_low_risk_average_strategy(Path(args.schedule_file))
-    output = build_fallback_rows(new_cases, fallback_by_day)
+    fallback_by_risk = build_average_strategy_by_risk(Path(args.schedule_file))
+    output = build_fallback_rows(new_cases, fallback_by_risk)
     output.to_csv(output_file, index=False)
 
     print(
