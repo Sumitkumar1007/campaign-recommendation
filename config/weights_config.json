@@ -1,0 +1,81 @@
+{
+  "description": "Strategy feature weighting config. Scores are used only when STRATEGY_USE_STATUS_WEIGHTS=true.",
+  "normalization": {
+    "method": "min_max_scale",
+    "source_min": 1.3,
+    "source_max": 3.0,
+    "target_min": 0.4,
+    "target_max": 1.0,
+    "formula": "normalized = target_min + ((raw - source_min) / (source_max - source_min)) * (target_max - target_min)"
+  },
+  "success_statuses": {
+    "SMS": [
+      "DELIVERED",
+      "READ",
+      "CLICKED"
+    ],
+    "WHATSAPP": [
+      "DELIVERED",
+      "READ",
+      "CLICKED"
+    ],
+    "VOICE": [
+      "CONNECTED",
+      "CALL_CONNECTED"
+    ],
+    "VOICE_BOT": [
+      "CONNECTED",
+      "CALL_CONNECTED"
+    ]
+  },
+  "strategy_success_scores": {
+    "SMS": {
+      "DELIVERED": 0.4,
+      "READ": 0.8,
+      "CLICKED": 1.0
+    },
+    "WHATSAPP": {
+      "DELIVERED": 0.4,
+      "READ": 0.8,
+      "CLICKED": 1.0
+    },
+    "VOICE": {
+      "CONNECTED": 1.0,
+      "CALL_CONNECTED": 1.0
+    },
+    "VOICE_BOT": {
+      "CONNECTED": 1.0,
+      "CALL_CONNECTED": 1.0
+    }
+  },
+  "voice_bot_disposition_success_scores_raw": {
+    "Already_Paid": 3.0,
+    "EMI ALREADY PAID": 3.0,
+    "PAYMENT ALREADY DONE": 3.0,
+    "Partial_Payment_Paid": 2.5,
+    "Payment_Committed": 2.2,
+    "Promise_to_Pay": 2.0,
+    "FULL PAYMENT WILL BE DONE": 2.0,
+    "PARTIAL PAYMENT WILL BE DONE": 1.8,
+    "Partial_Payment_Agreed": 1.8,
+    "Partial_Payment_Arranged": 1.8,
+    "PAYMENT DATE SHARED": 1.5,
+    "HAVE FUNDS IN ACCOUNT": 1.4,
+    "WILL HAVE FUNDS IN ACCOUNT": 1.3
+  },
+  "voice_bot_disposition_success_scores": {
+    "Already_Paid": 1.0,
+    "EMI ALREADY PAID": 1.0,
+    "PAYMENT ALREADY DONE": 1.0,
+    "Partial_Payment_Paid": 0.82,
+    "Payment_Committed": 0.72,
+    "Promise_to_Pay": 0.65,
+    "FULL PAYMENT WILL BE DONE": 0.65,
+    "PARTIAL PAYMENT WILL BE DONE": 0.58,
+    "Partial_Payment_Agreed": 0.58,
+    "Partial_Payment_Arranged": 0.58,
+    "PAYMENT DATE SHARED": 0.47,
+    "HAVE FUNDS IN ACCOUNT": 0.44,
+    "WILL HAVE FUNDS IN ACCOUNT": 0.4
+  }
+}

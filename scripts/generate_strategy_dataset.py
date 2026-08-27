@@ -41,11 +41,14 @@ SUCCESS_STATUS_MAP = {
 }
 
 DEFAULT_SUCCESS_SCORES = {
-    "SMS": {"SENT": 0.5, "DELIVERED": 1.0, "CLICKED": 2.0},
-    "WH": {"SENT": 0.5, "DELIVERED": 1.0, "READ": 1.5, "CLICKED": 2.0},
+    "SMS": {"DELIVERED": 0.4, "READ": 0.8, "CLICKED": 1.0},
+    "WH": {"DELIVERED": 0.4, "READ": 0.8, "CLICKED": 1.0},
     "VOICE": {"CONNECTED": 1.0, "CALL_CONNECTED": 1.0},
     "VOICE_BOT": {"CONNECTED": 1.0, "CALL_CONNECTED": 1.0},
 }
+
+DEFAULT_VOICE_BOT_DISPOSITION_SCORES: dict[str, float] = {}
+WEIGHTS_CONFIG_FILE = REPO_ROOT / "config" / "weights_config.json"
 
 TARGET_SAMPLE_WEIGHT_COLUMN = "TARGET_SAMPLE_WEIGHT"
 
@@ -54,6 +57,7 @@ USECOLS = [
     "party_id",
     "comm_status",
     "communication_type",
+    "disposition",
     "verbiage_language",
     "vertical",
     "risk",
@@ -70,21 +74,48 @@ def env_flag(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def load_weight_config() -> tuple[bool, dict[str, dict[str, float]], float]:
+def normalize_config_key(value: object) -> str:
+    return " ".join(str(value or "").replace("_", " ").upper().split())
+
+
+def normalize_channel_key(value: object) -> str:
+    raw = str(value or "").strip().upper()
+    return COMM_TYPE_MAP.get(raw, raw)
+
+
+def load_weight_config() -> tuple[bool, dict[str, set[str]], dict[str, dict[str, float]], dict[str, float], float, Path]:
     enabled = env_flag("STRATEGY_USE_STATUS_WEIGHTS", default=False)
-    raw_scores = os.getenv("STRATEGY_SUCCESS_SCORES_JSON", "").strip()
+    config_file = Path(os.getenv("STRATEGY_WEIGHTS_CONFIG_FILE", str(WEIGHTS_CONFIG_FILE))).expanduser()
+    success_status_map = {channel: set(statuses) for channel, statuses in SUCCESS_STATUS_MAP.items()}
     score_map = DEFAULT_SUCCESS_SCORES
-    if raw_scores:
-        parsed = json.loads(raw_scores)
-        score_map = {
-            str(channel).upper(): {
-                str(status).upper(): float(score)
-                for status, score in statuses.items()
+    disposition_scores = DEFAULT_VOICE_BOT_DISPOSITION_SCORES
+
+    if config_file.exists():
+        parsed = json.loads(config_file.read_text())
+        raw_statuses = parsed.get("success_statuses", {})
+        if raw_statuses:
+            success_status_map = {
+                normalize_channel_key(channel): {str(status).upper().strip() for status in statuses}
+                for channel, statuses in raw_statuses.items()
             }
-            for channel, statuses in parsed.items()
-        }
+        raw_scores = parsed.get("strategy_success_scores", {})
+        if raw_scores:
+            score_map = {
+                normalize_channel_key(channel): {
+                    str(status).upper().strip(): float(score)
+                    for status, score in statuses.items()
+                }
+                for channel, statuses in raw_scores.items()
+            }
+        raw_disposition_scores = parsed.get("voice_bot_disposition_success_scores", {})
+        if raw_disposition_scores:
+            disposition_scores = {
+                normalize_config_key(disposition): float(score)
+                for disposition, score in raw_disposition_scores.items()
+            }
+
     positive_boost = float(os.getenv("STRATEGY_SAMPLE_WEIGHT_POSITIVE_BOOST", "1.0"))
-    return enabled, score_map, positive_boost
+    return enabled, success_status_map, score_map, disposition_scores, positive_boost, config_file
 
 
 def parse_args() -> argparse.Namespace:
@@ -232,7 +263,9 @@ def process_chunk(
     month_source: str = "emi_date",
     send_hour_window: dict[str, int] | None = None,
     weighting_enabled: bool = False,
+    success_statuses: dict[str, set[str]] | None = None,
     success_scores: dict[str, dict[str, float]] | None = None,
+    voice_bot_disposition_scores: dict[str, float] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df = chunk.copy()
     if "risk" not in df.columns:
@@ -246,6 +279,7 @@ def process_chunk(
             return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     df["COMM_TYPE"] = normalize_comm_type(df["communication_type"])
     df["STATUS"] = normalize_status(df["comm_status"])
+    df["DISPOSITION"] = df["disposition"].map(normalize_config_key) if "disposition" in df.columns else ""
     df["LANGUAGE"] = normalize_language(df["verbiage_language"])
     df["VERTICAL"] = normalize_vertical(df["vertical"]) if "vertical" in df.columns else "UNKNOWN"
     df["RISK"] = normalize_risk(df["risk"])
@@ -273,27 +307,34 @@ def process_chunk(
     month_dates = df["emi_date"] if month_source == "emi_date" else created_ts.dt.normalize()
     df["MONTH"] = month_dates.dt.strftime("%b-%Y").str.upper()
     df["DAY"] = df["offset"].map(day_label)
-    df["IS_SUCCESS"] = df.apply(
-        lambda row: row["STATUS"] in SUCCESS_STATUS_MAP[row["COMM_TYPE"]],
-        axis=1,
-    )
+    status_lookup = success_statuses or SUCCESS_STATUS_MAP
+    disposition_lookup = voice_bot_disposition_scores or {}
+
+    def is_success(row: pd.Series) -> bool:
+        connected_success = row["STATUS"] in status_lookup.get(row["COMM_TYPE"], set())
+        if weighting_enabled and row["COMM_TYPE"] == "VOICE_BOT" and disposition_lookup:
+            return connected_success and row["DISPOSITION"] in disposition_lookup
+        return connected_success
+
+    df["IS_SUCCESS"] = df.apply(is_success, axis=1)
     score_lookup = {
-        str(channel).upper(): {
-            str(status).upper(): float(score)
+        normalize_channel_key(channel): {
+            str(status).upper().strip(): float(score)
             for status, score in statuses.items()
         }
         for channel, statuses in (success_scores or {}).items()
     }
-    if weighting_enabled:
-        df["SUCCESS_SCORE"] = df.apply(
-            lambda row: score_lookup.get(row["COMM_TYPE"], {}).get(
-                row["STATUS"],
-                1.0 if row["IS_SUCCESS"] else 0.0,
-            ),
-            axis=1,
-        )
-    else:
-        df["SUCCESS_SCORE"] = df["IS_SUCCESS"].astype(float)
+
+    def success_score(row: pd.Series) -> float:
+        if not row["IS_SUCCESS"]:
+            return 0.0
+        if not weighting_enabled:
+            return 1.0
+        if row["COMM_TYPE"] == "VOICE_BOT" and disposition_lookup:
+            return float(disposition_lookup.get(row["DISPOSITION"], 0.0))
+        return float(score_lookup.get(row["COMM_TYPE"], {}).get(row["STATUS"], 1.0))
+
+    df["SUCCESS_SCORE"] = df.apply(success_score, axis=1)
 
     totals = (
         df.groupby([key_col, "MONTH", "DAY", "COMM_TYPE"], sort=False)
@@ -484,7 +525,7 @@ def build_dataset(
     month_source: str = "emi_date",
     send_hour_window: dict[str, int] | None = None,
 ) -> None:
-    weighting_enabled, success_scores, positive_boost = load_weight_config()
+    weighting_enabled, success_statuses, success_scores, voice_bot_disposition_scores, positive_boost, weights_config_file = load_weight_config()
     output_file = ensure_parent_dir(output_file)
     exclude_tokens = {token.upper() for token in (exclude_months or [])}
     if input_files:
@@ -510,7 +551,12 @@ def build_dataset(
 
     for csv_file in csv_files:
         print(f"Processing {csv_file.name} ...")
-        for chunk in pd.read_csv(csv_file, usecols=USECOLS, chunksize=chunksize):
+        header_columns = pd.read_csv(csv_file, nrows=0).columns.tolist()
+        available_usecols = [column for column in USECOLS if column in header_columns]
+        for chunk in pd.read_csv(csv_file, usecols=available_usecols, chunksize=chunksize):
+            for column in USECOLS:
+                if column not in chunk.columns:
+                    chunk[column] = ""
             merge_audit_counts(audit_counts, summarize_chunk_audit(chunk, sample_cards=sample_cards))
             feature_counts, strategy_counts, risk_counts = process_chunk(
                 chunk,
@@ -518,7 +564,9 @@ def build_dataset(
                 month_source=month_source,
                 send_hour_window=send_hour_window,
                 weighting_enabled=weighting_enabled,
+                success_statuses=success_statuses,
                 success_scores=success_scores,
+                voice_bot_disposition_scores=voice_bot_disposition_scores,
             )
             if not feature_counts.empty:
                 feature_parts.append(feature_counts)
@@ -657,7 +705,9 @@ def build_dataset(
             {
                 "enabled": weighting_enabled,
                 "positive_boost": positive_boost,
+                "weights_config_file": str(weights_config_file),
                 "weighted_status_channels": sorted(success_scores),
+                "voice_bot_disposition_weight_count": len(voice_bot_disposition_scores),
             },
             sort_keys=True,
         )
