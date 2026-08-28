@@ -44,6 +44,7 @@ from project_paths import (
     LOG_DIR,
     METRICS_DIR,
     MODEL_DIR,
+    PAYMENT_DATA_DIR,
     PREDICTIONS_DIR,
     SCHEDULE_DATA_DIR,
     SCRIPTS_DIR,
@@ -2741,13 +2742,48 @@ def main() -> None:
         #         str(FEATURE_DATA_DIR / "strategy_monthly_features.csv"),
         #         logger=logger,
         #     )
+        inference_feature_file = FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv"
         with log_step(logger, "build_monthly_features"):
             run_python_script(
                 "build_monthly_feature_dataset.py",
                 "--input-file",
                 str(TRAINING_DATA_DIR / "strategy_training_dataset_inference.csv"),  # <-- CHANGED
                 "--output-file",
-                str(FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv"),   # <-- CHANGED
+                str(inference_feature_file),   # <-- CHANGED
+                logger=logger,
+            )
+        payment_files: list[Path] = []
+        with log_step(logger, "fetch_inference_payments", months=','.join(history_months)):
+            for fetch_month in history_months:
+                payment_file = PAYMENT_DATA_DIR / f"payment_data_{pd.Timestamp(f'{fetch_month}-01').strftime('%b%Y').upper()}.csv"
+                run_python_script(
+                    "fetch_payments_from_postgres.py",
+                    "--host",
+                    args.host,
+                    "--port",
+                    str(args.port),
+                    "--dbname",
+                    args.dbname,
+                    "--user",
+                    args.user,
+                    "--password",
+                    args.password,
+                    "--schema",
+                    args.source_schema,
+                    "--source-month",
+                    fetch_month,
+                    "--output-file",
+                    str(payment_file),
+                    logger=logger,
+                )
+                payment_files.append(payment_file)
+        with log_step(logger, "append_inference_payment_flags", feature_file=inference_feature_file):
+            run_python_script(
+                "append_payment_flags.py",
+                "--feature-file",
+                str(inference_feature_file),
+                "--payment-files",
+                *[str(path) for path in payment_files],
                 logger=logger,
             )
 
@@ -2792,7 +2828,7 @@ def main() -> None:
                     "--prediction-source-months",   
                     source_month_label,
                     "--feature-file",
-                    str(FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv"),
+                    str(inference_feature_file),
                     "--schedule-file",
                     str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv"),
                     logger=logger,
@@ -2835,7 +2871,7 @@ def main() -> None:
                     str(model_file),
                     "--feature-file",
                     # str(FEATURE_DATA_DIR / "strategy_monthly_features.csv"),
-                    str(FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv"),   # <-- CHANGED
+                    str(inference_feature_file),   # <-- CHANGED
                     "--schedule-file",
                     # str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv"),
                     str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv"),  # <-- CHANGED

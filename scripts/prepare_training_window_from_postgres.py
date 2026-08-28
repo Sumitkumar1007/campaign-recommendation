@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 
+import pandas as pd
 from psycopg import sql
 
 from app_logging import log_step, setup_logging
@@ -18,7 +19,7 @@ from fetch_month_from_postgres import (
     write_query_to_csv,
 )
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
-from project_paths import FEATURE_DATA_DIR, SCHEDULE_DATA_DIR, TRAINING_DATA_DIR
+from project_paths import FEATURE_DATA_DIR, PAYMENT_DATA_DIR, SCHEDULE_DATA_DIR, TRAINING_DATA_DIR
 from run_monthly_inference_pipeline import run_python_script
 
 
@@ -143,7 +144,7 @@ def fetch_month_extracts(args: argparse.Namespace, logger: logging.Logger, month
     return files
 
 
-def build_training_artifacts(input_files: list[Path], month_source: str, logger: logging.Logger) -> None:
+def build_training_artifacts(args: argparse.Namespace, input_files: list[Path], months: list[str], month_source: str, logger: logging.Logger) -> None:
     training_output = TRAINING_DATA_DIR / "strategy_training_dataset_train.csv"
     schedule_output = SCHEDULE_DATA_DIR / "strategy_schedule_dataset_train.csv"
     feature_output = FEATURE_DATA_DIR / "strategy_monthly_features_train.csv"
@@ -179,6 +180,41 @@ def build_training_artifacts(input_files: list[Path], month_source: str, logger:
             logger=logger,
         )
         logger.info("Generated feature dataset | output_file=%s exists=%s", feature_output, feature_output.exists())
+    payment_files: list[Path] = []
+    with log_step(logger, "fetch_training_payments", months=','.join(months)):
+        for month in months:
+            payment_file = PAYMENT_DATA_DIR / f"payment_data_{pd.Timestamp(f'{month}-01').strftime('%b%Y').upper()}.csv"
+            run_python_script(
+                "fetch_payments_from_postgres.py",
+                "--host",
+                args.host,
+                "--port",
+                str(args.port),
+                "--dbname",
+                args.dbname,
+                "--user",
+                args.user,
+                "--password",
+                args.password,
+                "--schema",
+                args.schema,
+                "--source-month",
+                month,
+                "--output-file",
+                str(payment_file),
+                logger=logger,
+            )
+            payment_files.append(payment_file)
+    with log_step(logger, "append_training_payment_flags", feature_file=feature_output):
+        run_python_script(
+            "append_payment_flags.py",
+            "--feature-file",
+            str(feature_output),
+            "--payment-files",
+            *[str(path) for path in payment_files],
+            logger=logger,
+        )
+        logger.info("Appended training payment flags | feature_file=%s payment_files=%s", feature_output, payment_files)
 
 
 def main() -> None:
@@ -220,7 +256,7 @@ def main() -> None:
         )
         input_files = fetch_month_extracts(args, logger, months)
         logger.info("Fetched all month extracts successfully | input_files=%s", input_files)
-        build_training_artifacts(input_files, args.month_source, logger)
+        build_training_artifacts(args, input_files, months, args.month_source, logger)
         logger.info("Training window preparation completed successfully | requested_months=%s raw_source_months=%s", args.months, months)
         print(f"Prepared training data for requested months={args.months} using raw source months={months}")
     except Exception:

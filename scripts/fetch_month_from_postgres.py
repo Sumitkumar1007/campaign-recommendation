@@ -270,7 +270,7 @@ def build_query(schema: str, table: str, vertical_column: str, party_id_column: 
         WHERE emi_date = ANY(%(emi_dates)s)
             AND LOWER(apac_card_number) NOT LIKE '%%test%%'
             AND apac_card_number NOT LIKE 'PRVCMP%%'
-            AND apac_card_number <> '1234'
+            AND apac_card_number NOT IN ('1234', '2345', '3453')
         """
     ).format(
         table_ref=table_ref,

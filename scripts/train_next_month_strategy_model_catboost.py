@@ -782,6 +782,9 @@ def main() -> None:
                         encoder,
                         X_pred,
                         prediction_rows["RISK"],
+                        bounce_flags=prediction_rows["bounce_flag"] if "bounce_flag" in prediction_rows.columns else None,
+                        day=day,
+                        logger=logger,
                     )
                 prediction_output["D"] = "-"
                 prediction_output = prediction_output[

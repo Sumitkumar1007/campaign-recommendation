@@ -1,0 +1,58 @@
+{
+  "assumption": "Source-month monthly communication features predict next-month schedule targets with month offset 1 using the latest 6 months of per-account feature history.",
+  "target_offset_months": 1,
+  "history_window_months": 6,
+  "train_source_months": [
+    "NOV-2025",
+    "DEC-2025",
+    "JAN-2026"
+  ],
+  "validation_source_months": [
+    "FEB-2026"
+  ],
+  "test_source_months": [],
+  "prediction_source_months": [
+    "MAR-2026"
+  ],
+  "n_jobs": 16,
+  "iterations": 500,
+  "learning_rate": 0.05,
+  "depth": 8,
+  "train_metrics": {
+    "rows": 66057,
+    "exact_match_accuracy": 0.4705935782733094,
+    "average_day_accuracy": 0.8714110540896497,
+    "per_day_accuracy": {
+      "D-5": 0.8720498963016788,
+      "D-4": 0.8477072831039859,
+      "D-3": 0.8840849569311352,
+      "D-2": 0.7611759541002467,
+      "D-1": 1.0,
+      "D+1": 0.8680684863072801,
+      "D+2": 0.8663881193514692,
+      "D+3": 0.871035620751775,
+      "D+4": 0.8723526651225457,
+      "D+5": 0.8712475589263817
+    }
+  },
+  "validation_metrics": {
+    "rows": 53681,
+    "exact_match_accuracy": 0.033848102680650506,
+    "average_day_accuracy": 0.565792366014046,
+    "per_day_accuracy": {
+      "D-5": 0.8153909204373987,
+      "D-4": 0.29198412846258454,
+      "D-3": 0.783442931390995,
+      "D-2": 0.8044000670628342,
+      "D-1": 0.7374117471731153,
+      "D+1": 0.4392801922467912,
+      "D+2": 0.438628192470334,
+      "D+3": 0.44851996050744214,
+      "D+4": 0.4441422477226579,
+      "D+5": 0.4547232726663065
+    }
+  },
+  "test_metrics": {
+    "rows": 0
+  }
+}

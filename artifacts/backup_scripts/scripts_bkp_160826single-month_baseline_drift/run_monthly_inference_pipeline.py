@@ -1,0 +1,2910 @@
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import shutil
+import subprocess
+import uuid
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+import joblib
+import pandas as pd
+from psycopg import errors, sql
+from psycopg.types.json import Jsonb
+
+from app_logging import log_step, setup_logging
+from drift_utils import compute_drift_report
+from model_fallbacks import register_legacy_joblib_aliases
+from env_utils import load_dotenv
+from fetch_month_from_postgres import (
+    configured_prediction_month_from_emi_dates,
+    configured_source_month_from_emi_dates,
+    default_output_file as default_communication_output_file,
+    resolve_scheduler_emi_dates as resolve_configured_emi_dates,
+)
+from pipeline_common import (
+    DAY_COLUMNS,
+    POSTDUE_DAY_COLUMNS,
+    PREDUE_DAY_COLUMNS,
+    SCHEDULE_DAY_COLUMNS,
+    build_feature_matrix,
+    prepare_next_month_dataset,
+    split_by_source_month,
+)
+from postgres_utils import PostgresConfig, connect_db, qualified_identifier
+from predict_next_month_strategy_catboost import build_prediction_population, load_base_population
+from project_paths import (
+    CASE_DATA_DIR,
+    COMMUNICATION_DATA_DIR,
+    FEATURE_DATA_DIR,
+    LOG_DIR,
+    METRICS_DIR,
+    MODEL_DIR,
+    PREDICTIONS_DIR,
+    SCHEDULE_DATA_DIR,
+    SCRIPTS_DIR,
+    TRAINING_DATA_DIR,
+)
+
+
+register_legacy_joblib_aliases()
+
+
+PREDUE_DAYS = PREDUE_DAY_COLUMNS
+POSTDUE_DAYS = POSTDUE_DAY_COLUMNS
+ALL_CAMPAIGN_DAYS = SCHEDULE_DAY_COLUMNS
+CAMPAIGN_DAY_ORDER = {day: index for index, day in enumerate([*PREDUE_DAYS, *POSTDUE_DAYS])}
+RISK_CODES = {
+    "LOW": "LR",
+    "MEDIUM": "MR",
+    "HIGH": "HR",
+}
+MODE_BY_STRATEGY_CHANNEL = {
+    "SMS": "SMS",
+    "WH": "WHATSAPP",
+    "WHATSAPP": "WHATSAPP",
+    "IVR": "VOICE",
+    "VOICE": "VOICE",
+    "VOICE_BOT": "VOICE_BOT",
+}
+NAME_CHANNEL_BY_MODE = {
+    "SMS": "SMS",
+    "WHATSAPP": "WA",
+    "VOICE": "VOICE",
+    "VOICE_BOT": "VOICE_BOT",
+}
+VENDOR_CONFIG_KEYS = {
+    "SMS": "sms.service.vendor-list",
+    "VOICE": "voice.service.vendor-list",
+    "VOICE_BOT": "voice-bot.service.vendor-list",
+    "WHATSAPP": "whatsapp.service.vendor-list",
+}
+EMI_DATES_CONFIG_KEY = "upload.scheduler.emi-dates"
+
+
+def parse_args() -> argparse.Namespace:
+    load_dotenv(override=True)
+    parser = argparse.ArgumentParser(
+        description=(
+            "Incremental monthly inference pipeline: fetch one source month from "
+            "Postgres, rebuild local processed data, run inference, and store "
+            "prediction and campaign outputs back to Postgres."
+        )
+    )
+    parser.add_argument("--host", default=os.getenv("PGHOST"))
+    parser.add_argument("--port", type=int, default=int(os.getenv("PGPORT", "5432")))
+    parser.add_argument("--dbname", default=os.getenv("PGDATABASE"))
+    parser.add_argument("--user", default=os.getenv("PGUSER"))
+    parser.add_argument("--password", default=os.getenv("PGPASSWORD"))
+    parser.add_argument(
+        "--source-schema",
+        default=os.getenv("SOURCE_SCHEMA", "digital_collections"),
+        help="Schema containing the source communications table.",
+    )
+    parser.add_argument(
+        "--source-table",
+        default=os.getenv("SOURCE_TABLE", "communications"),
+        help="Source communications table.",
+    )
+    parser.add_argument(
+        "--target-schema",
+        default=os.getenv("TARGET_SCHEMA", "digital_collections"),
+        help="Schema used for storing predictions and campaign outputs.",
+    )
+    parser.add_argument(
+        "--prediction-table",
+        default=os.getenv("PREDICTION_TABLE", "ai_ml_recommendations_data"),
+        help="Target table for model prediction snapshots.",
+    )
+    parser.add_argument(
+        "--campaign-table",
+        default=os.getenv("CAMPAIGN_TABLE", "ai_ml_campaign_recommendations"),
+        help="Target table for campaign scheduler recommendations.",
+    )
+    parser.add_argument(
+        "--campaign-mapping-table",
+        default=os.getenv("CAMPAIGN_MAPPING_TABLE", "ai_ml_campaign_mapping"),
+        help="Target table for campaign-to-account mapping rows.",
+    )
+    parser.add_argument(
+        "--campaign-vertical",
+        default=os.getenv("CAMPAIGN_VERTICAL", "LAP"),
+        help="Campaign vertical used in scheduler naming until a source column is available.",
+    )
+    parser.add_argument(
+        "--campaign-vendor",
+        default=os.getenv("CAMPAIGN_VENDOR", "prutech-cpass"),
+        help="Fallback campaign vendor when data_config vendor lookup is unavailable.",
+    )
+    parser.add_argument(
+        "--source-month",
+        default=os.getenv("SOURCE_MONTH", "").strip(),
+        help="Source month to process in YYYY-MM format. Defaults to the month before configured EMI date.",
+    )
+    parser.add_argument(
+        "--predict-month",
+        default=os.getenv("PREDICT_MONTH", "").strip(),
+        help="Target month to predict in YYYY-MM format. Defaults to the configured EMI date month.",
+    )
+    parser.add_argument(
+        "--model",
+        choices=["catboost", "catboost_3m", "logistic"],
+        default=os.getenv("MODEL_NAME", "catboost_3m"),
+        help="Which next-month model pipeline to run.",
+    )
+    parser.add_argument(
+        "--model-serving",
+        choices=["local", "mlflow"],
+        default=os.getenv("MODEL_SERVING", os.getenv("modelserving", "local")).lower(),
+        help="Load model from local artifacts or download the bundle from MLflow registry.",
+    )
+    parser.add_argument(
+        "--mlflow-model-uri",
+        default=os.getenv(
+            "MLFLOW_MODEL_URI",
+            f"models:/{os.getenv('MLFLOW_REGISTERED_MODEL_NAME', 'campaign_next_month_catboost_3m')}@production",
+        ),
+        help="MLflow model URI used when --model-serving=mlflow.",
+    )
+    parser.add_argument(
+        "--model-version",
+        default=os.getenv("MODEL_VERSION", "").strip(),
+        help="Optional model version token, for example v002.",
+    )
+    parser.add_argument(
+        "--model-file",
+        default=os.getenv("MODEL_FILE", "").strip(),
+        help="Optional explicit model file path. Overrides model-version naming.",
+    )
+    parser.add_argument(
+        "--metrics-file",
+        default=os.getenv("METRICS_FILE", "").strip(),
+        help="Optional explicit metrics file path. Overrides model-version naming.",
+    )
+    parser.add_argument(
+        "--feature-month-source",
+        choices=["emi_date", "created_date"],
+        default=os.getenv("FEATURE_MONTH_SOURCE", "emi_date"),
+        help="Date field used to assign monthly feature labels after fetch.",
+    )
+    parser.add_argument(
+        "--skip-db-store",
+        action="store_true",
+        help="Run the local fetch/process/predict flow without storing snapshots back to Postgres.",
+    )
+    parser.add_argument(
+        "--log-file",
+        default=str(LOG_DIR / "monthly_inference_pipeline.log"),
+        help="Application log file.",
+    )
+    parser.add_argument(
+        "--prediction-evidence-limit",
+        type=int,
+        default=int(os.getenv("PREDICTION_EVIDENCE_LIMIT", "100")),
+        help="Optional row cap for the generated prediction evidence CSV. Use 0 for no limit.",
+    )
+    parser.add_argument(
+        "--history_window_months",
+        type=int,
+        default=int(os.getenv("HISTORY_WINDOW_MONTHS", "6")),
+        help="Number of months of history to fetch.",
+    )
+    args = parser.parse_args()
+    missing = [
+        name
+        for name, value in {
+            "PGHOST/--host": args.host,
+            "PGDATABASE/--dbname": args.dbname,
+            "PGUSER/--user": args.user,
+            "PGPASSWORD/--password": args.password,
+        }.items()
+        if not value
+    ]
+    if missing:
+        parser.error("Missing required environment variables or CLI args: " + ", ".join(missing))
+    config = PostgresConfig(
+        host=args.host,
+        port=args.port,
+        dbname=args.dbname,
+        user=args.user,
+        password=args.password,
+    )
+    if not args.source_month and not args.predict_month:
+        with connect_db(config) as conn:
+            configured_emi_dates = resolve_configured_emi_dates(conn, schema=args.source_schema)
+        args.predict_month = configured_prediction_month_from_emi_dates(configured_emi_dates)
+        args.source_month = configured_source_month_from_emi_dates(configured_emi_dates)
+    elif not args.source_month and args.predict_month:
+        args.source_month = str(parse_month(args.predict_month) - 1)
+    elif args.source_month and not args.predict_month:
+        args.predict_month = next_month(args.source_month)
+    try:
+        validate_month_pair(args.source_month, args.predict_month)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
+
+
+def parse_month(yyyy_mm: str) -> pd.Period:
+    if len(yyyy_mm) != 7 or yyyy_mm[4] != "-":
+        raise ValueError(f"Invalid month '{yyyy_mm}'. Expected YYYY-MM, for example 2026-05.")
+    try:
+        return pd.Period(yyyy_mm, freq="M")
+    except ValueError as exc:
+        raise ValueError(f"Invalid month '{yyyy_mm}'. Expected YYYY-MM, for example 2026-05.") from exc
+
+
+def current_month(today: pd.Timestamp | None = None) -> str:
+    return (today or pd.Timestamp.today()).strftime("%Y-%m")
+
+
+def next_month(yyyy_mm: str) -> str:
+    return str(parse_month(yyyy_mm) + 1)
+
+
+def validate_month_pair(source_month: str, predict_month: str) -> None:
+    source_period = parse_month(source_month)
+    predict_period = parse_month(predict_month)
+    expected_period = source_period + 1
+    if predict_period != expected_period:
+        raise ValueError(
+            "PREDICT_MONTH/--predict-month must be exactly one month after "
+            f"SOURCE_MONTH/--source-month for the current next-month model. "
+            f"Got source={source_month}, predict={predict_month}, expected={expected_period}."
+        )
+
+
+def month_label(yyyy_mm: str) -> str:
+    return parse_month(yyyy_mm).to_timestamp().strftime("%b-%Y").upper()
+
+
+def month_file_token(period: pd.Period) -> str:
+    return period.to_timestamp().strftime("%b%Y").upper()
+
+
+def model_artifact_path(directory: Path, stem: str, suffix: str, model_version: str | None) -> Path:
+    token = str(model_version or "").strip()
+    if token:
+        if not token.lower().startswith("v"):
+            token = f"v{token}"
+        return directory / f"{stem}_{token}{suffix}"
+    return directory / f"{stem}{suffix}"
+
+
+def _communication_file_sort_key(path: Path) -> tuple[int, str]:
+    parts = path.stem.split("_")
+    cycle_token = parts[-1] if len(parts) >= 4 else ""
+    return (int(cycle_token) if cycle_token.isdigit() else 0, path.name)
+
+
+def _communication_extract_candidates(month: str) -> list[Path]:
+    token = month_file_token(parse_month(month))
+    cycle_candidates = sorted(
+        COMMUNICATION_DATA_DIR.glob(f"comm_data_{token}_*.csv"),
+        key=_communication_file_sort_key,
+    )
+    existing_cycle_candidates = [path for path in cycle_candidates if path.exists()]
+    if existing_cycle_candidates:
+        return existing_cycle_candidates
+    canonical_candidate = COMMUNICATION_DATA_DIR / f"comm_data_{token}.csv"
+    if canonical_candidate.exists():
+        return [canonical_candidate]
+    legacy_candidates = [
+        COMMUNICATION_DATA_DIR / f"latest_{token}_comm_data.csv",
+        COMMUNICATION_DATA_DIR / f"mfl_recomm_model_{token}_comm_data.csv",
+    ]
+    return [path for path in legacy_candidates if path.exists()]
+
+
+def latest_extract_files(source_month: str) -> list[Path]:
+    files = _communication_extract_candidates(source_month)
+    if files:
+        return files
+    return [default_communication_output_file(source_month)]
+
+
+def monthly_extract_files(month: str) -> list[Path]:
+    return _communication_extract_candidates(month)
+
+
+def current_cases_file(source_month: str) -> Path:
+    token = month_file_token(parse_month(source_month))
+    return CASE_DATA_DIR / f"digital_cases_{token}.csv"
+
+
+def resolve_drift_baseline_source_months(
+    dataset: pd.DataFrame,
+    *,
+    source_month_label: str,
+    history_window_months: int,
+    metrics_metadata: dict[str, object],
+    baseline_mode: str,
+) -> tuple[list[str], str]:
+    source_month_series = dataset["SOURCE_MONTH"].dropna().astype(str).drop_duplicates()
+    source_month_pairs = []
+    for month in source_month_series.tolist():
+        parsed = pd.to_datetime(month, format="%b-%Y", errors="coerce")
+        if pd.isna(parsed):
+            continue
+        source_month_pairs.append((month, pd.Timestamp(parsed)))
+    source_month_pairs.sort(key=lambda item: item[1])
+    available_source_months = [month for month, _ in source_month_pairs]
+    source_period = pd.to_datetime(source_month_label, format="%b-%Y", errors="coerce")
+
+    recent_source_months: list[str] = []
+    if not pd.isna(source_period):
+        source_timestamp = pd.Timestamp(source_period)
+        recent_source_months = [
+            month
+            for month in available_source_months
+            if not pd.isna(pd.to_datetime(month, format="%b-%Y", errors="coerce"))
+            and pd.Timestamp(pd.to_datetime(month, format="%b-%Y", errors="coerce")) <= source_timestamp
+        ]
+        if history_window_months > 0:
+            recent_source_months = recent_source_months[-history_window_months:]
+
+    if recent_source_months:
+        if baseline_mode == "latest_source_month":
+            return recent_source_months[-1:], "latest_source_month"
+        return recent_source_months, "recent_source_months"
+
+    metrics_months = [
+        str(value)
+        for value in metrics_metadata.get("train_source_months", [])
+        if str(value).strip()
+    ]
+    available_metrics_months = [month for month in metrics_months if month in available_source_months]
+    if available_metrics_months:
+        return available_metrics_months, "metrics_train_source_months"
+
+    return available_source_months, "all_source_months"
+
+
+# def selected_history_files(source_month: str, latest_files: list[Path]) -> list[Path]:
+#     source_period = parse_month(source_month)
+    # previous_periods = [source_period - 2, source_period - 1]
+def selected_history_files(source_month: str, latest_files: list[Path], history_window: int) -> list[Path]:
+    source_period = parse_month(source_month)
+    previous_periods = [source_period - i for i in range(history_window - 1, 0, -1)]
+    files: list[Path] = []
+    for period in previous_periods:
+        files.extend(path for path in monthly_extract_files(str(period)) if path.exists())
+    files.extend(path for path in latest_files if path.exists())
+
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for path in files:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        deduped.append(path)
+    return deduped
+
+
+def csv_has_rows(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    with path.open("r", encoding="utf-8") as handle:
+        return sum(1 for _ in handle) > 1
+
+
+def prediction_summary_path(predict_month: str) -> Path:
+    return LOG_DIR / f"{predict_month.replace('-', '_').lower()}_prediction_summary.json"
+
+
+def _count_top_labels(df: pd.DataFrame, day_columns: list[str]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for day in day_columns:
+        if day not in df.columns:
+            continue
+        for value in df[day].fillna("-").astype(str):
+            for label in value.split("|"):
+                label = label.strip()
+                if not label or label == "-":
+                    continue
+                counts[label] = counts.get(label, 0) + 1
+    return dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+
+
+def _count_daywise_labels(df: pd.DataFrame, day_columns: list[str]) -> dict[str, dict[str, int]]:
+    output: dict[str, dict[str, int]] = {}
+    for day in day_columns:
+        if day not in df.columns:
+            continue
+        counts: dict[str, int] = {}
+        for value in df[day].fillna("-").astype(str):
+            for label in value.split("|"):
+                label = label.strip()
+                if not label or label == "-":
+                    continue
+                counts[label] = counts.get(label, 0) + 1
+        output[day] = dict(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
+    return output
+
+
+def _count_blank_predictions(df: pd.DataFrame, day_columns: list[str]) -> dict[str, object]:
+    normalized = df[day_columns].fillna("-").astype(str).apply(lambda col: col.str.strip())
+    blank_counts = {
+        day: int((normalized[day] == "-").sum())
+        for day in day_columns
+        if day in normalized.columns
+    }
+    all_blank_rows = int(normalized.apply(lambda row: all(value == "-" for value in row), axis=1).sum())
+    return {
+        "blank_counts_by_day": blank_counts,
+        "all_blank_rows": all_blank_rows,
+    }
+
+
+def build_prediction_summary(
+    *,
+    prediction_file: Path,
+    source_month_label: str,
+    prediction_month_label: str,
+    model_name: str,
+    campaign_df: pd.DataFrame,
+    mapping_df: pd.DataFrame,
+) -> dict[str, object]:
+    predictions = pd.read_csv(prediction_file)
+    predictions = predictions[predictions["MONTH"] == prediction_month_label].copy()
+    day_columns = DAY_COLUMNS
+
+    source_risk_counts = (
+        predictions["SOURCE_RISK"].fillna("UNKNOWN").astype(str).value_counts().sort_index().to_dict()
+        if "SOURCE_RISK" in predictions.columns
+        else {}
+    )
+    source_vertical_counts = (
+        predictions["SOURCE_VERTICAL"].fillna("UNKNOWN").astype(str).value_counts().sort_index().to_dict()
+        if "SOURCE_VERTICAL" in predictions.columns
+        else {}
+    )
+    campaign_mode_counts = (
+        campaign_df["mode"].fillna("UNKNOWN").astype(str).value_counts().sort_index().to_dict()
+        if not campaign_df.empty
+        else {}
+    )
+    campaign_vendor_counts = (
+        campaign_df["vendor"].fillna("UNKNOWN").astype(str).value_counts().sort_index().to_dict()
+        if not campaign_df.empty
+        else {}
+    )
+    campaign_vertical_counts = (
+        campaign_df["vertical"].fillna("UNKNOWN").astype(str).value_counts().sort_index().to_dict()
+        if not campaign_df.empty
+        else {}
+    )
+    mapping_counts_by_campaign = (
+        mapping_df["campaign_name"].fillna("UNKNOWN").astype(str).value_counts().head(20).to_dict()
+        if not mapping_df.empty
+        else {}
+    )
+
+    blank_prediction_counts = _count_blank_predictions(predictions, day_columns)
+
+    return {
+        "source_month": source_month_label,
+        "prediction_month": prediction_month_label,
+        "model_name": model_name,
+        "prediction_rows": int(len(predictions)),
+        "campaign_rows": int(len(campaign_df)),
+        "mapping_rows": int(len(mapping_df)),
+        "source_risk_counts": source_risk_counts,
+        "source_vertical_counts": source_vertical_counts,
+        "predicted_label_counts": _count_top_labels(predictions, day_columns),
+        "predicted_label_counts_by_day": _count_daywise_labels(predictions, day_columns),
+        "blank_prediction_counts": blank_prediction_counts,
+        "campaign_mode_counts": campaign_mode_counts,
+        "campaign_vendor_counts": campaign_vendor_counts,
+        "campaign_vertical_counts": campaign_vertical_counts,
+        "top_campaign_mapping_counts": mapping_counts_by_campaign,
+    }
+
+
+def write_prediction_summary(
+    *,
+    summary: dict[str, object],
+    output_path: Path,
+    logger: logging.Logger,
+) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+    logger.info("Saved prediction summary | path=%s", output_path)
+    logger.info(
+        "Prediction summary counts | prediction_rows=%s campaign_rows=%s mapping_rows=%s",
+        summary["prediction_rows"],
+        summary["campaign_rows"],
+        summary["mapping_rows"],
+    )
+    return output_path
+
+
+def fetch_communication_extract(
+    args: argparse.Namespace,
+    output_file: Path,
+    fetch_month: str,
+    logger: logging.Logger,
+) -> None:
+    run_python_script(
+        "fetch_month_from_postgres.py",
+        "--schema",
+        args.source_schema,
+        "--table",
+        args.source_table,
+        "--fetch-month",
+        fetch_month,
+        "--output-file",
+        str(output_file),
+        logger=logger,
+        env_updates={
+            "PGHOST": args.host,
+            "PGPORT": str(args.port),
+            "PGDATABASE": args.dbname,
+            "PGUSER": args.user,
+            "PGPASSWORD": args.password,
+        },
+    )
+
+
+def fetch_current_cases_extract(
+    args: argparse.Namespace,
+    output_file: Path,
+    fetch_month: str,
+    logger: logging.Logger,
+) -> None:
+    run_python_script(
+        "fetch_cases_from_postgres.py",
+        "--schema",
+        args.source_schema,
+        "--fetch-month",
+        fetch_month,
+        "--output-file",
+        str(output_file),
+        logger=logger,
+        env_updates={
+            "PGHOST": args.host,
+            "PGPORT": str(args.port),
+            "PGDATABASE": args.dbname,
+            "PGUSER": args.user,
+            "PGPASSWORD": args.password,
+        },
+    )
+
+
+def run_python_script(
+    script_name: str,
+    *script_args: str,
+    logger: logging.Logger | None = None,
+    env_updates: dict[str, str] | None = None,
+) -> None:
+    cmd = [sys.executable, str(SCRIPTS_DIR / script_name), *script_args]
+    env = os.environ.copy()
+    if env_updates:
+        env.update(env_updates)
+    if logger:
+        logger.info("Running child script | script=%s args=%s cwd=%s", script_name, list(script_args), SCRIPTS_DIR.parent)
+    try:
+        result = subprocess.run(cmd, check=True, cwd=SCRIPTS_DIR.parent, env=env, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        if logger:
+            logger.error("Child script failed | script=%s returncode=%s", script_name, exc.returncode)
+            if isinstance(exc.stdout, str) and exc.stdout.strip():
+                for line in exc.stdout.strip().splitlines():
+                    logger.error("Child script stdout | script=%s | %s", script_name, line)
+            else:
+                logger.info("Child script stdout empty | script=%s", script_name)
+            if isinstance(exc.stderr, str) and exc.stderr.strip():
+                for line in exc.stderr.strip().splitlines():
+                    logger.error("Child script stderr | script=%s | %s", script_name, line)
+            else:
+                logger.info("Child script stderr empty | script=%s", script_name)
+        raise
+    if logger:
+        logger.info("Child script completed | script=%s returncode=%s", script_name, result.returncode)
+        if isinstance(result.stdout, str) and result.stdout.strip():
+            for line in result.stdout.strip().splitlines():
+                logger.info("Child script stdout | script=%s | %s", script_name, line)
+        else:
+            logger.info("Child script stdout empty | script=%s", script_name)
+        if isinstance(result.stderr, str) and result.stderr.strip():
+            for line in result.stderr.strip().splitlines():
+                logger.info("Child script stderr | script=%s | %s", script_name, line)
+        else:
+            logger.info("Child script stderr empty | script=%s", script_name)
+
+
+def download_mlflow_model_bundle(model_uri: str, target_file: Path, logger: logging.Logger) -> Path:
+    try:
+        import mlflow
+    except ImportError as exc:
+        raise RuntimeError("MLflow model serving requires mlflow. Install project dependencies first.") from exc
+
+    tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
+    if tracking_uri:
+        mlflow.set_tracking_uri(tracking_uri)
+
+    logger.info("Downloading MLflow model bundle | model_uri=%s target_file=%s", model_uri, target_file)
+    local_dir = Path(mlflow.artifacts.download_artifacts(model_uri))
+    joblib_files = sorted(local_dir.rglob("*.joblib"))
+    if not joblib_files:
+        raise FileNotFoundError(f"No .joblib model bundle found in downloaded MLflow model: {local_dir}")
+
+    target_file.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(joblib_files[0], target_file)
+    logger.info("Downloaded MLflow model bundle | source=%s target=%s", joblib_files[0], target_file)
+    return target_file
+
+
+def ensure_prediction_table(conn, schema: str, table: str) -> None:
+    conn.execute(
+        sql.SQL(
+            """
+            CREATE TABLE IF NOT EXISTS {table_ref} (
+                loan_number TEXT NOT NULL,
+                source_month_used TEXT NOT NULL,
+                prediction_month TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                source_risk TEXT,
+                prediction_payload JSONB NOT NULL,
+                prediction_reason JSONB,
+                created_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY (loan_number, prediction_month, model_name)
+            )
+            """
+        ).format(table_ref=qualified_identifier(schema, table))
+    )
+    conn.execute(
+        sql.SQL("ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS prediction_reason JSONB").format(
+            table_ref=qualified_identifier(schema, table)
+        )
+    )
+
+
+def ensure_campaign_table(conn, schema: str, table: str) -> None:
+    conn.execute(
+        sql.SQL(
+            """
+            CREATE TABLE IF NOT EXISTS {table_ref} (
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY,
+                name TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                date TEXT NOT NULL,
+                time TEXT NOT NULL,
+                template_name TEXT NOT NULL,
+                dataset_name TEXT NOT NULL,
+                vendor TEXT NOT NULL,
+                active TEXT NOT NULL,
+                source_month TEXT NOT NULL,
+                prediction_month TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                emi_cycle INTEGER NOT NULL,
+                risk TEXT NOT NULL,
+                vertical TEXT NOT NULL,
+                campaign_type TEXT NOT NULL,
+                due_type TEXT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                modified_at TIMESTAMPTZ NOT NULL,
+                created_by TEXT NOT NULL,
+                modified_by TEXT NOT NULL,
+                PRIMARY KEY (name, id)
+            )
+            """
+        ).format(table_ref=qualified_identifier(schema, table))
+    )
+
+
+def ensure_campaign_mapping_table(conn, schema: str, table: str) -> None:
+    conn.execute(
+        sql.SQL(
+            """
+            CREATE TABLE IF NOT EXISTS {table_ref} (
+                id BIGINT GENERATED BY DEFAULT AS IDENTITY,
+                campaign_name TEXT NOT NULL,
+                loan_number TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                date TEXT NOT NULL,
+                time TEXT NOT NULL,
+                vendor TEXT NOT NULL,
+                language TEXT NOT NULL,
+                source_month TEXT NOT NULL,
+                prediction_month TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                emi_cycle INTEGER NOT NULL,
+                risk TEXT NOT NULL,
+                vertical TEXT NOT NULL,
+                campaign_type TEXT NOT NULL,
+                due_type TEXT NOT NULL,
+                prediction_reason TEXT,
+                created_at TIMESTAMPTZ NOT NULL,
+                modified_at TIMESTAMPTZ NOT NULL,
+                created_by TEXT NOT NULL,
+                modified_by TEXT NOT NULL,
+                PRIMARY KEY (campaign_name, loan_number, id)
+            )
+            """
+        ).format(table_ref=qualified_identifier(schema, table))
+    )
+    conn.execute(
+        sql.SQL("ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS prediction_reason TEXT").format(
+            table_ref=qualified_identifier(schema, table)
+        )
+    )
+    conn.execute(
+        sql.SQL("ALTER TABLE {table_ref} ADD COLUMN IF NOT EXISTS language TEXT").format(
+            table_ref=qualified_identifier(schema, table)
+        )
+    )
+
+
+def store_prediction_snapshots(
+    conn,
+    schema: str,
+    table: str,
+    prediction_file: Path,
+    prediction_month_label: str,
+    model_name: str,
+) -> int:
+    df = pd.read_csv(prediction_file)
+    df = df[df["MONTH"] == prediction_month_label].copy()
+    if df.empty:
+        return 0
+
+    ensure_prediction_table(conn, schema, table)
+    now = datetime.now(timezone.utc)
+
+    source_risk_col = "SOURCE_RISK" if "SOURCE_RISK" in df.columns else "RISK"
+    rows = []
+    for _, row in df.iterrows():
+        payload = {
+            day: row[day]
+            for day in ALL_CAMPAIGN_DAYS
+            if day in row.index
+        }
+        reason_payload = None
+        if "PREDICTION_REASON" in row.index and not pd.isna(row["PREDICTION_REASON"]):
+            raw_reason = str(row["PREDICTION_REASON"]).strip()
+            if raw_reason:
+                try:
+                    reason_payload = json.loads(raw_reason)
+                except json.JSONDecodeError:
+                    reason_payload = {"raw": raw_reason}
+        rows.append(
+            (
+                str(row["Loan_number"]),
+                str(row["SOURCE_MONTH_USED"]),
+                prediction_month_label,
+                model_name,
+                row.get(source_risk_col),
+                Jsonb(payload),
+                Jsonb(reason_payload) if reason_payload is not None else None,
+                now,
+            )
+        )
+
+    query = sql.SQL(
+        """
+        INSERT INTO {table_ref} (
+            loan_number,
+            source_month_used,
+            prediction_month,
+            model_name,
+            source_risk,
+            prediction_payload,
+            prediction_reason,
+            created_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (loan_number, prediction_month, model_name)
+        DO UPDATE SET
+            source_month_used = EXCLUDED.source_month_used,
+            source_risk = EXCLUDED.source_risk,
+            prediction_payload = EXCLUDED.prediction_payload,
+            prediction_reason = EXCLUDED.prediction_reason,
+            created_at = EXCLUDED.created_at
+        """
+    ).format(table_ref=qualified_identifier(schema, table))
+    with conn.cursor() as cur:
+        cur.executemany(query, rows)
+    return len(rows)
+
+
+def _format_scheduler_hour(hour_label: str) -> str:
+    parsed = pd.to_datetime(hour_label.upper(), format="%I%p", errors="coerce")
+    if pd.isna(parsed):
+        raise ValueError(f"Invalid strategy hour label: {hour_label!r}")
+    return parsed.strftime("%H:00:00")
+
+
+def _parse_strategy(strategy: str) -> tuple[str, str, str] | None:
+    if not strategy or strategy == "-" or pd.isna(strategy):
+        return None
+    parts = str(strategy).split("-", 2)
+    if len(parts) != 3:
+        return None
+    channel, hour_label, language = parts
+    mode = MODE_BY_STRATEGY_CHANNEL.get(channel.upper())
+    if mode is None:
+        return None
+    normalized_language = language.upper().strip()
+    if normalized_language == "REGIONAL":
+        return None
+    return mode, _format_scheduler_hour(hour_label), normalized_language
+
+
+def _due_bucket(day: str, *, configured_emi_dates: list[str] | None = None) -> tuple[str, str, str]:
+    if day in PREDUE_DAYS:
+        return "PRE", "PREDUE", day
+    if day == "D":
+        emi_dates = configured_emi_dates or []
+        if emi_dates:
+            return "DUE", "DUEDATE", ",".join(emi_dates)
+        return "DUE", "DUEDATE", day
+    if day in POSTDUE_DAYS:
+        return "POST", "POSTDUE", day
+    raise ValueError(f"Unsupported campaign day: {day}")
+
+
+def _scheduler_name(
+    *,
+    due_type: str,
+    mode: str,
+    vertical: str,
+    language: str,
+    emi_cycle: int,
+    vendor: str,
+    risk_code: str,
+    run_token: str,
+) -> str:
+    channel = NAME_CHANNEL_BY_MODE[mode]
+    vendor_token = vendor.upper().replace("-", "_")
+    return (
+        f"{due_type}_AIML_{channel}_{vertical.upper()}_{language}_{risk_code}_"
+        f"{emi_cycle}TH_{vendor_token}_{run_token}"
+    )
+
+
+def _template_name(*, due_type: str, mode: str, language: str) -> str:
+    return f"{due_type}_AIML_{NAME_CHANNEL_BY_MODE[mode]}_{language}"
+
+
+def _dataset_time_label(value: str) -> str:
+    labels = []
+    for part in str(value).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        labels.append(datetime.strptime(part, "%H:%M:%S").strftime("%H"))
+    return ",".join(labels)
+
+
+def _dataset_day_token(day_label: str) -> str:
+    day_label = str(day_label).strip().upper()
+    if day_label == "D":
+        return "D"
+    if day_label.startswith("D+"):
+        return f"DP{day_label[2:]}"
+    if day_label.startswith("D-"):
+        return f"DM{day_label[2:]}"
+    return day_label.replace(",", "-")
+
+
+def _dataset_day_label(value: str) -> str:
+    return "-".join(_dataset_day_token(part) for part in str(value).split(",") if part.strip())
+
+
+def _dataset_name(*, due_type: str, mode: str, vertical: str, language: str, risk_code: str, emi_cycle: int, date_value: str, time_value: str) -> str:
+    return (
+        f"{due_type} AIML {NAME_CHANNEL_BY_MODE[mode]} {vertical.upper()} {language} {risk_code} "
+        f"EMI {emi_cycle}TH {_dataset_day_label(date_value)} {_dataset_time_label(time_value)}"
+    )
+
+
+def _normalize_vendor_token(raw_value: object) -> str | None:
+    if raw_value is None or pd.isna(raw_value):
+        return None
+
+    text = str(raw_value).strip()
+    if not text:
+        return None
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = text
+
+    vendor = str(parsed).strip()
+    if not vendor:
+        return None
+
+    token = vendor.replace("_", "-").strip().lower()
+    if not token:
+        return None
+
+    alias_map = {
+        "kaylera": "kaleyra",
+    }
+    return alias_map.get(token, token)
+
+
+def _extract_campaign_vendors(raw_value: object) -> list[str]:
+    if raw_value is None:
+        return []
+
+    if isinstance(raw_value, list):
+        items = raw_value
+    elif isinstance(raw_value, dict):
+        items = []
+        for key in ("active_Service", "active_service", "activeService", "vendor", "vendors", "name", "value"):
+            if key in raw_value:
+                items.append(raw_value[key])
+    else:
+        if pd.isna(raw_value):
+            return []
+        text = str(raw_value).strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = text
+
+        if isinstance(parsed, (list, dict)):
+            return _extract_campaign_vendors(parsed)
+        items = [part.strip() for part in str(parsed).split(",") if part.strip()]
+
+    vendors: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        if isinstance(item, (list, dict)):
+            nested = _extract_campaign_vendors(item)
+            for vendor in nested:
+                if vendor not in seen:
+                    seen.add(vendor)
+                    vendors.append(vendor)
+            continue
+
+        normalized = _normalize_vendor_token(item)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            vendors.append(normalized)
+    return vendors
+
+
+def _candidate_data_config_refs(source_schema: str, target_schema: str) -> list[sql.Composable]:
+    candidate_refs: list[sql.Composable] = [sql.Identifier("data_config")]
+    seen = {"data_config"}
+    for schema_name in (source_schema, target_schema):
+        key = f"{schema_name}.data_config"
+        if schema_name and key not in seen:
+            seen.add(key)
+            candidate_refs.append(sql.SQL("{}.{}").format(sql.Identifier(schema_name), sql.Identifier("data_config")))
+    return candidate_refs
+
+
+def _normalize_mode_from_communication_type(value: object) -> str | None:
+    text = str(value or "").strip().upper()
+    if not text:
+        return None
+    return {
+        "SMS": "SMS",
+        "WH": "WHATSAPP",
+        "WHATSAPP": "WHATSAPP",
+        "VOICE": "VOICE",
+        "VOICE_BOT": "VOICE_BOT",
+        "IVR": "VOICE",
+    }.get(text)
+
+
+def resolve_active_campaign_vendors_by_mode(
+    conn,
+    *,
+    source_schema: str,
+    source_table: str,
+    source_month: str,
+    logger: logging.Logger,
+) -> dict[str, list[str]]:
+    table_ref = qualified_identifier(source_schema, source_table)
+    start_ts = parse_month(source_month).to_timestamp()
+    end_ts = (parse_month(source_month) + 1).to_timestamp()
+    query = sql.SQL(
+        """
+        SELECT communication_type, active_service
+        FROM {table_ref}
+        WHERE created_date >= %s
+          AND created_date < %s
+          AND communication_type IS NOT NULL
+          AND active_service IS NOT NULL
+          AND BTRIM(active_service) <> ''
+        GROUP BY communication_type, active_service
+        """
+    ).format(table_ref=table_ref)
+
+    vendor_map: dict[str, list[str]] = {mode: [] for mode in VENDOR_CONFIG_KEYS}
+    try:
+        rows = conn.execute(query, (start_ts.to_pydatetime(), end_ts.to_pydatetime())).fetchall()
+    except errors.UndefinedTable:
+        conn.rollback()
+        logger.warning(
+            "Active vendor lookup skipped because source table was not found | schema=%s table=%s",
+            source_schema,
+            source_table,
+        )
+        return vendor_map
+    except Exception:
+        logger.exception(
+            "Active vendor lookup failed | schema=%s table=%s source_month=%s",
+            source_schema,
+            source_table,
+            source_month,
+        )
+        conn.rollback()
+        return vendor_map
+
+    for communication_type, active_service in rows:
+        mode = _normalize_mode_from_communication_type(communication_type)
+        vendor = _normalize_vendor_token(active_service)
+        if not mode or not vendor:
+            continue
+        if vendor not in vendor_map[mode]:
+            vendor_map[mode].append(vendor)
+
+    logger.info(
+        "Resolved active campaign vendors from communications | source_month=%s vendor_map=%s",
+        source_month,
+        vendor_map,
+    )
+    return vendor_map
+
+
+def resolve_campaign_vendors_by_mode(
+    conn,
+    *,
+    source_schema: str,
+    target_schema: str,
+    source_table: str = "communications",
+    source_month: str | None = None,
+    fallback_vendor: str,
+    logger: logging.Logger,
+) -> dict[str, list[str]]:
+    candidate_refs = _candidate_data_config_refs(source_schema, target_schema)
+    fallback_vendors = _extract_campaign_vendors(fallback_vendor)
+    vendor_map: dict[str, list[str]] = {}
+
+    for mode, config_key in VENDOR_CONFIG_KEYS.items():
+        resolved_vendors: list[str] = []
+        for table_ref in candidate_refs:
+            try:
+                row = conn.execute(
+                    sql.SQL("SELECT value FROM {} WHERE key_name = %s LIMIT 1").format(table_ref),
+                    (config_key,),
+                ).fetchone()
+            except errors.UndefinedTable:
+                conn.rollback()
+                continue
+            except Exception:
+                logger.exception("Vendor lookup failed for mode=%s key=%s. Using fallback vendor.", mode, config_key)
+                conn.rollback()
+                break
+
+            if not row:
+                continue
+
+            resolved_vendors = _extract_campaign_vendors(row[0])
+            if resolved_vendors:
+                logger.info(
+                    "Resolved campaign vendors from data_config | mode=%s key=%s vendors=%s",
+                    mode,
+                    config_key,
+                    resolved_vendors,
+                )
+                break
+
+        if resolved_vendors:
+            vendor_map[mode] = resolved_vendors
+        elif fallback_vendors:
+            logger.warning(
+                "Using fallback campaign vendors | mode=%s fallback_vendors=%s key=%s",
+                mode,
+                fallback_vendors,
+                config_key,
+            )
+            vendor_map[mode] = fallback_vendors
+        else:
+            logger.warning(
+                "Using raw fallback campaign vendor | mode=%s fallback_vendor=%s key=%s",
+                mode,
+                fallback_vendor,
+                config_key,
+            )
+            vendor_map[mode] = [fallback_vendor]
+
+    if not source_month:
+        return vendor_map
+
+    active_vendor_map = resolve_active_campaign_vendors_by_mode(
+        conn,
+        source_schema=source_schema,
+        source_table=source_table,
+        source_month=source_month,
+        logger=logger,
+    )
+    if not any(active_vendor_map.values()):
+        logger.warning(
+            "No active vendors found in communications for source_month=%s. Using configured vendor map.",
+            source_month,
+        )
+        return vendor_map
+
+    final_vendor_map: dict[str, list[str]] = {}
+    for mode, active_vendors in active_vendor_map.items():
+        configured_vendors = vendor_map.get(mode, [])
+        if not active_vendors:
+            logger.info(
+                "No active_service vendors found for mode=%s source_month=%s. Using configured vendors from data_config.",
+                mode,
+                source_month,
+            )
+            final_vendor_map[mode] = configured_vendors
+            continue
+
+        matched_vendors = [vendor for vendor in active_vendors if vendor in configured_vendors]
+        if not matched_vendors:
+            logger.warning(
+                "active_service vendors did not match data_config vendors | mode=%s source_month=%s active_vendors=%s configured_vendors=%s. Using configured vendors from data_config.",
+                mode,
+                source_month,
+                active_vendors,
+                configured_vendors,
+            )
+            final_vendor_map[mode] = configured_vendors
+            continue
+
+        logger.info(
+            "Resolved final vendors from active_service -> data_config flow | mode=%s source_month=%s final_vendors=%s",
+            mode,
+            source_month,
+            matched_vendors,
+        )
+        final_vendor_map[mode] = matched_vendors
+
+    return final_vendor_map
+
+
+def resolve_campaign_vendors(
+    conn,
+    *,
+    source_schema: str,
+    target_schema: str,
+    fallback_vendor: str,
+    logger: logging.Logger,
+) -> list[str]:
+    vendor_map = resolve_campaign_vendors_by_mode(
+        conn,
+        source_schema=source_schema,
+        target_schema=target_schema,
+        fallback_vendor=fallback_vendor,
+        logger=logger,
+    )
+    vendors: list[str] = []
+    seen: set[str] = set()
+    for mode in ("SMS", "VOICE", "VOICE_BOT", "WHATSAPP"):
+        for vendor in vendor_map.get(mode, []):
+            if vendor not in seen:
+                seen.add(vendor)
+                vendors.append(vendor)
+    return vendors
+
+
+def _join_campaign_days(values: pd.Series) -> str:
+    return ",".join(
+        sorted(
+            set(values),
+            key=lambda day: CAMPAIGN_DAY_ORDER.get(day, len(CAMPAIGN_DAY_ORDER)),
+        )
+    )
+
+
+def _join_campaign_times(values: pd.Series) -> str:
+    return ",".join(sorted(set(values)))
+
+
+def _coerce_emi_cycle_from_value(value: object) -> int | None:
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        # Prediction EMI dates are emitted as DD/MM/YYYY; parse that first so
+        # multi-cycle runs keep the actual EMI day instead of the month number.
+        timestamp = pd.to_datetime(text, format="%d/%m/%Y", errors="coerce")
+    except Exception:
+        timestamp = pd.NaT
+    if pd.isna(timestamp):
+        try:
+            timestamp = pd.to_datetime(text, dayfirst=True, errors="coerce")
+        except Exception:
+            timestamp = pd.NaT
+    if not pd.isna(timestamp):
+        return int(timestamp.day)
+    match = re.search(r"(\d{1,2})", text)
+    if match:
+        day = int(match.group(1))
+        if 1 <= day <= 31:
+            return day
+    return None
+
+
+def _resolve_row_emi_cycle(row: pd.Series, default_cycles: list[int]) -> int:
+    derived = _coerce_emi_cycle_from_value(row.get("EMI_DATE"))
+    if derived is not None:
+        return derived
+    if len(default_cycles) == 1:
+        return int(default_cycles[0])
+    raise ValueError("Could not derive emi_cycle from prediction row EMI_DATE for multi-cycle config.")
+
+
+def _load_prediction_context_lookup(prediction_file: Path, prediction_month_label: str) -> dict[str, dict[str, object]]:
+    df = pd.read_csv(prediction_file)
+    df = df[df["MONTH"] == prediction_month_label].copy()
+    lookup: dict[str, dict[str, object]] = {}
+    for _, row in df.iterrows():
+        context: dict[str, object] = {}
+        raw_reason = row.get("PREDICTION_REASON") if "PREDICTION_REASON" in row.index else None
+        if raw_reason is not None and not pd.isna(raw_reason):
+            try:
+                parsed = json.loads(str(raw_reason))
+            except json.JSONDecodeError:
+                parsed = {}
+            if isinstance(parsed, dict):
+                context["reasons"] = {str(key): str(value) for key, value in parsed.items()}
+        lookup[str(row["Loan_number"])] = context
+    return lookup
+
+
+def _mapping_prediction_reason(row: pd.Series, context_lookup: dict[str, dict[str, object]]) -> str:
+    loan_reasons = context_lookup.get(str(row["loan_number"]), {}).get("reasons", {})
+    parts: list[str] = []
+    seen: set[str] = set()
+    for day in str(row["date"]).split(","):
+        day = day.strip()
+        if not day:
+            continue
+        reason = loan_reasons.get(day)
+        if reason and reason not in seen:
+            seen.add(reason)
+            parts.append(reason)
+    if parts:
+        return " ".join(parts)
+    return "Reason not available from prediction output for this campaign mapping."
+
+
+def _extract_scheduler_emi_dates(raw_value: object) -> list[str]:
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, list):
+        items = raw_value
+    else:
+        if pd.isna(raw_value):
+            return []
+        text = str(raw_value).strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = text
+        if isinstance(parsed, list):
+            items = parsed
+        else:
+            items = [part.strip() for part in str(parsed).split(",") if part.strip()]
+
+    dates: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        value = str(item).strip()
+        if not value:
+            continue
+        try:
+            normalized = datetime.strptime(value, "%d-%m-%Y").strftime("%d-%m-%Y")
+        except ValueError:
+            continue
+        if normalized not in seen:
+            seen.add(normalized)
+            dates.append(normalized)
+    return dates
+
+
+def resolve_scheduler_emi_dates(
+    conn,
+    *,
+    source_schema: str,
+    target_schema: str,
+    logger: logging.Logger,
+) -> list[str]:
+    candidate_refs: list[sql.Composable] = [sql.Identifier("data_config")]
+    seen = {"data_config"}
+    for schema_name in (source_schema, target_schema):
+        key = f"{schema_name}.data_config"
+        if schema_name and key not in seen:
+            seen.add(key)
+            candidate_refs.append(sql.SQL("{}.{}").format(sql.Identifier(schema_name), sql.Identifier("data_config")))
+
+    for table_ref in candidate_refs:
+        try:
+            row = conn.execute(
+                sql.SQL("SELECT value FROM {} WHERE key_name = %s LIMIT 1").format(table_ref),
+                (EMI_DATES_CONFIG_KEY,),
+            ).fetchone()
+        except errors.UndefinedTable:
+            conn.rollback()
+            continue
+        except Exception:
+            logger.exception("Scheduler EMI date lookup failed.")
+            conn.rollback()
+            break
+
+        if not row:
+            continue
+
+        emi_dates = _extract_scheduler_emi_dates(row[0])
+        if emi_dates:
+            logger.info("Resolved scheduler EMI dates from data_config | key=%s emi_dates=%s", EMI_DATES_CONFIG_KEY, emi_dates)
+            return emi_dates
+
+    return []
+
+
+def _derive_emi_cycles_from_dates(date_values: list[str]) -> list[int]:
+    cycles: list[int] = []
+    seen: set[int] = set()
+    for value in date_values:
+        try:
+            day = datetime.strptime(str(value).strip(), "%d-%m-%Y").day
+        except ValueError:
+            continue
+        if day not in seen:
+            seen.add(day)
+            cycles.append(day)
+    return sorted(cycles)
+
+
+def _build_campaign_assignment_groups(
+    prediction_file: Path,
+    *,
+    source_month_label: str,
+    prediction_month_label: str,
+    model_name: str,
+    emi_cycles: list[int],
+    vertical: str,
+    vendors: list[str] | None = None,
+    vendor_map: dict[str, list[str]] | None = None,
+    configured_emi_dates: list[str] | None = None,
+    run_token: str,
+) -> pd.DataFrame:
+    df = pd.read_csv(prediction_file)
+    df = df[df["MONTH"] == prediction_month_label].copy()
+    rows: list[dict] = []
+
+    for _, row in df.iterrows():
+        loan_number = str(row["Loan_number"])
+        risk = str(row.get("SOURCE_RISK", row.get("RISK", "LOW"))).upper()
+        risk_code = RISK_CODES.get(risk, "LR")
+        for day in ALL_CAMPAIGN_DAYS:
+            for strategy in str(row.get(day, "")).split("|"):
+                parsed = _parse_strategy(strategy.strip())
+                if parsed is None:
+                    continue
+                mode, send_time, language = parsed
+                campaign_type, due_type, campaign_dates = _due_bucket(day, configured_emi_dates=configured_emi_dates or [])
+                vertical_value = str(row.get("SOURCE_VERTICAL", row.get("VERTICAL", vertical))).strip().upper()
+                if not vertical_value or vertical_value == "UNKNOWN":
+                    vertical_value = vertical.upper()
+                template_name = _template_name(
+                    due_type=due_type,
+                    mode=mode,
+                    language=language,
+                )
+                emi_cycle = _resolve_row_emi_cycle(row, emi_cycles)
+                dataset_name = f"{due_type}|{NAME_CHANNEL_BY_MODE[mode]}|{vertical_value}|{language}|{risk_code}|{emi_cycle}"
+                mode_vendors = (vendor_map[mode] if vendor_map is not None and mode in vendor_map else (vendors or []))
+                for vendor in mode_vendors:
+                    base_name = _scheduler_name(
+                        due_type=due_type,
+                        mode=mode,
+                        vertical=vertical_value,
+                        language=language,
+                        emi_cycle=emi_cycle,
+                        vendor=vendor,
+                        risk_code=risk_code,
+                        run_token=run_token,
+                    )
+                    rows.append(
+                        {
+                            "loan_number": loan_number,
+                            "base_name": base_name,
+                            "mode": mode,
+                            "date": campaign_dates,
+                            "time": send_time,
+                            "template_name": template_name,
+                            "dataset_name": dataset_name,
+                            "vendor": vendor,
+                            "language": language,
+                            "active": "T",
+                            "source_month": source_month_label,
+                            "prediction_month": prediction_month_label,
+                            "model_name": model_name,
+                            "emi_cycle": emi_cycle,
+                            "risk": risk_code,
+                            "vertical": vertical_value,
+                            "campaign_type": campaign_type,
+                            "due_type": due_type,
+                        }
+                    )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "loan_number",
+                "base_name",
+                "mode",
+                "date",
+                "time",
+                "template_name",
+                "dataset_name",
+                "vendor",
+                "language",
+                "active",
+                "source_month",
+                "prediction_month",
+                "model_name",
+                "emi_cycle",
+                "risk",
+                "vertical",
+                "campaign_type",
+                "due_type",
+                "prediction_reason",
+            ]
+        )
+
+    result = pd.DataFrame(rows).drop_duplicates()
+    group_cols = [col for col in result.columns if col != "date"]
+    result = result.groupby(group_cols, as_index=False)["date"].agg(_join_campaign_days)
+
+    group_cols = [col for col in result.columns if col not in {"base_name", "name", "time"}]
+    result = result.groupby(group_cols, as_index=False).agg(
+        {
+            "base_name": "first",
+            "time": _join_campaign_times,
+        }
+    )
+    return result
+
+
+def _prepare_campaign_outputs(
+    prediction_file: Path,
+    *,
+    source_month_label: str,
+    prediction_month_label: str,
+    model_name: str,
+    emi_cycles: list[int],
+    vertical: str,
+    vendors: list[str] | None = None,
+    vendor_map: dict[str, list[str]] | None = None,
+    configured_emi_dates: list[str] | None = None,
+    run_date: datetime | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    run_token = (run_date or datetime.now(timezone.utc)).strftime("%d%m%y")
+    assignment_groups = _build_campaign_assignment_groups(
+        prediction_file,
+        source_month_label=source_month_label,
+        prediction_month_label=prediction_month_label,
+        model_name=model_name,
+        emi_cycles=emi_cycles,
+        vertical=vertical,
+        vendors=vendors,
+        vendor_map=vendor_map,
+        configured_emi_dates=configured_emi_dates or [],
+        run_token=run_token,
+    )
+    if assignment_groups.empty:
+        empty_campaigns = pd.DataFrame(
+            columns=[
+                "name",
+                "mode",
+                "date",
+                "time",
+                "template_name",
+                "dataset_name",
+                "vendor",
+                "active",
+                "source_month",
+                "prediction_month",
+                "model_name",
+                "emi_cycle",
+                "risk",
+                "vertical",
+                "campaign_type",
+                "due_type",
+            ]
+        )
+        empty_mappings = pd.DataFrame(
+            columns=[
+                "campaign_name",
+                "loan_number",
+                "mode",
+                "date",
+                "time",
+                "vendor",
+                "language",
+                "source_month",
+                "prediction_month",
+                "model_name",
+                "emi_cycle",
+                "risk",
+                "vertical",
+                "campaign_type",
+                "due_type",
+                "prediction_reason",
+            ]
+        )
+        return empty_campaigns, empty_mappings
+
+    campaigns = assignment_groups.drop(columns=["loan_number"]).drop_duplicates()
+    campaigns = campaigns.sort_values(["base_name", "time", "date"]).reset_index(drop=True)
+    duplicate_index = campaigns.groupby("base_name").cumcount() + 1
+    duplicate_count = campaigns.groupby("base_name")["base_name"].transform("size")
+    campaigns["name"] = campaigns["base_name"]
+    campaigns.loc[duplicate_count > 1, "name"] = (
+        campaigns.loc[duplicate_count > 1, "base_name"] + "_" + duplicate_index.loc[duplicate_count > 1].astype(str)
+    )
+    campaigns["dataset_name"] = campaigns.apply(
+        lambda row: _dataset_name(
+            due_type=str(row["due_type"]),
+            mode=str(row["mode"]),
+            vertical=str(row["vertical"]),
+            language=str(row["template_name"]).rsplit("_", 1)[-1],
+            risk_code=str(row["risk"]),
+            emi_cycle=int(row["emi_cycle"]),
+            date_value=str(row["date"]),
+            time_value=str(row["time"]),
+        ),
+        axis=1,
+    )
+
+    join_cols = [
+        "base_name",
+        "mode",
+        "date",
+        "time",
+        "template_name",
+        "vendor",
+        "language",
+        "active",
+        "source_month",
+        "prediction_month",
+        "model_name",
+        "emi_cycle",
+        "risk",
+        "vertical",
+        "campaign_type",
+        "due_type",
+    ]
+    mappings = assignment_groups.merge(campaigns[["name", *join_cols]], on=join_cols, how="left")
+    mappings = mappings.rename(columns={"name": "campaign_name"})
+    mappings = mappings[
+        [
+            "campaign_name",
+            "loan_number",
+            "mode",
+            "date",
+            "time",
+            "vendor",
+            "language",
+            "source_month",
+            "prediction_month",
+            "model_name",
+            "emi_cycle",
+            "risk",
+            "vertical",
+            "campaign_type",
+            "due_type",
+        ]
+    ].drop_duplicates()
+    context_lookup = _load_prediction_context_lookup(prediction_file, prediction_month_label)
+    mappings["prediction_reason"] = mappings.apply(
+        lambda row: _mapping_prediction_reason(row, context_lookup),
+        axis=1,
+    )
+
+    campaign_output = campaigns[
+        [
+            "name",
+            "mode",
+            "date",
+            "time",
+            "template_name",
+            "dataset_name",
+            "vendor",
+            "active",
+            "source_month",
+            "prediction_month",
+            "model_name",
+            "emi_cycle",
+            "risk",
+            "vertical",
+            "campaign_type",
+            "due_type",
+        ]
+    ]
+    return campaign_output, mappings
+
+
+def build_campaign_recommendations(
+    prediction_file: Path,
+    *,
+    source_month_label: str,
+    prediction_month_label: str,
+    model_name: str,
+    emi_cycles: list[int],
+    vertical: str,
+    vendors: list[str],
+    run_date: datetime | None = None,
+) -> pd.DataFrame:
+    campaign_rows, _ = _prepare_campaign_outputs(
+        prediction_file,
+        source_month_label=source_month_label,
+        prediction_month_label=prediction_month_label,
+        model_name=model_name,
+        emi_cycles=emi_cycles,
+        vertical=vertical,
+        vendors=vendors,
+        run_date=run_date,
+    )
+    return campaign_rows
+
+
+def build_campaign_mappings(
+    prediction_file: Path,
+    *,
+    source_month_label: str,
+    prediction_month_label: str,
+    model_name: str,
+    emi_cycles: list[int],
+    vertical: str,
+    vendors: list[str],
+    run_date: datetime | None = None,
+) -> pd.DataFrame:
+    _, mapping_rows = _prepare_campaign_outputs(
+        prediction_file,
+        source_month_label=source_month_label,
+        prediction_month_label=prediction_month_label,
+        model_name=model_name,
+        emi_cycles=emi_cycles,
+        vertical=vertical,
+        vendors=vendors,
+        run_date=run_date,
+    )
+    return mapping_rows
+
+
+def store_campaign_recommendations(
+    conn,
+    schema: str,
+    table: str,
+    campaign_rows: pd.DataFrame,
+    *,
+    source_month_label: str,
+    prediction_month_label: str,
+    model_name: str,
+) -> int:
+    ensure_campaign_table(conn, schema, table)
+    conn.execute(
+        sql.SQL(
+            """
+            DELETE FROM {table_ref}
+            WHERE source_month = %s
+              AND prediction_month = %s
+              AND model_name = %s
+            """
+        ).format(table_ref=qualified_identifier(schema, table)),
+        (source_month_label, prediction_month_label, model_name),
+    )
+    if campaign_rows.empty:
+        return 0
+
+    now = datetime.now(timezone.utc)
+    actor = "campaign-model"
+    rows = []
+    for _, row in campaign_rows.iterrows():
+        rows.append(
+            (
+                row["name"],
+                row["mode"],
+                row["date"],
+                row["time"],
+                row["template_name"],
+                row["dataset_name"],
+                row["vendor"],
+                row["active"],
+                row["source_month"],
+                row["prediction_month"],
+                row["model_name"],
+                int(row["emi_cycle"]),
+                row["risk"],
+                row["vertical"],
+                row["campaign_type"],
+                row["due_type"],
+                now,
+                now,
+                actor,
+                actor,
+            )
+        )
+
+    query = sql.SQL(
+        """
+        INSERT INTO {table_ref} (
+            name,
+            mode,
+            date,
+            time,
+            template_name,
+            dataset_name,
+            vendor,
+            active,
+            source_month,
+            prediction_month,
+            model_name,
+            emi_cycle,
+            risk,
+            vertical,
+            campaign_type,
+            due_type,
+            created_at,
+            modified_at,
+            created_by,
+            modified_by
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+    ).format(table_ref=qualified_identifier(schema, table))
+    with conn.cursor() as cur:
+        cur.executemany(query, rows)
+    return len(rows)
+
+
+def store_campaign_mappings(
+    conn,
+    schema: str,
+    table: str,
+    mapping_rows: pd.DataFrame,
+    *,
+    source_month_label: str,
+    prediction_month_label: str,
+    model_name: str,
+) -> int:
+    ensure_campaign_mapping_table(conn, schema, table)
+    conn.execute(
+        sql.SQL(
+            """
+            DELETE FROM {table_ref}
+            WHERE source_month = %s
+              AND prediction_month = %s
+              AND model_name = %s
+            """
+        ).format(table_ref=qualified_identifier(schema, table)),
+        (source_month_label, prediction_month_label, model_name),
+    )
+    if mapping_rows.empty:
+        return 0
+
+    now = datetime.now(timezone.utc)
+    actor = "campaign-model"
+    rows = []
+    for _, row in mapping_rows.iterrows():
+        rows.append(
+            (
+                row["campaign_name"],
+                row["loan_number"],
+                row["mode"],
+                row["date"],
+                row["time"],
+                row["vendor"],
+                row["language"],
+                row["source_month"],
+                row["prediction_month"],
+                row["model_name"],
+                int(row["emi_cycle"]),
+                row["risk"],
+                row["vertical"],
+                row["campaign_type"],
+                row["due_type"],
+                row.get("prediction_reason"),
+                now,
+                now,
+                actor,
+                actor,
+            )
+        )
+
+    query = sql.SQL(
+        """
+        INSERT INTO {table_ref} (
+            campaign_name,
+            loan_number,
+            mode,
+            date,
+            time,
+            vendor,
+            language,
+            source_month,
+            prediction_month,
+            model_name,
+            emi_cycle,
+            risk,
+            vertical,
+            campaign_type,
+            due_type,
+            prediction_reason,
+            created_at,
+            modified_at,
+            created_by,
+            modified_by
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+    ).format(table_ref=qualified_identifier(schema, table))
+    with conn.cursor() as cur:
+        cur.executemany(query, rows)
+    return len(rows)
+
+def select_drift_feature_columns(
+    feature_columns: list[str],
+    *,
+    excluded_prefixes: list[str],
+    excluded_exact: list[str],
+) -> list[str]:
+    exact = {value.strip() for value in excluded_exact if value.strip()}
+    prefixes = [value.strip() for value in excluded_prefixes if value.strip()]
+    selected = []
+    for column in feature_columns:
+        if column in exact:
+            continue
+        if any(column.startswith(prefix) for prefix in prefixes):
+            continue
+        selected.append(column)
+    return selected
+
+
+def _load_metrics_metadata(metrics_file: Path) -> dict[str, object]:
+    if not metrics_file.exists():
+        return {}
+    try:
+        return json.loads(metrics_file.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+# def compute_model_drift_metrics(
+#     *,
+#     feature_file: Path,
+#     schedule_file: Path,
+#     base_population_file: Path,
+#     model_file: Path,
+#     metrics_file: Path,
+#     source_month_label: str,
+# ) -> dict[str, object]:
+#     bundle = joblib.load(model_file)
+#     target_offset_months = int(bundle.get("target_offset_months", 1))
+#     history_window_months = int(bundle.get("history_window_months", 1))
+
+#     dataset = prepare_next_month_dataset(
+#         feature_file=feature_file,
+#         schedule_file=schedule_file,
+#         target_offset_months=target_offset_months,
+#         history_window_months=history_window_months,
+#     )
+#     base_population = load_base_population(base_population_file, source_month_label)
+#     prediction_rows, blank_rows = build_prediction_population(
+#         dataset=dataset,
+#         base_population=base_population,
+#         prediction_source_month=source_month_label,
+#     )
+    
+#     metrics_metadata = _load_metrics_metadata(metrics_file)
+#     # Load original training baseline matrix from the bundle
+#     if "baseline_matrix" not in bundle:
+#         raise ValueError("Model bundle is missing 'baseline_matrix'. Please retrain the model to save the baseline.")
+    
+#     baseline_matrix = bundle["baseline_matrix"].reindex(columns=bundle["feature_columns"], fill_value=0)
+#     baseline_source_months = [str(value) for value in metrics_metadata.get("train_source_months", [])]
+    
+#     # Use the FULL inference population (no account matching)
+#     inference_matrix = build_feature_matrix(prediction_rows).reindex(columns=bundle["feature_columns"], fill_value=0)
+
+#     # baseline_source_months, baseline_selection_method = resolve_drift_baseline_source_months(
+#     #     dataset,
+#     #     source_month_label=source_month_label,
+#     #     history_window_months=history_window_months,
+#     #     metrics_metadata=metrics_metadata,
+#     #     baseline_mode=drift_baseline_mode,
+#     # )
+#     # if baseline_source_months:
+#     #     baseline_rows = split_by_source_month(dataset, baseline_source_months, require_target=False)
+#     # else:
+#     #     baseline_rows = dataset.copy()
+#     #     baseline_source_months = sorted(baseline_rows["SOURCE_MONTH"].dropna().astype(str).unique().tolist())
+#     #     baseline_selection_method = "all_source_months"
+
+#     # inference_accounts = set(prediction_rows["APAC_CARD_NUMBER"].dropna().astype(str).tolist())
+#     # baseline_account_count_before = int(baseline_rows["APAC_CARD_NUMBER"].nunique()) if "APAC_CARD_NUMBER" in baseline_rows.columns else 0
+#     # matched_inference_rows = prediction_rows.copy()
+#     # if inference_accounts and "APAC_CARD_NUMBER" in baseline_rows.columns:
+#     #     matched_baseline_rows = baseline_rows[baseline_rows["APAC_CARD_NUMBER"].astype(str).isin(inference_accounts)].copy()
+#     #     matched_account_values = set(matched_baseline_rows["APAC_CARD_NUMBER"].dropna().astype(str).tolist())
+#     #     matched_account_count = int(matched_baseline_rows["APAC_CARD_NUMBER"].nunique())
+#     #     if not matched_baseline_rows.empty and matched_account_values:
+#     #         baseline_rows = matched_baseline_rows
+#     #         matched_inference_rows = prediction_rows[prediction_rows["APAC_CARD_NUMBER"].astype(str).isin(matched_account_values)].copy()
+#     #         baseline_selection_method = f"{baseline_selection_method}_matched_accounts"
+#     #     else:
+#     #         matched_account_count = 0
+#     # else:
+#     #     matched_account_count = 0
+
+#     # drift_feature_columns = select_drift_feature_columns(
+#     #     bundle["feature_columns"],
+#     # )
+#     # baseline_matrix = build_feature_matrix(baseline_rows).reindex(columns=bundle["feature_columns"], fill_value=0)
+#     # inference_matrix = build_feature_matrix(matched_inference_rows).reindex(columns=bundle["feature_columns"], fill_value=0)
+#     # report = compute_drift_report(
+#     #     baseline_df=baseline_matrix,
+#     #     inference_df=inference_matrix,
+#     #     feature_columns=drift_feature_columns,
+#     #     blank_inference_rows=len(blank_rows),
+#     # )
+#     # report["baseline_source_months"] = baseline_source_months
+#     # report["baseline_selection_method"] = baseline_selection_method
+#     # report["drift_baseline_mode"] = drift_baseline_mode
+#     # report["baseline_account_count_before_match"] = baseline_account_count_before
+#     # report["baseline_account_count_after_match"] = int(baseline_rows["APAC_CARD_NUMBER"].nunique()) if "APAC_CARD_NUMBER" in baseline_rows.columns else 0
+#     # report["matched_inference_account_count"] = int(matched_inference_rows["APAC_CARD_NUMBER"].nunique()) if "APAC_CARD_NUMBER" in matched_inference_rows.columns else matched_account_count
+#     # report["inference_account_count"] = int(prediction_rows["APAC_CARD_NUMBER"].nunique()) if "APAC_CARD_NUMBER" in prediction_rows.columns else 0
+#     # report["history_window_months"] = history_window_months
+#     # return report
+
+
+#     drift_feature_columns = select_drift_feature_columns(
+#         bundle["feature_columns"],
+#     )
+    
+#     report = compute_drift_report(
+#         baseline_df=baseline_matrix,
+#         inference_df=inference_matrix,
+#         feature_columns=drift_feature_columns,
+#         blank_inference_rows=len(blank_rows),
+#     )
+    
+#     report["baseline_source_months"] = baseline_source_months
+#     report["baseline_selection_method"] = "training_bundle"
+#     report["drift_baseline_mode"] = "training_bundle"
+#     report["baseline_account_count_before_match"] = len(baseline_matrix)
+#     report["baseline_account_count_after_match"] = len(baseline_matrix)
+#     report["matched_inference_account_count"] = len(inference_matrix)
+#     report["inference_account_count"] = len(inference_matrix)
+#     report["history_window_months"] = history_window_months
+    
+#     return report
+
+
+#logic for calculating drift from mdole file,  from training 
+# def compute_model_drift_metrics(
+#     *,
+#     train_feature_file: Path,
+#     inference_feature_file: Path,
+#     schedule_file: Path,
+#     base_population_file: Path,
+#     model_file: Path,
+#     metrics_file: Path,
+#     source_month_label: str,
+# ) -> dict[str, object]:
+#     bundle = joblib.load(model_file)
+#     target_offset_months = int(bundle.get("target_offset_months", 1))
+#     history_window_months = int(bundle.get("history_window_months", 1))
+
+#     # --- 1. BUILD INFERENCE MATRIX FROM INFERENCE CSV ---
+#     dataset = prepare_next_month_dataset(
+#         feature_file=inference_feature_file,
+#         schedule_file=schedule_file,
+#         target_offset_months=target_offset_months,
+#         history_window_months=history_window_months,
+#     )
+#     base_population = load_base_population(base_population_file, source_month_label)
+#     prediction_rows, blank_rows = build_prediction_population(
+#         dataset=dataset,
+#         base_population=base_population,
+#         prediction_source_month=source_month_label,
+#     )
+#     inference_matrix = build_feature_matrix(prediction_rows).reindex(columns=bundle["feature_columns"], fill_value=0)
+
+#     # --- 2. BUILD BASELINE MATRIX FROM TRAIN CSV ---
+#     metrics_metadata = _load_metrics_metadata(metrics_file)
+#     baseline_source_months = [str(value) for value in metrics_metadata.get("train_source_months", [])]
+    
+#     if not train_feature_file.exists():
+#         raise FileNotFoundError(f"Training feature file not found for drift calculation: {train_feature_file}")
+    
+#     train_df = pd.read_csv(train_feature_file)
+#     # Filter it to only include the months the model actually trained on
+#     if baseline_source_months and "SOURCE_MONTH" in train_df.columns:
+#         train_df = train_df[train_df["SOURCE_MONTH"].astype(str).isin(baseline_source_months)]
+        
+#     # Cap it at 10,000 rows just like the original training script did to keep drift math fast
+#     if len(train_df) > 10000:
+#         train_df = train_df.sample(n=10000, random_state=42)
+        
+#     baseline_matrix = build_feature_matrix(train_df).reindex(columns=bundle["feature_columns"], fill_value=0)
+
+#     # --- 3. CALCULATE DRIFT ---
+#     drift_feature_columns = select_drift_feature_columns(
+#         bundle["feature_columns"],
+#     )
+    
+#     report = compute_drift_report(
+#         baseline_df=baseline_matrix,
+#         inference_df=inference_matrix,
+#         feature_columns=drift_feature_columns,
+#         blank_inference_rows=len(blank_rows),
+#     )
+    
+#     report["baseline_source_months"] = baseline_source_months
+#     report["baseline_selection_method"] = "train_csv_file"
+#     report["drift_baseline_mode"] = "train_csv_file"
+#     report["baseline_account_count_before_match"] = len(baseline_matrix)
+#     report["baseline_account_count_after_match"] = len(baseline_matrix)
+#     report["matched_inference_account_count"] = len(inference_matrix)
+#     report["inference_account_count"] = len(inference_matrix)
+#     report["history_window_months"] = history_window_months
+    
+#     return report
+
+def compute_model_drift_metrics(
+    *,
+    train_feature_file: Path,
+    inference_feature_file: Path,
+    schedule_file: Path,
+    base_population_file: Path,
+    model_file: Path,
+    metrics_file: Path,
+    source_month_label: str,
+) -> dict[str, object]:
+    
+    # --- ADDED: Print inference source month for analysis ---
+    print(f"\n[DRIFT ANALYSIS] Target Inference Source Month: {source_month_label}")
+
+    bundle = joblib.load(model_file)
+    target_offset_months = int(bundle.get("target_offset_months", 1))
+    history_window_months = int(bundle.get("history_window_months", 1))
+
+    # --- 1. BUILD INFERENCE MATRIX FROM INFERENCE CSV ---
+    dataset = prepare_next_month_dataset(
+        feature_file=inference_feature_file,
+        schedule_file=schedule_file,
+        target_offset_months=target_offset_months,
+        history_window_months=history_window_months,
+    )
+    base_population = load_base_population(base_population_file, source_month_label)
+    prediction_rows, blank_rows = build_prediction_population(
+        dataset=dataset,
+        base_population=base_population,
+        prediction_source_month=source_month_label,
+    )
+    
+    # --- ADDED: Print actual distinct months found in the inference data ---
+    actual_inf_months = prediction_rows["SOURCE_MONTH"].dropna().unique().tolist() if "SOURCE_MONTH" in prediction_rows.columns else []
+    print(f"[DRIFT ANALYSIS] Actual Inference Months in Data: {actual_inf_months}")
+    
+    inference_matrix = build_feature_matrix(prediction_rows).reindex(columns=bundle["feature_columns"], fill_value=0)
+
+    # --- 2. BUILD BASELINE MATRIX FROM TRAIN CSV ---
+    metrics_metadata = _load_metrics_metadata(metrics_file)
+    baseline_source_months = [str(value) for value in metrics_metadata.get("train_source_months", [])]
+
+    if baseline_source_months:
+        baseline_source_months = [baseline_source_months[-1]]
+    # --- ADDED: Print the baseline months we are comparing against ---
+    print(f"[DRIFT ANALYSIS] Baseline Training Source Months: {baseline_source_months}\n")
+    
+    if not train_feature_file.exists():
+        raise FileNotFoundError(f"Training feature file not found for drift calculation: {train_feature_file}")
+    
+    train_df = pd.read_csv(train_feature_file)
+    
+    # Apply the exact same rolling windows used in training
+    if history_window_months:
+        from pipeline_common import build_rolling_feature_windows
+        train_df = build_rolling_feature_windows(train_df, history_window_months)
+        
+    # Create the SOURCE_MONTH column that build_feature_matrix expects
+    if "MONTH" in train_df.columns:
+        train_df["SOURCE_MONTH"] = train_df["MONTH"]
+        
+    # Filter it to only include the months the model actually trained on
+    if baseline_source_months and "SOURCE_MONTH" in train_df.columns:
+        train_df = train_df[train_df["SOURCE_MONTH"].astype(str).isin(baseline_source_months)]
+        
+    # Cap it at 10,000 rows just like the original training script did to keep drift math fast
+    if len(train_df) > 10000:
+        train_df = train_df.sample(n=10000, random_state=42)
+        
+    baseline_matrix = build_feature_matrix(train_df).reindex(columns=bundle["feature_columns"], fill_value=0)
+
+    # --- 3. CALCULATE DRIFT ---
+    drift_feature_columns = select_drift_feature_columns(
+        bundle["feature_columns"],
+        excluded_prefixes=["SOURCE_MONTH_"],
+        excluded_exact=[],
+    )
+    
+    report = compute_drift_report(
+        baseline_df=baseline_matrix,
+        inference_df=inference_matrix,
+        feature_columns=drift_feature_columns,
+        blank_inference_rows=len(blank_rows),
+    )
+    
+    report["baseline_source_months"] = baseline_source_months
+    report["inference_source_month"] = source_month_label  # <-- ADDED to the saved report output!
+    report["baseline_selection_method"] = "train_csv_file"
+    report["drift_baseline_mode"] = "train_csv_file"
+    report["excluded_feature_prefixes"] = ["SOURCE_MONTH_"]
+    report["excluded_feature_columns"] = []
+    report["baseline_account_count_before_match"] = len(baseline_matrix)
+    report["baseline_account_count_after_match"] = len(baseline_matrix)
+    report["matched_inference_account_count"] = len(inference_matrix)
+    report["inference_account_count"] = len(inference_matrix)
+    report["history_window_months"] = history_window_months
+    
+    return report
+
+##logic changed of main to have same same fetching months as training
+# def main() -> None:
+#     args = parse_args()
+#     run_started_at = datetime.now(timezone.utc)
+#     prediction_file: Path | None = None
+#     prediction_rows = 0
+#     drift_report: dict[str, object] | None = None
+#     logger = setup_logging(args.log_file, "monthly_inference_pipeline")
+#     logger.info(
+#         "Monthly inference args: %s",
+#         {
+#             key: ("***" if key == "password" else value)
+#             for key, value in vars(args).items()
+#         },
+#     )
+#     source_month_label = month_label(args.source_month)
+#     prediction_month_label = month_label(args.predict_month)
+#     source_extract_base_file = default_communication_output_file(args.source_month)
+#     source_cases_file = current_cases_file(args.predict_month)
+
+
+
+#     try:
+#         source_period = parse_month(args.source_month)
+#         # history_fetches = [
+#         #     (str(source_period - 2), default_communication_output_file(str(source_period - 2))),
+#         #     (str(source_period - 1), default_communication_output_file(str(source_period - 1))),
+#         #     (args.source_month, source_extract_base_file),
+#         # ]
+#         history_fetches = []
+#         for i in range(args.history_window_months - 1, 0, -1):
+#             past_month = str(source_period - i)
+#             history_fetches.append((past_month, default_communication_output_file(past_month)))
+#         history_fetches.append((args.source_month, source_extract_base_file))
+#         with log_step(logger, "fetch_communication_history", source_month=args.source_month):
+#             for fetch_month, output_file in history_fetches:
+#                 fetch_communication_extract(args, output_file, fetch_month, logger)
+#         with log_step(logger, "fetch_current_cases", source_month=args.source_month):
+#             fetch_current_cases_extract(args, source_cases_file, args.predict_month, logger)
+
+#         source_extract_files = latest_extract_files(args.source_month)
+#         if not any(csv_has_rows(path) for path in source_extract_files):
+#             logger.warning("No latest communication rows found. Skipping prediction run.")
+#             print(
+#                 f"No latest communication rows found in {[str(path) for path in source_extract_files]}; skipped prediction run."
+#             )
+#             return
+
+#         # history_files = selected_history_files(args.source_month, source_extract_files)
+#         history_files = selected_history_files(args.source_month, source_extract_files, args.history_window_months)
+#         if len(history_files) < 3:
+#             raise FileNotFoundError(
+#                 "Need latest communication file plus previous two month files. "
+#                 f"Found {len(history_files)} files: {[str(path) for path in history_files]}"
+#             )
+#         logger.info("Selected communication history files: %s", [str(path) for path in history_files])
+
+#         with log_step(logger, "prepare_inference_features"):
+#             run_python_script(
+#                 "generate_strategy_dataset.py",
+#                 "--output-file",
+#                 str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+#                 "--month-source",
+#                 args.feature_month_source,
+#                 "--input-files",
+#                 *[str(path) for path in history_files],
+#                 logger=logger,
+#             )
+#         with log_step(logger, "build_schedule_dataset"):
+#             run_python_script(
+#                 "build_strategy_schedule_dataset.py",
+#                 "--input-file",
+#                 str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+#                 "--output-file",
+#                 str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv"),
+#                 logger=logger,
+#             )
+#         with log_step(logger, "build_monthly_features"):
+#             run_python_script(
+#                 "build_monthly_feature_dataset.py",
+#                 "--input-file",
+#                 str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+#                 "--output-file",
+#                 str(FEATURE_DATA_DIR / "strategy_monthly_features.csv"),
+#                 logger=logger,
+#             )
+
+#         if args.model in {"catboost", "catboost_3m"}:
+#             model_suffix = "catboost_3m" if args.model == "catboost_3m" else "catboost"
+#             prediction_file = (
+#                 PREDICTIONS_DIR
+#                 / f"{args.predict_month.replace('-', '_').lower()}_strategy_predictions_{model_suffix}.csv"
+#             )
+#             model_file = Path(args.model_file) if args.model_file else model_artifact_path(
+#                 MODEL_DIR,
+#                 f"next_month_strategy_{model_suffix}",
+#                 ".joblib",
+#                 args.model_version,
+#             )
+#             metrics_file = Path(args.metrics_file) if args.metrics_file else model_artifact_path(
+#                 METRICS_DIR,
+#                 f"next_month_strategy_{model_suffix}_metrics",
+#                 ".json",
+#                 args.model_version,
+#             )
+#             if args.model_serving == "mlflow":
+#                 with log_step(
+#                     logger,
+#                     "download_mlflow_model_bundle",
+#                     model_uri=args.mlflow_model_uri,
+#                     model_file=model_file,
+#                 ):
+#                     download_mlflow_model_bundle(args.mlflow_model_uri, model_file, logger)
+#             if not model_file.exists():
+#                 raise FileNotFoundError(
+#                     f"CatBoost model bundle not found: {model_file}. "
+#                     "Train the CatBoost model once or set MODEL_SERVING=mlflow and MLFLOW_MODEL_URI."
+#                 )
+#             with log_step(
+#                 logger,
+#                 "run_catboost_inference",
+#                 model_file=model_file,
+#                 prediction_file=prediction_file,
+#             ):
+#                 run_python_script(
+#                     "predict_next_month_strategy_catboost.py",
+#                     "--model-file",
+#                     str(model_file),
+#                     "--prediction-file",
+#                     str(prediction_file),
+#                     "--base-population-file",
+#                     str(source_cases_file),
+#                     "--prediction-source-months",
+#                     source_month_label,
+#                     logger=logger,
+#                 )
+#             with log_step(
+#                 logger,
+#                 "build_prediction_evidence",
+#                 prediction_file=prediction_file,
+#                 prediction_evidence_limit=args.prediction_evidence_limit,
+#             ):
+#                 evidence_command = [
+#                     "generate_prediction_evidence.py",
+#                     "--prediction-file",
+#                     str(prediction_file),
+#                     "--model-file",
+#                     str(model_file),
+#                     "--feature-file",
+#                     str(FEATURE_DATA_DIR / "strategy_monthly_features.csv"),
+#                     "--schedule-file",
+#                     str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv"),
+#                     "--base-population-file",
+#                     str(source_cases_file),
+#                     "--month-source",
+#                     args.feature_month_source,
+#                     "--communication-files",
+#                     *[str(path) for path in history_files],
+#                 ]
+#                 if args.prediction_evidence_limit > 0:
+#                     evidence_command.extend(["--limit", str(args.prediction_evidence_limit)])
+#                 run_python_script(
+#                     *evidence_command,
+#                     logger=logger,
+#                 )
+#         else:
+#             prediction_file = (
+#                 PREDICTIONS_DIR
+#                 / f"{args.predict_month.replace('-', '_').lower()}_strategy_predictions_logistic.csv"
+#             )
+#             model_file = MODEL_DIR / "next_month_strategy_logistic.joblib"
+#             metrics_file = METRICS_DIR / "next_month_strategy_logistic_metrics.json"
+#             with log_step(logger, "run_logistic_training_and_inference", prediction_file=prediction_file):
+#                 run_python_script(
+#                     "train_next_month_strategy_model_logistic.py",
+#                     "--model-file",
+#                     str(model_file),
+#                     "--metrics-file",
+#                     str(metrics_file),
+#                     "--prediction-file",
+#                     str(prediction_file),
+#                     "--prediction-source-months",
+#                     source_month_label,
+#                     logger=logger,
+#                 )
+
+#         with log_step(logger, "compute_model_drift", model_file=model_file, metrics_file=metrics_file):
+#             drift_report = compute_model_drift_metrics(
+#                 feature_file=FEATURE_DATA_DIR / "strategy_monthly_features.csv",
+#                 schedule_file=SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv",
+#                 base_population_file=source_cases_file,
+#                 model_file=model_file,
+#                 metrics_file=metrics_file,
+#                 source_month_label=source_month_label,
+#             )
+#             metrics_payload = _load_metrics_metadata(metrics_file)
+#             accuracy_value = None
+#             validation_metrics = metrics_payload.get("validation_metrics") if isinstance(metrics_payload, dict) else None
+#             train_metrics = metrics_payload.get("train_metrics") if isinstance(metrics_payload, dict) else None
+#             accuracy_source = validation_metrics if isinstance(validation_metrics, dict) and validation_metrics.get("average_day_accuracy") is not None else train_metrics
+#             if isinstance(accuracy_source, dict) and accuracy_source.get("average_day_accuracy") is not None:
+#                 accuracy_value = round(float(accuracy_source["average_day_accuracy"]) * 100, 2)
+#             drift_report["current_accuracy"] = accuracy_value
+#             logger.info(
+#                 "Drift summary | baseline_rows=%s inference_rows=%s blank_inference_rows=%s feature_count=%s drift_percentage=%s overall_psi=%s max_feature_psi=%s status=%s",
+#                 drift_report["baseline_rows"],
+#                 drift_report["inference_rows"],
+#                 drift_report["blank_inference_rows"],
+#                 drift_report["feature_count"],
+#                 drift_report["drift_percentage"],
+#                 drift_report["overall_psi"],
+#                 drift_report["max_feature_psi"],
+#                 drift_report["status"],
+#             )
+
+#         if not args.skip_db_store:
+#             with log_step(logger, "store_snapshots", target_schema=args.target_schema):
+#                 config = PostgresConfig(
+#                     host=args.host,
+#                     port=args.port,
+#                     dbname=args.dbname,
+#                     user=args.user,
+#                     password=args.password,
+#                 )
+#                 with connect_db(config) as conn:
+#                     campaign_vendor_map = resolve_campaign_vendors_by_mode(
+#                         conn,
+#                         source_schema=args.source_schema,
+#                         target_schema=args.target_schema,
+#                         source_table=args.source_table,
+#                         source_month=args.source_month,
+#                         fallback_vendor=args.campaign_vendor,
+#                         logger=logger,
+#                     )
+#                     configured_emi_dates = resolve_scheduler_emi_dates(
+#                         conn,
+#                         source_schema=args.source_schema,
+#                         target_schema=args.target_schema,
+#                         logger=logger,
+#                     )
+#                     prediction_rows = store_prediction_snapshots(
+#                         conn,
+#                         args.target_schema,
+#                         args.prediction_table,
+#                         prediction_file,
+#                         prediction_month_label,
+#                         args.model,
+#                     )
+#                     campaign_df, mapping_df = _prepare_campaign_outputs(
+#                         prediction_file,
+#                         source_month_label=source_month_label,
+#                         prediction_month_label=prediction_month_label,
+#                         model_name=args.model,
+#                         emi_cycles=_derive_emi_cycles_from_dates(configured_emi_dates),
+#                         vertical=args.campaign_vertical,
+#                         vendors=_extract_campaign_vendors(args.campaign_vendor) or [args.campaign_vendor],
+#                         vendor_map=campaign_vendor_map,
+#                         configured_emi_dates=configured_emi_dates or [],
+#                     )
+#                     campaign_rows = store_campaign_recommendations(
+#                         conn,
+#                         args.target_schema,
+#                         args.campaign_table,
+#                         campaign_df,
+#                         source_month_label=source_month_label,
+#                         prediction_month_label=prediction_month_label,
+#                         model_name=args.model,
+#                     )
+#                     mapping_rows = store_campaign_mappings(
+#                         conn,
+#                         args.target_schema,
+#                         args.campaign_mapping_table,
+#                         mapping_df,
+#                         source_month_label=source_month_label,
+#                         prediction_month_label=prediction_month_label,
+#                         model_name=args.model,
+#                     )
+#                     conn.commit()
+#                 print(f"Stored {prediction_rows:,} prediction snapshots in Postgres")
+#                 print(f"Stored {campaign_rows:,} campaign recommendation snapshots in Postgres")
+#                 print(f"Stored {mapping_rows:,} campaign mapping snapshots in Postgres")
+#         else:
+#             campaign_vendors = []
+#             configured_emi_dates = []
+#             campaign_df, mapping_df = _prepare_campaign_outputs(
+#                 prediction_file,
+#                 source_month_label=source_month_label,
+#                 prediction_month_label=prediction_month_label,
+#                 model_name=args.model,
+#                 emi_cycles=_derive_emi_cycles_from_dates(configured_emi_dates),
+#                 vertical=args.campaign_vertical,
+#                 vendors=_extract_campaign_vendors(args.campaign_vendor) or [args.campaign_vendor],
+#                 configured_emi_dates=configured_emi_dates or [],
+#             )
+
+#         # summary = build_prediction_summary(
+#         #     prediction_file=prediction_file,
+#         #     source_month_label=source_month_label,
+#         #     prediction_month_label=prediction_month_label,
+#         #     model_name=args.model,
+#         #     campaign_df=campaign_df,
+#         #     mapping_df=mapping_df,
+#         # )
+#         # if drift_report is not None:
+#         #     summary["drift"] = {
+#         #         key: value
+#         #         for key, value in drift_report.items()
+#         #         if key != "feature_metrics"
+#         #     }
+#         # summary_path = write_prediction_summary(
+#         #     summary=summary,
+#         #     output_path=prediction_summary_path(args.predict_month),
+#         #     logger=logger,
+#         # )
+
+#         summary = build_prediction_summary(
+#             prediction_file=prediction_file,
+#             source_month_label=source_month_label,
+#             prediction_month_label=prediction_month_label,
+#             model_name=args.model,
+#             campaign_df=campaign_df,
+#             mapping_df=mapping_df,
+#         )
+#         if drift_report is not None:
+#             # --- CHANGED: Save the full drift report including feature_metrics ---
+#             summary["drift"] = drift_report
+            
+#         summary_path = write_prediction_summary(
+#             summary=summary,
+#             output_path=prediction_summary_path(args.predict_month),
+#             logger=logger,
+#         )
+
+#         print(f"Prediction file: {prediction_file}")
+#         print(f"Metrics file: {metrics_file}")
+#         print(f"Prediction summary: {summary_path}")
+#         logger.info("Monthly inference completed successfully.")
+#     except Exception as exc:
+#         logger.exception("Monthly inference failed.")
+#         raise
+
+
+# if __name__ == "__main__":
+#     main()
+
+
+def main() -> None:
+    args = parse_args()
+    run_started_at = datetime.now(timezone.utc)
+    prediction_file: Path | None = None
+    prediction_rows = 0
+    drift_report: dict[str, object] | None = None
+    logger = setup_logging(args.log_file, "monthly_inference_pipeline")
+    logger.info(
+        "Monthly inference args: %s",
+        {
+            key: ("***" if key == "password" else value)
+            for key, value in vars(args).items()
+        },
+    )
+    source_month_label = month_label(args.source_month)
+    prediction_month_label = month_label(args.predict_month)
+    
+    # --- DYNAMIC HISTORY WINDOW: Read directly from local model file ---
+    if args.model in {"catboost", "catboost_3m"}:
+        model_suffix = "catboost_3m" if args.model == "catboost_3m" else "catboost"
+        model_file = Path(args.model_file) if args.model_file else model_artifact_path(
+            MODEL_DIR,
+            f"next_month_strategy_{model_suffix}",
+            ".joblib",
+            args.model_version,
+        )
+        
+        if model_file.exists():
+            bundle = joblib.load(model_file)
+            if "history_window_months" in bundle:
+                args.history_window_months = int(bundle["history_window_months"])
+                logger.info(
+                    "Loaded local model bundle from %s | Dynamically set history_window_months=%s",
+                    model_file,
+                    args.history_window_months,
+                )
+    # -------------------------------------------------------------------
+
+    source_extract_base_file = default_communication_output_file(args.source_month)
+    source_cases_file = current_cases_file(args.predict_month)
+
+    try:
+        source_period = parse_month(args.source_month)
+        history_fetches = []
+        for i in range(args.history_window_months - 1, 0, -1):
+            past_month = str(source_period - i)
+            history_fetches.append((past_month, default_communication_output_file(past_month)))
+        history_fetches.append((args.source_month, source_extract_base_file))
+        with log_step(logger, "fetch_communication_history", source_month=args.source_month):
+            for fetch_month, output_file in history_fetches:
+                fetch_communication_extract(args, output_file, fetch_month, logger)
+        with log_step(logger, "fetch_current_cases", source_month=args.source_month):
+            fetch_current_cases_extract(args, source_cases_file, args.predict_month, logger)
+
+        source_extract_files = latest_extract_files(args.source_month)
+        if not any(csv_has_rows(path) for path in source_extract_files):
+            logger.warning("No latest communication rows found. Skipping prediction run.")
+            print(
+                f"No latest communication rows found in {[str(path) for path in source_extract_files]}; skipped prediction run."
+            )
+            return
+
+        history_files = selected_history_files(args.source_month, source_extract_files, args.history_window_months)
+        if len(history_files) < 3:
+            raise FileNotFoundError(
+                "Need latest communication file plus previous two month files. "
+                f"Found {len(history_files)} files: {[str(path) for path in history_files]}"
+            )
+        logger.info("Selected communication history files: %s", [str(path) for path in history_files])
+
+        # with log_step(logger, "prepare_inference_features"):
+        #     run_python_script(
+        #         "generate_strategy_dataset.py",
+        #         "--output-file",
+        #         str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+        #         "--month-source",
+        #         args.feature_month_source,
+        #         "--input-files",
+        #         *[str(path) for path in history_files],
+        #         logger=logger,
+        #     )
+        with log_step(logger, "prepare_inference_features"):
+            run_python_script(
+                "generate_strategy_dataset.py",
+                "--output-file",
+                str(TRAINING_DATA_DIR / "strategy_training_dataset_inference.csv"),  # <-- CHANGED
+                "--month-source",
+                args.feature_month_source,
+                "--input-files",
+                *[str(path) for path in history_files],
+                logger=logger,
+            )
+        # with log_step(logger, "build_schedule_dataset"):
+        #     run_python_script(
+        #         "build_strategy_schedule_dataset.py",
+        #         "--input-file",
+        #         str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+        #         "--output-file",
+        #         str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv"),
+        #         logger=logger,
+        #     )
+        with log_step(logger, "build_schedule_dataset"):
+            run_python_script(
+                "build_strategy_schedule_dataset.py",
+                "--input-file",
+                str(TRAINING_DATA_DIR / "strategy_training_dataset_inference.csv"),  # <-- CHANGED
+                "--output-file",
+                str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv"),  # <-- CHANGED
+                logger=logger,
+            )
+        # with log_step(logger, "build_monthly_features"):
+        #     run_python_script(
+        #         "build_monthly_feature_dataset.py",
+        #         "--input-file",
+        #         str(TRAINING_DATA_DIR / "strategy_training_dataset_all_months.csv"),
+        #         "--output-file",
+        #         str(FEATURE_DATA_DIR / "strategy_monthly_features.csv"),
+        #         logger=logger,
+        #     )
+        with log_step(logger, "build_monthly_features"):
+            run_python_script(
+                "build_monthly_feature_dataset.py",
+                "--input-file",
+                str(TRAINING_DATA_DIR / "strategy_training_dataset_inference.csv"),  # <-- CHANGED
+                "--output-file",
+                str(FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv"),   # <-- CHANGED
+                logger=logger,
+            )
+
+        if args.model in {"catboost", "catboost_3m"}:
+            model_suffix = "catboost_3m" if args.model == "catboost_3m" else "catboost"
+            prediction_file = (
+                PREDICTIONS_DIR
+                / f"{args.predict_month.replace('-', '_').lower()}_strategy_predictions_{model_suffix}.csv"
+            )
+            model_file = Path(args.model_file) if args.model_file else model_artifact_path(
+                MODEL_DIR,
+                f"next_month_strategy_{model_suffix}",
+                ".joblib",
+                args.model_version,
+            )
+            metrics_file = Path(args.metrics_file) if args.metrics_file else model_artifact_path(
+                METRICS_DIR,
+                f"next_month_strategy_{model_suffix}_metrics",
+                ".json",
+                args.model_version,
+            )
+            
+            if not model_file.exists():
+                raise FileNotFoundError(
+                    f"CatBoost model bundle not found: {model_file}. "
+                    "Train the CatBoost model first."
+                )
+            with log_step(
+                logger,
+                "run_catboost_inference",
+                model_file=model_file,
+                prediction_file=prediction_file,
+            ):
+                run_python_script(
+                    "predict_next_month_strategy_catboost.py",
+                    "--model-file",
+                    str(model_file),
+                    "--prediction-file",
+                    str(prediction_file),
+                    "--base-population-file",
+                    str(source_cases_file),
+                    "--prediction-source-months",   
+                    source_month_label,
+                    "--feature-file",
+                    str(FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv"),
+                    "--schedule-file",
+                    str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv"),
+                    logger=logger,
+                )
+            with log_step(
+                logger,
+                "build_prediction_evidence",
+                prediction_file=prediction_file,
+                prediction_evidence_limit=args.prediction_evidence_limit,
+            ):
+                evidence_command = [
+                    "generate_prediction_evidence.py",
+                    "--prediction-file",
+                    str(prediction_file),
+                    "--model-file",
+                    str(model_file),
+                    "--feature-file",
+                    # str(FEATURE_DATA_DIR / "strategy_monthly_features.csv"),
+                    str(FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv"),   # <-- CHANGED
+                    "--schedule-file",
+                    # str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv"),
+                    str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv"),  # <-- CHANGED
+                    "--base-population-file",
+                    str(source_cases_file),
+                    "--month-source",
+                    args.feature_month_source,
+                    "--communication-files",
+                    *[str(path) for path in history_files],
+                ]
+                if args.prediction_evidence_limit > 0:
+                    evidence_command.extend(["--limit", str(args.prediction_evidence_limit)])
+                run_python_script(
+                    *evidence_command,
+                    logger=logger,
+                )
+        else:
+            prediction_file = (
+                PREDICTIONS_DIR
+                / f"{args.predict_month.replace('-', '_').lower()}_strategy_predictions_logistic.csv"
+            )
+            model_file = MODEL_DIR / "next_month_strategy_logistic.joblib"
+            metrics_file = METRICS_DIR / "next_month_strategy_logistic_metrics.json"
+            with log_step(logger, "run_logistic_training_and_inference", prediction_file=prediction_file):
+                run_python_script(
+                    "train_next_month_strategy_model_logistic.py",
+                    "--model-file",
+                    str(model_file),
+                    "--metrics-file",
+                    str(metrics_file),
+                    "--prediction-file",
+                    str(prediction_file),
+                    "--prediction-source-months",
+                    source_month_label,
+                    logger=logger,
+                )
+
+        with log_step(logger, "compute_model_drift", model_file=model_file, metrics_file=metrics_file):
+            drift_report = compute_model_drift_metrics(
+                # feature_file=FEATURE_DATA_DIR / "strategy_monthly_features.csv",
+                # feature_file=FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv",
+                # schedule_file=SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv",
+                train_feature_file=FEATURE_DATA_DIR / "strategy_monthly_features_train.csv",       # <-- NEW
+                inference_feature_file=FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv", # <-- CHANGED
+                schedule_file=SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv", # <-- CHANGED
+                base_population_file=source_cases_file,
+                model_file=model_file,
+                metrics_file=metrics_file,
+                source_month_label=source_month_label,
+            )
+            metrics_payload = _load_metrics_metadata(metrics_file)
+            accuracy_value = None
+            validation_metrics = metrics_payload.get("validation_metrics") if isinstance(metrics_payload, dict) else None
+            train_metrics = metrics_payload.get("train_metrics") if isinstance(metrics_payload, dict) else None
+            accuracy_source = validation_metrics if isinstance(validation_metrics, dict) and validation_metrics.get("average_day_accuracy") is not None else train_metrics
+            if isinstance(accuracy_source, dict) and accuracy_source.get("average_day_accuracy") is not None:
+                accuracy_value = round(float(accuracy_source["average_day_accuracy"]) * 100, 2)
+            drift_report["current_accuracy"] = accuracy_value
+            logger.info(
+                "Drift summary | baseline_rows=%s inference_rows=%s blank_inference_rows=%s feature_count=%s drift_percentage=%s overall_psi=%s max_feature_psi=%s status=%s",
+                drift_report["baseline_rows"],
+                drift_report["inference_rows"],
+                drift_report["blank_inference_rows"],
+                drift_report["feature_count"],
+                drift_report["drift_percentage"],
+                drift_report["overall_psi"],
+                drift_report["max_feature_psi"],
+                drift_report["status"],
+            )
+
+        if not args.skip_db_store:
+            with log_step(logger, "store_snapshots", target_schema=args.target_schema):
+                config = PostgresConfig(
+                    host=args.host,
+                    port=args.port,
+                    dbname=args.dbname,
+                    user=args.user,
+                    password=args.password,
+                )
+                with connect_db(config) as conn:
+                    campaign_vendor_map = resolve_campaign_vendors_by_mode(
+                        conn,
+                        source_schema=args.source_schema,
+                        target_schema=args.target_schema,
+                        source_table=args.source_table,
+                        source_month=args.source_month,
+                        fallback_vendor=args.campaign_vendor,
+                        logger=logger,
+                    )
+                    configured_emi_dates = resolve_scheduler_emi_dates(
+                        conn,
+                        source_schema=args.source_schema,
+                        target_schema=args.target_schema,
+                        logger=logger,
+                    )
+                    prediction_rows = store_prediction_snapshots(
+                        conn,
+                        args.target_schema,
+                        args.prediction_table,
+                        prediction_file,
+                        prediction_month_label,
+                        args.model,
+                    )
+                    campaign_df, mapping_df = _prepare_campaign_outputs(
+                        prediction_file,
+                        source_month_label=source_month_label,
+                        prediction_month_label=prediction_month_label,
+                        model_name=args.model,
+                        emi_cycles=_derive_emi_cycles_from_dates(configured_emi_dates),
+                        vertical=args.campaign_vertical,
+                        vendors=_extract_campaign_vendors(args.campaign_vendor) or [args.campaign_vendor],
+                        vendor_map=campaign_vendor_map,
+                        configured_emi_dates=configured_emi_dates or [],
+                    )
+                    campaign_rows = store_campaign_recommendations(
+                        conn,
+                        args.target_schema,
+                        args.campaign_table,
+                        campaign_df,
+                        source_month_label=source_month_label,
+                        prediction_month_label=prediction_month_label,
+                        model_name=args.model,
+                    )
+                    mapping_rows = store_campaign_mappings(
+                        conn,
+                        args.target_schema,
+                        args.campaign_mapping_table,
+                        mapping_df,
+                        source_month_label=source_month_label,
+                        prediction_month_label=prediction_month_label,
+                        model_name=args.model,
+                    )
+                    conn.commit()
+                print(f"Stored {prediction_rows:,} prediction snapshots in Postgres")
+                print(f"Stored {campaign_rows:,} campaign recommendation snapshots in Postgres")
+                print(f"Stored {mapping_rows:,} campaign mapping snapshots in Postgres")
+        else:
+            campaign_vendors = []
+            configured_emi_dates = []
+            campaign_df, mapping_df = _prepare_campaign_outputs(
+                prediction_file,
+                source_month_label=source_month_label,
+                prediction_month_label=prediction_month_label,
+                model_name=args.model,
+                emi_cycles=_derive_emi_cycles_from_dates(configured_emi_dates),
+                vertical=args.campaign_vertical,
+                vendors=_extract_campaign_vendors(args.campaign_vendor) or [args.campaign_vendor],
+                configured_emi_dates=configured_emi_dates or [],
+            )
+
+        summary = build_prediction_summary(
+            prediction_file=prediction_file,
+            source_month_label=source_month_label,
+            prediction_month_label=prediction_month_label,
+            model_name=args.model,
+            campaign_df=campaign_df,
+            mapping_df=mapping_df,
+        )
+        if drift_report is not None:
+            # --- CHANGED: Save the full drift report including feature_metrics ---
+            summary["drift"] = drift_report
+            
+        summary_path = write_prediction_summary(
+            summary=summary,
+            output_path=prediction_summary_path(args.predict_month),
+            logger=logger,
+        )
+
+        print(f"Prediction file: {prediction_file}")
+        print(f"Metrics file: {metrics_file}")
+        print(f"Prediction summary: {summary_path}")
+        logger.info("Monthly inference completed successfully.")
+    except Exception as exc:
+        logger.exception("Monthly inference failed.")
+        raise
+
+if __name__ == "__main__":
+    main()

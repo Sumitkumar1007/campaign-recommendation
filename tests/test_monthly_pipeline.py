@@ -1563,3 +1563,75 @@ def test_generate_prediction_evidence_combines_same_day_offsets_from_loaded_mont
     assert d_plus_5["historical_successfeature1"] == "SMS_SUCCESS_12PM_ENGLISH"
     assert d_plus_5["historical_successprecentage1"] == 100.0
 
+
+def test_predict_top_k_by_risk_dynamic_quotas_and_overrides() -> None:
+    class DummyModel:
+        def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+            return np.array([])
+    class DummyEncoder:
+        classes_ = np.array(["-", "SMS-9AM-ENGLISH", "WH-10AM-HINDI"])
+    X = pd.DataFrame({"x": [1, 2, 3, 4, 5, 6]})
+    dummy_model = DummyModel()
+    dummy_model.predict_proba = lambda X: np.array([
+        [0.70, 0.20, 0.10], # LOW, bounce=0 -> k=1 -> "-"
+        [0.70, 0.20, 0.10], # LOW, bounce=1 -> k=2 -> "-|SMS-9AM-ENGLISH"
+        [0.10, 0.65, 0.25], # MEDIUM, bounce=0 -> k=2 -> "SMS-9AM-ENGLISH|WH-10AM-HINDI"
+        [0.10, 0.65, 0.25], # MEDIUM, bounce=1 -> k=3 -> "SMS-9AM-ENGLISH|WH-10AM-HINDI|-"
+        [0.10, 0.25, 0.65], # HIGH, bounce=0 -> k=3 -> "WH-10AM-HINDI|SMS-9AM-ENGLISH|-"
+        [0.10, 0.25, 0.65], # HIGH, bounce=1 -> k=4 -> "WH-10AM-HINDI|SMS-9AM-ENGLISH|-" (fewer available classes)
+    ])
+    
+    output = predict_top_k_by_risk(
+        dummy_model,
+        DummyEncoder(),
+        X,
+        pd.Series(["LOW", "LOW", "MEDIUM", "MEDIUM", "HIGH", "HIGH"]),
+        bounce_flags=pd.Series([0, 1, 0, 1, 0, 1]),
+        day="D-2",
+    )
+    
+    assert output.tolist() == [
+        "-",
+        "-|SMS-9AM-ENGLISH",
+        "SMS-9AM-ENGLISH|WH-10AM-HINDI",
+        "SMS-9AM-ENGLISH|WH-10AM-HINDI|-",
+        "WH-10AM-HINDI|SMS-9AM-ENGLISH|-",
+        "WH-10AM-HINDI|SMS-9AM-ENGLISH|-",
+    ]
+    output_override = predict_top_k_by_risk(
+        dummy_model,
+        DummyEncoder(),
+        X,
+        pd.Series(["LOW", "LOW", "MEDIUM", "MEDIUM", "HIGH", "HIGH"]),
+        bounce_flags=pd.Series([0, 1, 0, 1, 0, 1]),
+        day="D-5",
+    )
+    
+    assert output_override.tolist() == [
+        "SMS-9AM-ENGLISH",
+        "SMS-9AM-ENGLISH|WH-10AM-HINDI",
+        "SMS-9AM-ENGLISH|WH-10AM-HINDI",
+        "SMS-9AM-ENGLISH|WH-10AM-HINDI",
+        "WH-10AM-HINDI|SMS-9AM-ENGLISH",
+        "WH-10AM-HINDI|SMS-9AM-ENGLISH",
+    ]
+def test_evidence_top_k_labels_with_probabilities_matches_prediction() -> None:
+    from generate_prediction_evidence import _top_k_labels_with_probabilities
+    class DummyModel:
+        def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+            return np.array([
+                [0.70, 0.20, 0.10],
+                [0.70, 0.20, 0.10],
+            ])
+    class DummyEncoder:
+        classes_ = np.array(["-", "SMS-9AM-ENGLISH", "WH-10AM-HINDI"])
+    X = pd.DataFrame({"x": [1, 2]})
+    labels, ranked = _top_k_labels_with_probabilities(
+        DummyModel(),
+        DummyEncoder(),
+        X,
+        pd.Series(["LOW", "LOW"]),
+        bounce_flags=pd.Series([0, 1]),
+        day="D-5",
+    )
+    assert labels.tolist() == ["SMS-9AM-ENGLISH", "SMS-9AM-ENGLISH|WH-10AM-HINDI"]

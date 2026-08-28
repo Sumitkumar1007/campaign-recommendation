@@ -576,6 +576,7 @@ def main() -> None:
                     source_period + target_offset_months
                 ).dt.to_timestamp().dt.strftime("%b-%Y").str.upper()
 
+                prediction_output["IS_NEW_CUSTOMER"] = "False"
                 for day in DAY_COLUMNS:
                     logger.info("Predicting day column | day=%s", day)
                     encoder = bundle["label_encoders"][day]
@@ -585,6 +586,9 @@ def main() -> None:
                         encoder,
                         X_pred,
                         prediction_rows["RISK"],
+                        bounce_flags=prediction_rows["bounce_flag"] if "bounce_flag" in prediction_rows.columns else None,
+                        day=day,
+                        logger=logger,
                     )
                 prediction_output["PREDICTION_REASON"] = [
                     build_prediction_reason(
@@ -628,6 +632,9 @@ def main() -> None:
                 )
                 for row_idx in range(len(blank_output))
             ]
+            blank_output["IS_NEW_CUSTOMER"] = "True"
+            new_loans = blank_output["Loan_number"].tolist()
+            logger.info("New customers identified (no history): count=%d, loan_numbers=%s", len(new_loans), new_loans)
             prediction_outputs.append(blank_output)
 
         if prediction_outputs:
@@ -643,6 +650,7 @@ def main() -> None:
                     "MONTH",
                     *SCHEDULE_DAY_COLUMNS,
                     "PREDICTION_REASON",
+                    "IS_NEW_CUSTOMER",
                 ]
             )
 
@@ -658,6 +666,7 @@ def main() -> None:
                     "MONTH",
                     *SCHEDULE_DAY_COLUMNS,
                     "PREDICTION_REASON",
+                    "IS_NEW_CUSTOMER",
                 ]
             ]
             prediction_output.to_csv(prediction_file, index=False)

@@ -8,10 +8,35 @@ import pandas as pd
 
 from pipeline_common import DAY_COLUMNS, build_feature_matrix, month_to_period, prepare_next_month_dataset
 from predict_next_month_strategy_catboost import build_prediction_population, load_base_population
-from project_paths import CASE_DATA_DIR, FEATURE_DATA_DIR, MODEL_DIR, SCHEDULE_DATA_DIR, TRAINING_DATA_DIR, ensure_parent_dir
+from project_paths import CASE_DATA_DIR, COMMUNICATION_DATA_DIR, FEATURE_DATA_DIR, MODEL_DIR, SCHEDULE_DATA_DIR, TRAINING_DATA_DIR, ensure_parent_dir
 
 CHANNEL_ORDER = ["SMS", "WH", "VOICE", "VOICE_BOT"]
 HOUR_ORDER = ["9AM", "10AM", "11AM", "12PM", "1PM", "2PM", "3PM", "4PM", "5PM", "6PM"]
+
+
+def _prepare_raw_communications(files: list[Path]) -> pd.DataFrame:
+    dfs = []
+    for file in files:
+        df = pd.read_csv(file)
+        res = pd.DataFrame()
+        res["APAC_CARD_NUMBER"] = df["apac_card_number"].astype(str).str.strip()
+        res["emi_date"] = pd.to_datetime(df["emi_date"], errors="coerce")
+        res["event_date"] = pd.to_datetime(df["date"], errors="coerce")
+        res["COMM_TYPE"] = df["communication_type"].str.upper()
+        res["LANGUAGE"] = df["verbiage_language"].str.upper()
+        res["IS_SUCCESS"] = df["comm_status"] == "DELIVERED"
+        
+        # Parse created_date to extract hour_bucket
+        created_dt = pd.to_datetime(df["created_date"], errors="coerce")
+        res["hour_bucket"] = created_dt.dt.hour
+        
+        # Drop rows with NaT/NaN in critical columns
+        res = res.dropna(subset=["emi_date", "event_date", "hour_bucket"]).copy()
+        
+        dfs.append(res)
+    if not dfs:
+        return pd.DataFrame()
+    return pd.concat(dfs, ignore_index=True)
 
 
 def _top_k_labels_with_probabilities(
@@ -19,21 +44,41 @@ def _top_k_labels_with_probabilities(
     encoder,
     X: pd.DataFrame,
     risks: pd.Series,
+    bounce_flags: pd.Series | None = None,
+    day: str | None = None,
     *,
     evidence_top_n: int = 3,
 ) -> tuple[pd.Series, list[list[tuple[str, float]]]]:
+    from pipeline_common import RISK_BOUNCE_TOP_K
+    
     probabilities = model.predict_proba(X)
     labels_output: list[str] = []
     ranked_output: list[list[tuple[str, float]]] = []
-    risk_top_k = {"LOW": 1, "MEDIUM": 2, "HIGH": 3}
-    for row_probs, risk in zip(probabilities, risks.fillna("LOW").astype(str), strict=False):
-        k = risk_top_k.get(risk.upper(), 1)
-        risk_indices = pd.Series(row_probs).argsort()[-k:][::-1]
-        top_indices = pd.Series(row_probs).argsort()[-max(evidence_top_n, k):][::-1]
-        risk_ranked_labels = [(str(encoder.classes_[index]), round(float(row_probs[index]), 6)) for index in risk_indices]
-        ranked_labels = [(str(encoder.classes_[index]), round(float(row_probs[index]), 6)) for index in top_indices]
-        labels_output.append("|".join(label for label, _ in risk_ranked_labels))
-        ranked_output.append(ranked_labels)
+
+    if bounce_flags is None:
+        bounce_flags = pd.Series(0, index=X.index)
+    else:
+        bounce_flags = pd.Series(bounce_flags).reindex(X.index).fillna(0).astype(int)
+
+    for row_probs, risk, bounce in zip(probabilities, risks.fillna("LOW").astype(str), bounce_flags, strict=False):
+        risk_upper = risk.upper()
+        if risk_upper not in {"LOW", "MEDIUM", "HIGH"}:
+            risk_upper = "LOW"
+            
+        b_val = 1 if bounce == 1 else 0
+        k = RISK_BOUNCE_TOP_K.get((risk_upper, b_val), 1)
+        
+        candidates = [(str(encoder.classes_[index]), round(float(row_probs[index]), 6)) for index in range(len(row_probs))]
+        candidates = sorted(candidates, key=lambda x: x[1], reverse=True)
+        
+        is_override_day = day in {"D-5", "D-1"}
+        if is_override_day:
+            candidates = [c for c in candidates if c[0] != "-"]
+            
+        risk_ranked = candidates[:k]
+        labels_output.append("|".join(label for label, _ in risk_ranked))
+        ranked_output.append(candidates[:max(evidence_top_n, k)])
+        
     return pd.Series(labels_output, index=X.index), ranked_output
 
 
@@ -153,6 +198,8 @@ def _prepare_probability_map(
             encoder,
             X_pred,
             prediction_population["RISK"],
+            bounce_flags=prediction_population["bounce_flag"] if "bounce_flag" in prediction_population.columns else None,
+            day=day,
             evidence_top_n=3,
         )
         output_key = "APAC_CARD_NUMBER" if "APAC_CARD_NUMBER" in prediction_population.columns else ("ENTITY_KEY" if "ENTITY_KEY" in prediction_population.columns else None)
@@ -220,13 +267,67 @@ def _fallback_reason(recommended: str, backup: str) -> str:
 def build_prediction_evidence(
     *,
     prediction_rows: pd.DataFrame,
-    training_df: pd.DataFrame,
+    training_df: pd.DataFrame = None,
     ranked_probability_map: dict[tuple[str, str], list[tuple[str, float]]],
-    base_population: pd.DataFrame,
+    base_population: pd.DataFrame = None,
     limit: int = 0,
+    raw_communications: pd.DataFrame = None,
 ) -> pd.DataFrame:
+    if raw_communications is not None:
+        records = []
+        for _, row in raw_communications.iterrows():
+            apac = str(row["APAC_CARD_NUMBER"]).strip()
+            emi_dt = pd.to_datetime(row["emi_date"])
+            ev_dt = pd.to_datetime(row["event_date"])
+            offset = (ev_dt - emi_dt).days
+            
+            if offset < 0:
+                day = f"D{offset}"
+            elif offset > 0:
+                day = f"D+{offset}"
+            else:
+                day = "D"
+                
+            month = emi_dt.strftime("%b-%Y").upper()
+            channel = str(row["COMM_TYPE"]).upper().strip()
+            lang = str(row["LANGUAGE"]).upper().strip()
+            if pd.isna(row["hour_bucket"]) or pd.isna(row["emi_date"]) or pd.isna(row["event_date"]):
+                continue
+            hour = int(row["hour_bucket"])
+            
+            if hour == 0:
+                hour_str = "12AM"
+            elif hour < 12:
+                hour_str = f"{hour}AM"
+            elif hour == 12:
+                hour_str = "12PM"
+            else:
+                hour_str = f"{hour-12}PM"
+                
+            success_col = f"{channel}_SUCCESS_{hour_str}_{lang}"
+            intensity_col = f"{channel}_TOTAL_INTENSITY"
+            
+            record = {
+                "APAC_CARD_NUMBER": apac,
+                "MONTH": month,
+                "DAY": day,
+                success_col: 1.0 if row["IS_SUCCESS"] else 0.0,
+                intensity_col: 1.0,
+            }
+            records.append(record)
+            
+        training_df = pd.DataFrame(records).fillna(0.0)
+        # Filter the generated training_df to the 3-month rolling window
+        pred_month_str = str(prediction_rows["MONTH"].iloc[0]) if not prediction_rows.empty else ""
+        training_df = _filter_training_history_window(training_df, pred_month_str, window_months=3)
+
+    if base_population is None:
+        base_population = pd.DataFrame()
+        base_population["APAC_CARD_NUMBER"] = prediction_rows["Loan_number"].astype(str).str.strip()
+        base_population["ENTITY_KEY"] = prediction_rows["Loan_number"].astype(str).str.strip()
+
     training_key = "ENTITY_KEY" if "ENTITY_KEY" in training_df.columns else "APAC_CARD_NUMBER"
-    exclude_cols = {training_key, "MONTH", "DAY", "RISK", "VERTICAL", "PREDICTED_STRATEGY"}
+    exclude_cols = {training_key, "MONTH", "DAY", "RISK", "VERTICAL", "PREDICTED_STRATEGY", "TARGET_SAMPLE_WEIGHT"}
     numeric_feature_cols = [c for c in training_df.columns if c not in exclude_cols and pd.api.types.is_numeric_dtype(training_df[c])]
     
     print(f"Aggregating 3-month training dataset grouped by {training_key} and DAY...")
@@ -405,12 +506,30 @@ def main() -> None:
         prediction_source_month=source_month,
     )
     
+    # Load raw communication files to calculate raw counts
+    comm_files = []
+    if args.communication_files:
+        comm_files = [Path(p) for p in args.communication_files]
+    elif args.communication_dir:
+        comm_files = list(Path(args.communication_dir).glob("*.csv"))
+    else:
+        comm_dir = COMMUNICATION_DATA_DIR
+        if comm_dir.exists():
+            comm_files = list(comm_dir.glob("*.csv")) + list(comm_dir.glob("MFL_COMMUNICATION_DATA/*.csv"))
+            
+    comm_files = [p for p in comm_files if p.exists()]
+    raw_comm_df = None
+    if comm_files:
+        print(f"Loading raw communications from {len(comm_files)} files to compute raw counts...")
+        raw_comm_df = _prepare_raw_communications(comm_files)
+
     evidence = build_prediction_evidence(
         prediction_rows=predictions,
         training_df=training_df,
         ranked_probability_map=ranked_probability_map,
         base_population=base_population,
         limit=args.limit,
+        raw_communications=raw_comm_df,
     )
     
     evidence.to_csv(output_file, index=False)

@@ -12,12 +12,19 @@ SCHEDULE_DAY_COLUMNS = [*PREDUE_DAY_COLUMNS, "D", *POSTDUE_DAY_COLUMNS]
 DAY_WEIGHT_COLUMN_MAP = {day: f"{day}__WEIGHT" for day in DAY_COLUMNS}
 DAY_WEIGHT_COLUMNS = [DAY_WEIGHT_COLUMN_MAP[day] for day in DAY_COLUMNS]
 NON_FEATURE_COLUMNS = DAY_COLUMNS + DAY_WEIGHT_COLUMNS + ["TARGET_MONTH", "TARGET_MONTH_PERIOD", "TARGET_RISK", "VERTICAL"]
-RISK_TOP_K = {
-    "LOW": 1,
-    "MEDIUM": 2,
-    "HIGH": 3,
+# RISK_TOP_K = {
+#     "LOW": 1,
+#     "MEDIUM": 2,
+#     "HIGH": 3,
+# }
+RISK_BOUNCE_TOP_K = {
+    ("LOW", 0): 1,
+    ("LOW", 1): 2,
+    ("MEDIUM", 0): 2,
+    ("MEDIUM", 1): 3,
+    ("HIGH", 0): 3,
+    ("HIGH", 1): 4,
 }
-
 
 
 def candidate_hours(send_hour_window: dict[str, int]) -> list[int]:
@@ -55,7 +62,8 @@ def build_rolling_feature_windows(
     numeric_columns = [
         col
         for col in features.columns
-        if col not in {key_column, "MONTH", "RISK", "VERTICAL", "MONTH_PERIOD"}
+        # if col not in {key_column, "MONTH", "RISK", "VERTICAL", "MONTH_PERIOD"}
+        if col not in {key_column, "MONTH", "RISK", "VERTICAL", "MONTH_PERIOD", "bounce_flag", "paid_flag"}
     ]
     lag_columns = [
         f"{column}_M{lag}"
@@ -63,7 +71,13 @@ def build_rolling_feature_windows(
         for lag in range(1, history_window_months + 1)
     ]
     if features.empty:
-        base_columns = [key_column, "MONTH", *lag_columns, "RISK"]
+        # base_columns = [key_column, "MONTH", *lag_columns, "RISK"]
+        base_columns = [key_column, "MONTH", *lag_columns]
+        if "bounce_flag" in features.columns:
+            base_columns.append("bounce_flag")
+        if "paid_flag" in features.columns:
+            base_columns.append("paid_flag")
+        base_columns.append("RISK")
         if "VERTICAL" in features.columns:
             base_columns.append("VERTICAL")
         return pd.DataFrame(columns=base_columns)
@@ -80,10 +94,23 @@ def build_rolling_feature_windows(
     )
     rolled["RISK"] = features["RISK"].fillna("UNKNOWN").astype(str).str.upper().values
     rolled[lag_columns] = rolled[lag_columns].fillna(0)
+    if "bounce_flag" in features.columns:
+        rolled["bounce_flag"] = pd.to_numeric(features["bounce_flag"], errors="coerce").fillna(0).astype(int).values
+    if "paid_flag" in features.columns:
+        rolled["paid_flag"] = pd.to_numeric(features["paid_flag"], errors="coerce").fillna(0).astype(int).values
+
+    returned_cols = [key_column, "MONTH", *lag_columns]
+    if "bounce_flag" in features.columns:
+        returned_cols.append("bounce_flag")
+    if "paid_flag" in features.columns:
+        returned_cols.append("paid_flag")
+    returned_cols.append("RISK")
     if "VERTICAL" in features.columns:
+        returned_cols.append("VERTICAL")
         rolled["VERTICAL"] = features["VERTICAL"].fillna("UNKNOWN").astype(str).str.upper().values
-        return rolled[[key_column, "MONTH", *lag_columns, "RISK", "VERTICAL"]]
-    return rolled[[key_column, "MONTH", *lag_columns, "RISK"]]
+    #     return rolled[[key_column, "MONTH", *lag_columns, "RISK", "VERTICAL"]]
+    # return rolled[[key_column, "MONTH", *lag_columns, "RISK"]]
+    return rolled[returned_cols]
 
 
 def prepare_next_month_dataset(
@@ -160,12 +187,72 @@ def predict_top_k_by_risk(
     encoder,
     X: pd.DataFrame,
     risks: pd.Series,
+    bounce_flags: pd.Series | None = None,
+    day: str | None = None,
+    logger = None,
 ) -> pd.Series:
     probabilities = model.predict_proba(X)
     output: list[str] = []
-    for row_probs, risk in zip(probabilities, risks.fillna("LOW").astype(str), strict=False):
-        k = RISK_TOP_K.get(risk.upper(), 1)
-        top_indices = row_probs.argsort()[-k:][::-1]
-        labels = [str(encoder.classes_[index]) for index in top_indices]
-        output.append("|".join(labels))
+    # for row_probs, risk in zip(probabilities, risks.fillna("LOW").astype(str), strict=False):
+    #     k = RISK_TOP_K.get(risk.upper(), 1)
+    #     top_indices = row_probs.argsort()[-k:][::-1]
+    #     labels = [str(encoder.classes_[index]) for index in top_indices]
+    #     output.append("|".join(labels))
+    total_rows = len(X)
+    risk_counts = {"LOW": 0, "MEDIUM": 0, "HIGH": 0}
+    bounce_counts = {0: 0, 1: 0}
+    quota_distribution = {}
+    minus_predictions_removed = 0
+    fewer_than_requested = 0
+    recommendation_counts = {}
+
+    if bounce_flags is None:
+        bounce_flags = pd.Series(0, index=X.index)
+    else:
+        bounce_flags = pd.Series(bounce_flags).reindex(X.index).fillna(0).astype(int)
+
+    for row_probs, risk, bounce in zip(probabilities, risks.fillna("LOW").astype(str), bounce_flags, strict=False):
+        risk_upper = risk.upper()
+        if risk_upper not in {"LOW", "MEDIUM", "HIGH"}:
+            risk_upper = "LOW"
+        risk_counts[risk_upper] += 1
+        
+        b_val = 1 if bounce == 1 else 0
+        bounce_counts[b_val] += 1
+        
+        k = RISK_BOUNCE_TOP_K.get((risk_upper, b_val), 1)
+        quota_distribution[k] = quota_distribution.get(k, 0) + 1
+        
+        sorted_indices = row_probs.argsort()[::-1]
+        labels = [str(encoder.classes_[index]) for index in sorted_indices]
+        
+        is_override_day = day in {"D-5", "D-1"}
+        if is_override_day:
+            original_len = len(labels)
+            labels_no_dash = [lbl for lbl in labels if lbl != "-"]
+            removed_count = original_len - len(labels_no_dash)
+            minus_predictions_removed += removed_count
+            
+            selected_labels = labels_no_dash[:k]
+            if len(selected_labels) < k:
+                fewer_than_requested += 1
+        else:
+            selected_labels = labels[:k]
+            
+        joined_label = "|".join(selected_labels)
+        output.append(joined_label)
+        
+        label_len = len(selected_labels)
+        recommendation_counts[label_len] = recommendation_counts.get(label_len, 0) + 1
+        
+    if logger is not None:
+        logger.info(
+            "Scoring summary | day=%s total_rows=%d risk_counts=%s bounce_counts=%s "
+            "quota_distribution=%s minus_predictions_removed=%d fewer_than_requested=%d "
+            "recommendation_counts=%s",
+            day, total_rows, risk_counts, bounce_counts,
+            quota_distribution, minus_predictions_removed, fewer_than_requested,
+            recommendation_counts
+        )
+
     return pd.Series(output, index=X.index)

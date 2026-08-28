@@ -169,6 +169,9 @@ def apply_fallbacks_to_prediction_file(prediction_file: Path, fallback_rows: pd.
         for row in fallback_rows.itertuples(index=False)
     }
 
+    if "IS_NEW_CUSTOMER" not in predictions.columns:
+        predictions["IS_NEW_CUSTOMER"] = "False"
+
     updated = 0
     for idx, row in predictions.iterrows():
         loan = str(row.get("Loan_number", "")).strip()
@@ -183,6 +186,7 @@ def apply_fallbacks_to_prediction_file(prediction_file: Path, fallback_rows: pd.
             predictions.at[idx, "D"] = "-"
         if "PREDICTION_REASON" in predictions.columns:
             predictions.at[idx, "PREDICTION_REASON"] = reason_map[loan]
+        predictions.at[idx, "IS_NEW_CUSTOMER"] = "True"
         updated += 1
 
     if updated:
