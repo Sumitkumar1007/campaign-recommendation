@@ -30,6 +30,7 @@ data/training/
 data/features/
 data/schedules/
 data/cases/
+data/payments/
 *.joblib
 *.cbm
 *_predictions_*.csv
@@ -47,6 +48,7 @@ artifacts/checkpoints/
 artifacts/logs/
 artifacts/predictions/
 artifacts/metrics/
+artifacts/backup_scripts
 artifacts/explanations/*
 !artifacts/explanations/.gitkeep
 artifacts/mlruns/
