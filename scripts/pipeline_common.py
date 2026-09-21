@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-
+import os
 import pandas as pd
 
 
@@ -11,12 +11,7 @@ DAY_COLUMNS = [*PREDUE_DAY_COLUMNS, *POSTDUE_DAY_COLUMNS]
 SCHEDULE_DAY_COLUMNS = [*PREDUE_DAY_COLUMNS, "D", *POSTDUE_DAY_COLUMNS]
 DAY_WEIGHT_COLUMN_MAP = {day: f"{day}__WEIGHT" for day in DAY_COLUMNS}
 DAY_WEIGHT_COLUMNS = [DAY_WEIGHT_COLUMN_MAP[day] for day in DAY_COLUMNS]
-NON_FEATURE_COLUMNS = DAY_COLUMNS + DAY_WEIGHT_COLUMNS + ["TARGET_MONTH", "TARGET_MONTH_PERIOD", "TARGET_RISK", "VERTICAL"]
-# RISK_TOP_K = {
-#     "LOW": 1,
-#     "MEDIUM": 2,
-#     "HIGH": 3,
-# }
+NON_FEATURE_COLUMNS = DAY_COLUMNS + DAY_WEIGHT_COLUMNS + ["TARGET_MONTH", "TARGET_MONTH_PERIOD", "TARGET_RISK", "VERTICAL", "bounce_flag", "paid_flag"]
 RISK_BOUNCE_TOP_K = {
     ("LOW", 0): 1,
     ("LOW", 1): 2,
@@ -25,6 +20,7 @@ RISK_BOUNCE_TOP_K = {
     ("HIGH", 0): 3,
     ("HIGH", 1): 4,
 }
+
 
 
 def candidate_hours(send_hour_window: dict[str, int]) -> list[int]:
@@ -59,57 +55,77 @@ def build_rolling_feature_windows(
         .reset_index(drop=True)
     )
 
+    use_payment_flags = os.getenv("USE_PAYMENT_FLAGS_IN_MODEL", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+    payment_flag_cols = {"bounce_flag", "paid_flag"} if use_payment_flags else set()
     numeric_columns = [
         col
         for col in features.columns
-        # if col not in {key_column, "MONTH", "RISK", "VERTICAL", "MONTH_PERIOD"}
         if col not in {key_column, "MONTH", "RISK", "VERTICAL", "MONTH_PERIOD", "bounce_flag", "paid_flag"}
     ]
+
     lag_columns = [
         f"{column}_M{lag}"
         for column in numeric_columns
         for lag in range(1, history_window_months + 1)
     ]
+    if use_payment_flags:
+        for pf in ["bounce_flag", "paid_flag"]:
+            if pf in features.columns:
+                lag_columns.extend([f"{pf}_M{lag}" for lag in range(1, history_window_months + 1)])
+        lag_columns.extend([f"has_history_M{lag}" for lag in range(1, history_window_months + 1)])
+        lag_columns.append("history_months_count")
+
     if features.empty:
-        # base_columns = [key_column, "MONTH", *lag_columns, "RISK"]
-        base_columns = [key_column, "MONTH", *lag_columns]
-        if "bounce_flag" in features.columns:
-            base_columns.append("bounce_flag")
-        if "paid_flag" in features.columns:
-            base_columns.append("paid_flag")
-        base_columns.append("RISK")
+        base_columns = [key_column, "MONTH", *lag_columns, "RISK"]
         if "VERTICAL" in features.columns:
             base_columns.append("VERTICAL")
         return pd.DataFrame(columns=base_columns)
 
     features[numeric_columns] = features[numeric_columns].fillna(0)
     lagged_parts = [features[[key_column, "MONTH_PERIOD"]].copy()]
+
     for lag in range(1, history_window_months + 1):
-        shifted = features.groupby(key_column, sort=False)[numeric_columns].shift(lag - 1)
-        lagged_parts.append(shifted.add_suffix(f"_M{lag}"))
+        shifted_num = features.groupby(key_column, sort=False)[numeric_columns].shift(lag - 1)
+        lagged_parts.append(shifted_num.add_suffix(f"_M{lag}"))
+
+        if use_payment_flags:
+            # 3-State Encoding for payment flags: 1=Paid/Bounced, 0=False, -1=No History (Account didn't exist yet)
+            for pf in ["bounce_flag", "paid_flag"]:
+                if pf in features.columns:
+                    shifted_pf = features.groupby(key_column, sort=False)[pf].shift(lag - 1)
+                    shifted_pf_encoded = pd.to_numeric(shifted_pf, errors="coerce").fillna(-1).astype(int)
+                    shifted_pf_df = pd.DataFrame({f"{pf}_M{lag}": shifted_pf_encoded.values}, index=features.index)
+                    lagged_parts.append(shifted_pf_df)
+
+            # Presence Indicator: 1 if month data existed, 0 if account didn't exist yet
+            has_hist = features.groupby(key_column, sort=False)["MONTH_PERIOD"].shift(lag - 1).notna().astype(int)
+            lagged_parts.append(pd.DataFrame({f"has_history_M{lag}": has_hist.values}, index=features.index))
 
     rolled = pd.concat(lagged_parts, axis=1)
     rolled["MONTH"] = (
         rolled["MONTH_PERIOD"].dt.to_timestamp().dt.strftime("%b-%Y").str.upper()
     )
     rolled["RISK"] = features["RISK"].fillna("UNKNOWN").astype(str).str.upper().values
-    rolled[lag_columns] = rolled[lag_columns].fillna(0)
-    if "bounce_flag" in features.columns:
-        rolled["bounce_flag"] = pd.to_numeric(features["bounce_flag"], errors="coerce").fillna(0).astype(int).values
-    if "paid_flag" in features.columns:
-        rolled["paid_flag"] = pd.to_numeric(features["paid_flag"], errors="coerce").fillna(0).astype(int).values
 
-    returned_cols = [key_column, "MONTH", *lag_columns]
-    if "bounce_flag" in features.columns:
+    # Clean numeric lags
+    num_lags = [f"{column}_M{lag}" for column in numeric_columns for lag in range(1, history_window_months + 1)]
+    rolled[num_lags] = rolled[num_lags].fillna(0)
+
+    if use_payment_flags:
+        hist_cols = [f"has_history_M{lag}" for lag in range(1, history_window_months + 1)]
+        rolled["history_months_count"] = rolled[hist_cols].sum(axis=1).astype(int)
+
+    returned_cols = [key_column, "MONTH", *lag_columns, "RISK"]
+    if "bounce_flag" in features.columns and "bounce_flag" not in returned_cols:
         returned_cols.append("bounce_flag")
-    if "paid_flag" in features.columns:
+        rolled["bounce_flag"] = features["bounce_flag"].values
+    if "paid_flag" in features.columns and "paid_flag" not in returned_cols:
         returned_cols.append("paid_flag")
-    returned_cols.append("RISK")
+        rolled["paid_flag"] = features["paid_flag"].values
     if "VERTICAL" in features.columns:
         returned_cols.append("VERTICAL")
         rolled["VERTICAL"] = features["VERTICAL"].fillna("UNKNOWN").astype(str).str.upper().values
-    #     return rolled[[key_column, "MONTH", *lag_columns, "RISK", "VERTICAL"]]
-    # return rolled[[key_column, "MONTH", *lag_columns, "RISK"]]
     return rolled[returned_cols]
 
 
@@ -193,11 +209,7 @@ def predict_top_k_by_risk(
 ) -> pd.Series:
     probabilities = model.predict_proba(X)
     output: list[str] = []
-    # for row_probs, risk in zip(probabilities, risks.fillna("LOW").astype(str), strict=False):
-    #     k = RISK_TOP_K.get(risk.upper(), 1)
-    #     top_indices = row_probs.argsort()[-k:][::-1]
-    #     labels = [str(encoder.classes_[index]) for index in top_indices]
-    #     output.append("|".join(labels))
+    
     total_rows = len(X)
     risk_counts = {"LOW": 0, "MEDIUM": 0, "HIGH": 0}
     bounce_counts = {0: 0, 1: 0}
@@ -226,19 +238,16 @@ def predict_top_k_by_risk(
         sorted_indices = row_probs.argsort()[::-1]
         labels = [str(encoder.classes_[index]) for index in sorted_indices]
         
-        is_override_day = day in {"D-5", "D-1"}
-        if is_override_day:
-            original_len = len(labels)
-            labels_no_dash = [lbl for lbl in labels if lbl != "-"]
-            removed_count = original_len - len(labels_no_dash)
-            minus_predictions_removed += removed_count
-            
-            selected_labels = labels_no_dash[:k]
-            if len(selected_labels) < k:
-                fewer_than_requested += 1
+        # For D-5 and D-1, contact full base by bypassing '-' and selecting 2nd best active strategy
+        is_compulsory_day = day is not None and str(day).strip().upper() in {"D-5", "D-1", "D5", "D1"}
+        if is_compulsory_day:
+            active_labels = [label for label in labels if label != "-"]
+            selected_labels = active_labels[:k] if active_labels else labels[:k]
+            if labels and labels[0] == "-":
+                minus_predictions_removed += 1
         else:
             selected_labels = labels[:k]
-            
+
         joined_label = "|".join(selected_labels)
         output.append(joined_label)
         
@@ -254,5 +263,5 @@ def predict_top_k_by_risk(
             quota_distribution, minus_predictions_removed, fewer_than_requested,
             recommendation_counts
         )
-
+        
     return pd.Series(output, index=X.index)

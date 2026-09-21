@@ -168,6 +168,12 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional model version token used to save version-specific artifacts, for example v002.",
     )
+    parser.add_argument(
+        "--use-random-data-split",
+        action="store_true",
+        default=os.getenv("USE_RANDOM_DATA_SPLIT", "false").strip().lower() in {"1", "true", "yes", "on"},
+        help="Use random 70/15/15 stratified data split across all labeled data instead of chronological month split.",
+    )
     return parser.parse_args()
 
 
@@ -183,6 +189,28 @@ def _sorted_month_labels(labels: list[str]) -> list[str]:
     pairs = [(label, period) for label, period in zip(labels, periods, strict=False) if not pd.isna(period)]
     pairs.sort(key=lambda item: item[1])
     return [label for label, _ in pairs]
+
+
+def fetch_data_config_prediction_source_month() -> str | None:
+    """Attempt to resolve prediction source month from PostgreSQL data_config (e.g. 'AUG-2026')."""
+    try:
+        from fetch_month_from_postgres import (
+            create_db_connection,
+            resolve_scheduler_emi_dates,
+            configured_source_month_from_emi_dates,
+        )
+        conn = create_db_connection()
+        try:
+            emi_dates = resolve_scheduler_emi_dates(conn, schema="")
+            if emi_dates:
+                src_month_str = configured_source_month_from_emi_dates(emi_dates)
+                period = pd.Period(src_month_str, freq="M")
+                return period.strftime("%b-%Y").upper()
+        finally:
+            conn.close()
+    except Exception as e:
+        logging.getLogger("catboost_training").debug("Could not resolve prediction source month from data_config: %s", e)
+    return None
 
 
 def resolve_source_month_splits(
@@ -204,6 +232,24 @@ def resolve_source_month_splits(
         prediction_source_months,
     ])
     if not has_explicit_split and targetable_months:
+        data_config_pred_src = fetch_data_config_prediction_source_month()
+        if data_config_pred_src and data_config_pred_src in all_months:
+            effective_prediction = [data_config_pred_src]
+            valid_targetable = [m for m in targetable_months if m != data_config_pred_src]
+            if len(valid_targetable) >= 3:
+                effective_train = valid_targetable[:-2]
+                effective_validation = valid_targetable[-2:-1]
+                effective_test = valid_targetable[-1:]
+            elif len(valid_targetable) == 2:
+                effective_train = valid_targetable[:1]
+                effective_validation = valid_targetable[-1:]
+                effective_test = []
+            else:
+                effective_train = valid_targetable
+                effective_validation = []
+                effective_test = []
+            return effective_train, effective_validation, effective_test, effective_prediction
+
         if len(targetable_months) >= 3:
             effective_train = targetable_months[:-2]
             effective_validation = targetable_months[-2:-1]
@@ -423,31 +469,85 @@ def fit_day_model(
         time.perf_counter() - start,
     )
     return day, model, encoder
-
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from sklearn.preprocessing import LabelEncoder
 
 def evaluate_models(models: dict, label_encoders: dict, X: pd.DataFrame, y: pd.DataFrame) -> dict:
     if X.empty:
         return {"rows": 0}
 
     per_day_accuracy: dict[str, float] = {}
+    per_day_precision: dict[str, float] = {}
+    per_day_recall: dict[str, float] = {}
+    per_day_f1: dict[str, float] = {}
+    per_day_top2_hit_rate: dict[str, float] = {}
+
     pred_columns: dict[str, pd.Series] = {}
     for day in DAY_COLUMNS:
         encoder = label_encoders[day]
         model = models[day]
+
+        # String-normalized predictions & targets
         y_pred_encoded = model.predict(X)
         y_pred_encoded = pd.Series(y_pred_encoded.reshape(-1), index=y.index)
         y_pred = encoder.inverse_transform(y_pred_encoded.astype(int))
         pred_columns[day] = pd.Series(y_pred, index=y.index)
-        per_day_accuracy[day] = float(accuracy_score(y[day], y_pred))
+
+        y_true_day = y[day].fillna("-").astype(str).str.strip()
+        y_pred_day = pd.Series(y_pred, index=y.index).fillna("-").astype(str).str.strip()
+
+        # Top-1 Exact Accuracy, Precision, Recall, F1
+        per_day_accuracy[day] = float(accuracy_score(y_true_day, y_pred_day))
+        prec, rec, f1, _ = precision_recall_fscore_support(y_true_day, y_pred_day, average="weighted", zero_division=0)
+        per_day_precision[day] = float(prec)
+        per_day_recall[day] = float(rec)
+        per_day_f1[day] = float(f1)
+
+        # Top-2 Hit Rate (Multi-Recommendation Hit Rate)
+        try:
+            probs = model.predict_proba(X)
+            if probs.shape[1] >= 2:
+                top2_indices = np.argsort(probs, axis=1)[:, -2:]
+                classes_arr = np.array([encoder.classes_[i] for i in top2_indices.ravel()]).reshape(len(X), 2)
+                hit_mask = (classes_arr[:, 0] == y_true_day.values) | (classes_arr[:, 1] == y_true_day.values)
+                per_day_top2_hit_rate[day] = float(hit_mask.mean())
+            else:
+                per_day_top2_hit_rate[day] = per_day_accuracy[day]
+        except Exception:
+            per_day_top2_hit_rate[day] = per_day_accuracy[day]
 
     pred_df = pd.DataFrame(pred_columns)
-    exact_match_accuracy = float((pred_df == y).all(axis=1).mean())
+    exact_match_accuracy = float((pred_df == y.fillna("-").astype(str)).all(axis=1).mean())
     average_day_accuracy = float(pd.Series(per_day_accuracy).mean())
+    average_day_precision = float(pd.Series(per_day_precision).mean())
+    average_day_recall = float(pd.Series(per_day_recall).mean())
+    average_day_f1 = float(pd.Series(per_day_f1).mean())
+
+    # Pre-due Schedule Days (D-5 to D-1) Specific Average Accuracy
+    sched_days = [d for d in SCHEDULE_DAY_COLUMNS if d in per_day_accuracy]
+    average_schedule_day_accuracy = float(pd.Series({d: per_day_accuracy[d] for d in sched_days}).mean()) if sched_days else average_day_accuracy
+
+    all_y_true = y.fillna("-").values.ravel().astype(str)
+    all_y_pred = pred_df.values.ravel().astype(str)
+
+    overall_prec, overall_rec, overall_f1, _ = precision_recall_fscore_support(all_y_true, all_y_pred, average="weighted", zero_division=0)
+
     return {
         "rows": int(len(X)),
         "exact_match_accuracy": exact_match_accuracy,
         "average_day_accuracy": average_day_accuracy,
+        "average_schedule_day_accuracy": average_schedule_day_accuracy,
+        "average_day_precision": average_day_precision,
+        "average_day_recall": average_day_recall,
+        "average_day_f1": average_day_f1,
+        "overall_precision": float(overall_prec),
+        "overall_recall": float(overall_rec),
+        "overall_f1": float(overall_f1),
         "per_day_accuracy": per_day_accuracy,
+        "per_day_top2_hit_rate": per_day_top2_hit_rate,
+        "per_day_precision": per_day_precision,
+        "per_day_recall": per_day_recall,
+        "per_day_f1": per_day_f1,
     }
 
 
@@ -561,6 +661,9 @@ def main() -> None:
             )
 
         with log_step(logger, "split_dataset"):
+            use_random_split = getattr(args, "use_random_data_split", False) or (
+                os.getenv("USE_RANDOM_DATA_SPLIT", "false").strip().lower() in {"1", "true", "yes", "on"}
+            )
             effective_train_source_months, effective_validation_source_months, effective_test_source_months, effective_prediction_source_months = resolve_source_month_splits(
                 dataset,
                 args.train_source_months,
@@ -568,16 +671,27 @@ def main() -> None:
                 args.test_source_months,
                 args.prediction_source_months,
             )
-            train_df = split_by_source_month(dataset, effective_train_source_months, require_target=True)
-            validation_df = split_by_source_month(dataset, effective_validation_source_months, require_target=True)
-            test_df = split_by_source_month(dataset, effective_test_source_months, require_target=True)
-            prediction_df = split_by_source_month(dataset, effective_prediction_source_months, require_target=False)
+            if use_random_split:
+                from sklearn.model_selection import train_test_split
+                all_labeled_df = dataset[dataset["TARGET_MONTH"].notna()].copy()
+                prediction_df = split_by_source_month(dataset, effective_prediction_source_months, require_target=False)
+
+                train_df, temp_df = train_test_split(all_labeled_df, test_size=0.30, random_state=42)
+                validation_df, test_df = train_test_split(temp_df, test_size=0.50, random_state=42)
+                logger.info("Using Random Data Split (70%% Train / 15%% Validation / 15%% Test across all labeled rows)")
+            else:
+                train_df = split_by_source_month(dataset, effective_train_source_months, require_target=True)
+                validation_df = split_by_source_month(dataset, effective_validation_source_months, require_target=True)
+                test_df = split_by_source_month(dataset, effective_test_source_months, require_target=True)
+                prediction_df = split_by_source_month(dataset, effective_prediction_source_months, require_target=False)
+
             logger.info(
-                "Split rows | train=%s validation=%s test=%s prediction_candidates=%s",
+                "Split rows | train=%s validation=%s test=%s prediction_candidates=%s random_split=%s",
                 len(train_df),
                 len(validation_df),
                 len(test_df),
                 len(prediction_df),
+                use_random_split,
             )
             logger.info(
                 "Effective source months | train=%s validation=%s test=%s prediction=%s",
@@ -702,6 +816,8 @@ def main() -> None:
             logger.info("Validation metrics: %s", validation_metrics)
             logger.info("Test metrics: %s", test_metrics)
 
+            use_payment_flags = os.getenv("USE_PAYMENT_FLAGS_IN_MODEL", "false").strip().lower() in {"1", "true", "yes", "on"}
+
         metrics = {
             "assumption": (
                 "Source-month monthly communication features predict next-month schedule "
@@ -710,9 +826,12 @@ def main() -> None:
             ),
             "target_offset_months": args.target_offset_months,
             "history_window_months": args.history_window_months,
-            "train_source_months": effective_train_source_months,
-            "validation_source_months": effective_validation_source_months,
-            "test_source_months": effective_test_source_months,
+            "use_payment_flags": use_payment_flags,
+            "payment_flags_status": "payment_and_bounce_flags_included" if use_payment_flags else "payment_flags_excluded",
+            "split_method": "random_split (70% Train / 15% Validation / 15% Test)" if use_random_split else "month_based_split",
+            "train_source_months": "ALL_MONTHS_RANDOM_SAMPLED_70%" if use_random_split else effective_train_source_months,
+            "validation_source_months": "ALL_MONTHS_RANDOM_SAMPLED_15%" if use_random_split else effective_validation_source_months,
+            "test_source_months": "ALL_MONTHS_RANDOM_SAMPLED_15%" if use_random_split else effective_test_source_months,
             "prediction_source_months": effective_prediction_source_months,
             "n_jobs": args.n_jobs,
             "iterations": args.iterations,

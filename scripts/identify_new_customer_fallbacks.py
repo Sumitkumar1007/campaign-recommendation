@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
 
 import pandas as pd
 
 from pipeline_common import DAY_COLUMNS
 from project_paths import CASE_DATA_DIR, COMMUNICATION_DATA_DIR, SCHEDULE_DATA_DIR, ensure_parent_dir
+
+logger = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -179,6 +182,7 @@ def apply_fallbacks_to_prediction_file(prediction_file: Path, fallback_rows: pd.
             continue
         if "SOURCE_RISK" in predictions.columns:
             predictions.at[idx, "SOURCE_RISK"] = risk_map[loan]
+        r_str = str(risk_map[loan]).upper()
         for day in DAY_COLUMNS:
             if day in predictions.columns:
                 predictions.at[idx, day] = fallback_map.get((loan, day), "-")
@@ -191,6 +195,12 @@ def apply_fallbacks_to_prediction_file(prediction_file: Path, fallback_rows: pd.
 
     if updated:
         predictions.to_csv(prediction_file, index=False)
+        try:
+            from generate_prediction_summary import generate_summary_workbooks
+            generate_summary_workbooks(predictions, prediction_file.parent, prediction_file.stem)
+            logger.info("Saved updated summary Excel files for fallback output.")
+        except Exception as e:
+            logger.warning("Could not update summary Excel files: %s", e)
     return updated
 
 

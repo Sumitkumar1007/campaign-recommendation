@@ -60,7 +60,8 @@ def load_paid_keys(payment_files: list[Path]) -> tuple[set[tuple[str, str]], set
         for chunk in pd.read_csv(payment_file, usecols=usecols, dtype=str, chunksize=200_000):
             apacs = normalize_apac(chunk["apac_card_number"])
             if "payment_datetime" in chunk.columns:
-                months = pd.to_datetime(chunk["payment_datetime"], errors="coerce").dt.strftime("%b-%Y").str.upper()
+                parsed_months = pd.to_datetime(chunk["payment_datetime"], errors="coerce").dt.strftime("%b-%Y").str.upper()
+                months = parsed_months.fillna(month_label if month_label else "")
             else:
                 months = pd.Series(month_label, index=chunk.index)
             for apac, month in zip(apacs, months, strict=False):

@@ -2157,13 +2157,36 @@ def compute_model_drift_metrics(
         train_df["SOURCE_MONTH"] = train_df["MONTH"]
         
     # Filter it to only include the months the model actually trained on
+    def _norm_m(val: Any) -> str:
+        if not val or pd.isna(val):
+            return ""
+        val_str = str(val).strip().upper()
+        try:
+            return pd.Period(pd.to_datetime(val_str), freq="M").strftime("%Y-%m")
+        except Exception:
+            return val_str
+
     if baseline_source_months and "SOURCE_MONTH" in train_df.columns:
-        train_df = train_df[train_df["SOURCE_MONTH"].astype(str).isin(baseline_source_months)]
-        
+        # Check if baseline_source_months contains string tokens from random split (e.g. ALL_MONTHS_RANDOM_SAMPLED_70%)
+        is_string_token_split = any("ALL_MONTHS" in str(m).upper() for m in baseline_source_months)
+        if is_string_token_split:
+            logger.info("Random split detected in baseline metadata (%s). Using full training dataset for drift baseline.", baseline_source_months)
+        else:
+            norm_baseline = {_norm_m(m) for m in baseline_source_months if m}
+            filtered_train_df = train_df[train_df["SOURCE_MONTH"].apply(_norm_m).isin(norm_baseline)]
+            if not filtered_train_df.empty:
+                train_df = filtered_train_df
+            else:
+                logger.warning(
+                    "Drift baseline month filtering yielded 0 rows (baseline_source_months=%s). "
+                    "Falling back to full training feature dataset.",
+                    baseline_source_months,
+                )
+
     # Cap it at 10,000 rows just like the original training script did to keep drift math fast
     if len(train_df) > 10000:
         train_df = train_df.sample(n=10000, random_state=42)
-        
+
     baseline_matrix = build_feature_matrix(train_df).reindex(columns=bundle["feature_columns"], fill_value=0)
 
     # --- 3. CALCULATE DRIFT ---
