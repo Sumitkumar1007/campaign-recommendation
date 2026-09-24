@@ -55,10 +55,13 @@ class DummyAIConfigRepo:
         self.created.append(kwargs)
         self.entries[kwargs["transaction_id"]] = kwargs
 
-    def update_entry(self, **kwargs) -> None:
+    def update_entry(self, **kwargs) -> int:
         self.updated.append(kwargs)
-        existing = self.entries.setdefault(kwargs["transaction_id"], {"transaction_id": kwargs["transaction_id"]})
+        existing = self.entries.get(kwargs["transaction_id"])
+        if existing is None:
+            return 0
         existing.update(kwargs)
+        return 1
 
     def fetch_by_transaction_id(self, transaction_id: str):
         return self.entries.get(transaction_id)
@@ -77,12 +80,37 @@ class DummyApiAuditRepo:
     def __init__(self) -> None:
         self.created: list[dict] = []
         self.updated: list[dict] = []
+        self.entries: dict[str, dict] = {}
 
     def create_entry(self, **kwargs) -> None:
         self.created.append(kwargs)
+        ref = kwargs.get("reference_number")
+        if ref:
+            self.entries[ref] = dict(kwargs)
 
-    def update_latest_entry(self, **kwargs) -> None:
+    def update_entry(self, **kwargs) -> int:
         self.updated.append(kwargs)
+        ref = kwargs.get("reference_number")
+        if ref:
+            clean_ref = str(ref).strip().lower()
+            target_key = None
+            for key in self.entries:
+                if key.strip().lower() == clean_ref:
+                    target_key = key
+                    break
+            if target_key:
+                self.entries[target_key].update({k: v for k, v in kwargs.items() if v is not None})
+            else:
+                self.entries[ref] = {k: v for k, v in kwargs.items() if v is not None}
+            return 1
+        return 0
+
+    def fetch_by_reference_number(self, reference_number: str):
+        clean_ref = str(reference_number).strip().lower()
+        for key, entry in self.entries.items():
+            if key.strip().lower() == clean_ref:
+                return entry
+        return None
 
 
 class CapturingService(AIMLApiService):
@@ -839,3 +867,61 @@ def test_training_missing_months_returns_failed_payload() -> None:
 
     assert status.startswith("400")
     assert payload == {"transactionId": "TRN1", "status": "FAILED", "message": "months is required."}
+
+def test_dummy_api_audit_repo_upserts_by_reference_number() -> None:
+    repo = DummyApiAuditRepo()
+    repo.create_entry(
+        entry_type="INFERENCE",
+        reference_number="REF123",
+        request_url="http://localhost:8080/api/v1/inference",
+        request_body='{"key": "val"}',
+        response_body='{"status": "ACCEPTED"}',
+        status="ACCEPTED",
+    )
+    assert repo.entries["REF123"]["status"] == "ACCEPTED"
+    assert repo.entries["REF123"]["request_url"] == "http://localhost:8080/api/v1/inference"
+
+    updated_rows = repo.update_entry(
+        entry_type="INFERENCE",
+        reference_number="REF123",
+        request_url="/api/v1/inference",
+        response_body='{"status": "COMPLETED"}',
+        status="COMPLETED",
+        success_count=14,
+        processing_time_ms=100,
+    )
+    assert updated_rows == 1
+    assert repo.entries["REF123"]["status"] == "COMPLETED"
+    assert repo.entries["REF123"]["request_url"] == "/api/v1/inference"
+    assert repo.entries["REF123"]["request_body"] == '{"key": "val"}'
+    assert repo.entries["REF123"]["success_count"] == 14
+
+
+def test_dummy_api_audit_repo_updates_gateway_accepted_entry_in_place() -> None:
+    repo = DummyApiAuditRepo()
+    repo.create_entry(
+        entry_type="INFERENCE",
+        reference_number=" FBB09B0B-112B-4201-828B-09F2076A63A1 ",
+        request_url="http://localhost:8040/api/v1/inference",
+        request_body='{"transactionId":"fbb09b0b-112b-4201-828b-09f2076a63a1"}',
+        response_body='{"status":"ACCEPTED"}',
+        status="ACCEPTED",
+    )
+    assert len(repo.entries) == 1
+
+    updated_rows = repo.update_entry(
+        entry_type="INFERENCE",
+        reference_number="fbb09b0b-112b-4201-828b-09f2076a63a1",
+        request_url="/api/v1/inference",
+        response_body='{"status":"COMPLETED"}',
+        status="COMPLETED",
+        message="Metrics generated successfully",
+        success_count=14,
+        processing_time_ms=150,
+    )
+    assert updated_rows == 1
+    assert len(repo.entries) == 1
+    stored_entry = list(repo.entries.values())[0]
+    assert stored_entry["status"] == "COMPLETED"
+    assert stored_entry["message"] == "Metrics generated successfully"
+    assert stored_entry["request_url"] == "/api/v1/inference"

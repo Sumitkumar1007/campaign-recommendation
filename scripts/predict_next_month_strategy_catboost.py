@@ -505,6 +505,7 @@ def main() -> None:
                 schedule_file=Path(args.schedule_file),
                 target_offset_months=target_offset_months,
                 history_window_months=history_window_months,
+                # use_payment_flags=bundle.get("use_payment_flags"),
             )
             logger.info("Prepared inference dataset | rows=%s columns=%s", len(dataset), len(dataset.columns))
             if not any(str(column).startswith("VOICE_BOT_") for column in dataset.columns):
