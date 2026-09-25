@@ -662,6 +662,12 @@ def main() -> None:
             ]
             prediction_output.to_csv(prediction_file, index=False)
             logger.info("Saved predictions | rows=%s bytes=%s", len(prediction_output), prediction_file.stat().st_size)
+            try:
+                from generate_prediction_summary import generate_summary_workbooks
+                counts_f, pct_f = generate_summary_workbooks(prediction_output, prediction_file.parent, prediction_file.stem)
+                logger.info("Saved executive summary Excel files | counts=%s percentage=%s", counts_f, pct_f)
+            except Exception as e:
+                logger.warning("Could not generate summary Excel files: %s", e)
 
         print(f"Prediction rows: {len(prediction_output):,}")
         print(f"Saved inference-only predictions to {prediction_file}")
