@@ -12,6 +12,7 @@ CASE_DATA_DIR = DATA_DIR / "cases"
 TRAINING_DATA_DIR = DATA_DIR / "training"
 SCHEDULE_DATA_DIR = DATA_DIR / "schedules"
 FEATURE_DATA_DIR = DATA_DIR / "features"
+PAYMENT_DATA_DIR = DATA_DIR / "payments"
 
 ARTIFACTS_DIR = REPO_ROOT / "artifacts"
 MODEL_DIR = ARTIFACTS_DIR / "models"

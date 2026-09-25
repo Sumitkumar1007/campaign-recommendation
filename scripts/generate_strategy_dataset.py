@@ -11,6 +11,7 @@ from entity_keys import annotate_entity_key, entity_key_column_name
 from env_utils import load_dotenv
 from pipeline_common import candidate_hours
 from project_paths import COMMUNICATION_DATA_DIR, REPO_ROOT, TRAINING_DATA_DIR, ensure_parent_dir
+from append_payment_flags import load_paid_keys
 
 
 TIME_BUCKETS = {
@@ -83,7 +84,7 @@ def normalize_channel_key(value: object) -> str:
     return COMM_TYPE_MAP.get(raw, raw)
 
 
-def load_weight_config() -> tuple[bool, dict[str, set[str]], dict[str, dict[str, float]], dict[str, float], float, Path]:
+def load_weight_config() -> tuple[bool, dict[str, set[str]], dict[str, dict[str, float]], dict[str, float], float, Path, float]:
     enabled = env_flag("STRATEGY_USE_STATUS_WEIGHTS", default=False)
     config_file = Path(os.getenv("STRATEGY_WEIGHTS_CONFIG_FILE", str(WEIGHTS_CONFIG_FILE))).expanduser()
     success_status_map = {channel: set(statuses) for channel, statuses in SUCCESS_STATUS_MAP.items()}
@@ -115,7 +116,8 @@ def load_weight_config() -> tuple[bool, dict[str, set[str]], dict[str, dict[str,
             }
 
     positive_boost = float(os.getenv("STRATEGY_SAMPLE_WEIGHT_POSITIVE_BOOST", "1.0"))
-    return enabled, success_status_map, score_map, disposition_scores, positive_boost, config_file
+    payment_multiplier = float(os.getenv("STRATEGY_PAYMENT_MULTIPLIER", "5.0"))
+    return enabled, success_status_map, score_map, disposition_scores, positive_boost, config_file, payment_multiplier
 
 
 def parse_args() -> argparse.Namespace:
@@ -172,6 +174,12 @@ def parse_args() -> argparse.Namespace:
         choices=["emi_date", "created_date"],
         default="emi_date",
         help="Date field used to assign the MONTH feature label.",
+    )
+    parser.add_argument(
+        "--payment-files",
+        nargs="*",
+        default=[],
+        help="Optional payment CSV files to apply 'True Success' multiplier to SMS and WH channels.",
     )
     parser.add_argument(
         "--config-file",
@@ -266,6 +274,8 @@ def process_chunk(
     success_statuses: dict[str, set[str]] | None = None,
     success_scores: dict[str, dict[str, float]] | None = None,
     voice_bot_disposition_scores: dict[str, float] | None = None,
+    paid_keys: set[tuple[str, str]] | None = None,
+    payment_multiplier: float = 1.0,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df = chunk.copy()
     if "risk" not in df.columns:
@@ -328,11 +338,21 @@ def process_chunk(
     def success_score(row: pd.Series) -> float:
         if not row["IS_SUCCESS"]:
             return 0.0
-        if not weighting_enabled:
-            return 1.0
-        if row["COMM_TYPE"] == "VOICE_BOT" and disposition_lookup:
-            return float(disposition_lookup.get(row["DISPOSITION"], 0.0))
-        return float(score_lookup.get(row["COMM_TYPE"], {}).get(row["STATUS"], 1.0))
+            
+        base_score = 1.0
+        if weighting_enabled:
+            if row["COMM_TYPE"] == "VOICE_BOT" and disposition_lookup:
+                base_score = float(disposition_lookup.get(row["DISPOSITION"], 0.0))
+            else:
+                base_score = float(score_lookup.get(row["COMM_TYPE"], {}).get(row["STATUS"], 1.0))
+
+        if paid_keys and row["COMM_TYPE"] in {"SMS", "WH", "WHATSAPP"}:
+            entity = str(row[key_col]).strip()
+            month = str(row["MONTH"]).strip().upper()
+            if (entity, month) in paid_keys:
+                return base_score * payment_multiplier
+
+        return base_score
 
     df["SUCCESS_SCORE"] = df.apply(success_score, axis=1)
 
@@ -524,8 +544,9 @@ def build_dataset(
     input_files: list[Path] | None = None,
     month_source: str = "emi_date",
     send_hour_window: dict[str, int] | None = None,
+    payment_files: list[Path] | None = None,
 ) -> None:
-    weighting_enabled, success_statuses, success_scores, voice_bot_disposition_scores, positive_boost, weights_config_file = load_weight_config()
+    weighting_enabled, success_statuses, success_scores, voice_bot_disposition_scores, positive_boost, weights_config_file, payment_multiplier = load_weight_config()
     output_file = ensure_parent_dir(output_file)
     exclude_tokens = {token.upper() for token in (exclude_months or [])}
     if input_files:
@@ -543,6 +564,13 @@ def build_dataset(
     strategy_parts: list[pd.DataFrame] = []
     risk_parts: list[pd.DataFrame] = []
     audit_counts: dict[str, object] = {}
+    
+    paid_keys: set[tuple[str, str]] | None = None
+    if payment_files:
+        print(f"Loading payment data for True Success Multiplier ({payment_multiplier}x)...")
+        paid_keys, _ = load_paid_keys(payment_files)
+        print(f"Loaded {len(paid_keys)} unique payment events.")
+
     sample_cards = (
         collect_sample_cards(csv_files, chunksize, sample_size)
         if sample_size > 0
@@ -567,6 +595,8 @@ def build_dataset(
                 success_statuses=success_statuses,
                 success_scores=success_scores,
                 voice_bot_disposition_scores=voice_bot_disposition_scores,
+                paid_keys=paid_keys,
+                payment_multiplier=payment_multiplier,
             )
             if not feature_counts.empty:
                 feature_parts.append(feature_counts)
@@ -727,6 +757,7 @@ def main() -> None:
         input_files=[Path(path) for path in args.input_files],
         month_source=args.month_source,
         send_hour_window=send_hour_window,
+        payment_files=[Path(path) for path in args.payment_files],
     )
 
 

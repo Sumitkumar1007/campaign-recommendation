@@ -143,7 +143,29 @@ def fetch_month_extracts(args: argparse.Namespace, logger: logging.Logger, month
     return files
 
 
-def build_training_artifacts(input_files: list[Path], month_source: str, logger: logging.Logger) -> None:
+def fetch_payment_extracts(args: argparse.Namespace, logger: logging.Logger, months: list[str]) -> list[Path]:
+    from project_paths import PAYMENT_DATA_DIR
+    files: list[Path] = []
+    with log_step(logger, "fetch_training_payments"):
+        for month in months:
+            payment_file = PAYMENT_DATA_DIR / f"payment_data_{month}.csv"
+            run_python_script(
+                "fetch_payments_from_postgres.py",
+                "--host", args.host,
+                "--port", str(args.port),
+                "--dbname", args.dbname,
+                "--user", args.user,
+                "--password", args.password,
+                "--schema", args.schema,
+                "--source-month", month,
+                "--output-file", str(payment_file),
+                logger=logger,
+            )
+            files.append(payment_file)
+    return files
+
+
+def build_training_artifacts(input_files: list[Path], payment_files: list[Path], month_source: str, logger: logging.Logger) -> None:
     training_output = TRAINING_DATA_DIR / "strategy_training_dataset_train.csv"
     schedule_output = SCHEDULE_DATA_DIR / "strategy_schedule_dataset_train.csv"
     feature_output = FEATURE_DATA_DIR / "strategy_monthly_features_train.csv"
@@ -156,6 +178,8 @@ def build_training_artifacts(input_files: list[Path], month_source: str, logger:
             month_source,
             "--input-files",
             *[str(path) for path in input_files],
+            "--payment-files",
+            *[str(path) for path in payment_files],
             logger=logger,
         )
         logger.info("Generated training dataset | output_file=%s exists=%s", training_output, training_output.exists())
@@ -220,7 +244,9 @@ def main() -> None:
         )
         input_files = fetch_month_extracts(args, logger, months)
         logger.info("Fetched all month extracts successfully | input_files=%s", input_files)
-        build_training_artifacts(input_files, args.month_source, logger)
+        payment_files = fetch_payment_extracts(args, logger, months)
+        logger.info("Fetched all payment extracts successfully | payment_files=%s", payment_files)
+        build_training_artifacts(input_files, payment_files, args.month_source, logger)
         logger.info("Training window preparation completed successfully | requested_months=%s raw_source_months=%s", args.months, months)
         print(f"Prepared training data for requested months={args.months} using raw source months={months}")
     except Exception:
