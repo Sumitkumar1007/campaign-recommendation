@@ -39,7 +39,7 @@ Campaign recommendation ML pipeline with MCollect Digital scheduler integration.
 - Direct Quartz DB writing is temporary. Replace `DirectDatabaseMcollectPublisher` if/when MCollect provides an API.
 - `scripts/export_mcollect_scheduler.py` is dry-run by default; actual writes require `--write`.
 - `digital_rules` rows are not created by this repo. Templates/verbiages are predefined and created manually once in MCollect using names like `PREDUE_AIML_SMS_ENGLISH`.
-- Use `--trigger-state PAUSED` first for MCollect review before live scheduler execution.
+- Payment weighting distinguishes between Link Payments (`c.payment_unique_id == p.reference_number`, default `5.0x` multiplier) and External Payments (account payment on communication date, default `2.5x` multiplier). Multipliers are configurable in `config/weights_config.json` (`payment_multipliers`) or via `.env` (`STRATEGY_LINK_PAYMENT_MULTIPLIER`, `STRATEGY_EXTERNAL_PAYMENT_MULTIPLIER`).
 - Latest known monthly run: `APR-2026 -> MAY-2026`, model `catboost_3m`.
 
 ## Known Risks

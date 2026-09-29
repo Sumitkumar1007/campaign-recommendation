@@ -13,6 +13,7 @@ from model_fallbacks import register_legacy_joblib_aliases
 from pipeline_common import (
     DAY_COLUMNS,
     SCHEDULE_DAY_COLUMNS,
+    apply_predue_risk_rules,
     build_feature_matrix,
     month_to_period,
     predict_top_k_by_risk,
@@ -201,6 +202,10 @@ def build_prediction_population(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     source_month_period = month_to_period(pd.Series([prediction_source_month])).iloc[0]
     key_column = "ENTITY_KEY" if "ENTITY_KEY" in dataset.columns else "APAC_CARD_NUMBER"
+    base_population = base_population.copy()
+    base_population[key_column] = base_population[key_column].astype(str).str.strip()
+    dataset = dataset.copy()
+    dataset[key_column] = dataset[key_column].astype(str).str.strip()
     feature_rows = dataset[dataset["TARGET_MONTH"].isna()].copy()
     feature_rows = feature_rows[feature_rows["SOURCE_MONTH_PERIOD"].notna()].copy()
     feature_rows = feature_rows[feature_rows["SOURCE_MONTH_PERIOD"] <= source_month_period].copy()
@@ -648,6 +653,7 @@ def main() -> None:
 
         with log_step(logger, "write_predictions", prediction_file=prediction_file):
             prediction_output["D"] = "-"
+            prediction_output = apply_predue_risk_rules(prediction_output)
             prediction_output = prediction_output[
                 [
                     "SOURCE_RISK",

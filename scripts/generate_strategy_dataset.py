@@ -84,7 +84,7 @@ def normalize_channel_key(value: object) -> str:
     return COMM_TYPE_MAP.get(raw, raw)
 
 
-def load_weight_config() -> tuple[bool, dict[str, set[str]], dict[str, dict[str, float]], dict[str, float], float, Path, float]:
+def load_weight_config() -> tuple[bool, dict[str, set[str]], dict[str, dict[str, float]], dict[str, float], float, Path, float, float]:
     enabled = env_flag("STRATEGY_USE_STATUS_WEIGHTS", default=False)
     config_file = Path(os.getenv("STRATEGY_WEIGHTS_CONFIG_FILE", str(WEIGHTS_CONFIG_FILE))).expanduser()
     success_status_map = {channel: set(statuses) for channel, statuses in SUCCESS_STATUS_MAP.items()}
@@ -116,8 +116,29 @@ def load_weight_config() -> tuple[bool, dict[str, set[str]], dict[str, dict[str,
             }
 
     positive_boost = float(os.getenv("STRATEGY_SAMPLE_WEIGHT_POSITIVE_BOOST", "1.0"))
-    payment_multiplier = float(os.getenv("STRATEGY_PAYMENT_MULTIPLIER", "5.0"))
-    return enabled, success_status_map, score_map, disposition_scores, positive_boost, config_file, payment_multiplier
+    payment_multipliers = parsed.get("payment_multipliers", {}) if config_file.exists() else {}
+    default_link_mult = float(payment_multipliers.get("link_payment_multiplier", 5.0))
+    default_ext_mult = float(payment_multipliers.get("external_payment_multiplier", 2.5))
+
+    link_payment_multiplier = float(
+        os.getenv("STRATEGY_LINK_PAYMENT_MULTIPLIER")
+        or os.getenv("STRATEGY_PAYMENT_MULTIPLIER")
+        or default_link_mult
+    )
+    external_payment_multiplier = float(
+        os.getenv("STRATEGY_EXTERNAL_PAYMENT_MULTIPLIER")
+        or default_ext_mult
+    )
+    return (
+        enabled,
+        success_status_map,
+        score_map,
+        disposition_scores,
+        positive_boost,
+        config_file,
+        link_payment_multiplier,
+        external_payment_multiplier,
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -275,7 +296,11 @@ def process_chunk(
     success_scores: dict[str, dict[str, float]] | None = None,
     voice_bot_disposition_scores: dict[str, float] | None = None,
     paid_keys: set[tuple[str, str]] | None = None,
-    payment_multiplier: float = 1.0,
+    payment_multiplier: float = 5.0,
+    link_ref_numbers: set[str] | None = None,
+    external_payment_dates: set[tuple[str, str]] | None = None,
+    link_payment_multiplier: float = 5.0,
+    external_payment_multiplier: float = 2.5,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df = chunk.copy()
     if "risk" not in df.columns:
@@ -346,11 +371,24 @@ def process_chunk(
             else:
                 base_score = float(score_lookup.get(row["COMM_TYPE"], {}).get(row["STATUS"], 1.0))
 
-        if paid_keys and row["COMM_TYPE"] in {"SMS", "WH", "WHATSAPP"}:
+        if paid_keys and row["COMM_TYPE"] in {"SMS", "WH", "WHATSAPP", "VOICE", "VOICE_BOT"}:
             entity = str(row[key_col]).strip()
             month = str(row["MONTH"]).strip().upper()
+            pay_unique_id = str(row.get("payment_unique_id", "") or "").strip()
+            comm_date_val = row.get("date")
+            comm_date_str = comm_date_val.strftime("%Y-%m-%d") if pd.notna(comm_date_val) else ""
+
+            # Priority 1: Link Payment Match (c.payment_unique_id == p.reference_number)
+            if pay_unique_id and link_ref_numbers and pay_unique_id in link_ref_numbers:
+                return base_score * link_payment_multiplier
+
+            # Priority 2: External Payment Match on communication date
+            if comm_date_str and external_payment_dates and (entity, comm_date_str) in external_payment_dates:
+                return base_score * external_payment_multiplier
+
+            # Fallback: Monthly account payment match
             if (entity, month) in paid_keys:
-                return base_score * payment_multiplier
+                return base_score * link_payment_multiplier
 
         return base_score
 
@@ -546,7 +584,16 @@ def build_dataset(
     send_hour_window: dict[str, int] | None = None,
     payment_files: list[Path] | None = None,
 ) -> None:
-    weighting_enabled, success_statuses, success_scores, voice_bot_disposition_scores, positive_boost, weights_config_file, payment_multiplier = load_weight_config()
+    (
+        weighting_enabled,
+        success_statuses,
+        success_scores,
+        voice_bot_disposition_scores,
+        positive_boost,
+        weights_config_file,
+        link_payment_multiplier,
+        external_payment_multiplier,
+    ) = load_weight_config()
     output_file = ensure_parent_dir(output_file)
     exclude_tokens = {token.upper() for token in (exclude_months or [])}
     if input_files:
@@ -566,10 +613,12 @@ def build_dataset(
     audit_counts: dict[str, object] = {}
     
     paid_keys: set[tuple[str, str]] | None = None
+    link_ref_numbers: set[str] | None = None
+    external_payment_dates: set[tuple[str, str]] | None = None
     if payment_files:
-        print(f"Loading payment data for True Success Multiplier ({payment_multiplier}x)...")
-        paid_keys, _ = load_paid_keys(payment_files)
-        print(f"Loaded {len(paid_keys)} unique payment events.")
+        print(f"Loading payment data (Link Multiplier={link_payment_multiplier}x, External Multiplier={external_payment_multiplier}x)...")
+        paid_keys, _, link_ref_numbers, external_payment_dates = load_paid_keys(payment_files)
+        print(f"Loaded {len(paid_keys)} unique payment events ({len(link_ref_numbers)} link refs, {len(external_payment_dates)} date refs).")
 
     sample_cards = (
         collect_sample_cards(csv_files, chunksize, sample_size)
@@ -596,7 +645,10 @@ def build_dataset(
                 success_scores=success_scores,
                 voice_bot_disposition_scores=voice_bot_disposition_scores,
                 paid_keys=paid_keys,
-                payment_multiplier=payment_multiplier,
+                link_ref_numbers=link_ref_numbers,
+                external_payment_dates=external_payment_dates,
+                link_payment_multiplier=link_payment_multiplier,
+                external_payment_multiplier=external_payment_multiplier,
             )
             if not feature_counts.empty:
                 feature_parts.append(feature_counts)
@@ -665,6 +717,8 @@ def build_dataset(
         .last()
         .rename(columns={key_col: "ENTITY_KEY"})
     )
+    wide["ENTITY_KEY"] = wide["ENTITY_KEY"].astype(str).str.strip()
+    risk_df["ENTITY_KEY"] = risk_df["ENTITY_KEY"].astype(str).str.strip()
     wide = wide.merge(risk_df, on=["ENTITY_KEY", "MONTH", "DAY"], how="left")
 
     if not strategies.empty:
@@ -683,6 +737,7 @@ def build_dataset(
                 "feature": "PREDICTED_STRATEGY",
             }
         )
+        predicted["ENTITY_KEY"] = predicted["ENTITY_KEY"].astype(str).str.strip()
         if weighting_enabled:
             predicted[TARGET_SAMPLE_WEIGHT_COLUMN] = 1.0 + (
                 predicted["count"].astype(float) * positive_boost

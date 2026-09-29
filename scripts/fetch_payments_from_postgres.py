@@ -39,7 +39,8 @@ def build_query(schema: str, table: str) -> sql.Composed:
         SELECT
             apac_card_number,
             amount,
-            payment_datetime
+            payment_datetime,
+            reference_number
         FROM {table_ref}
         WHERE (
             payment_datetime::text LIKE %(month_prefix)s
@@ -118,7 +119,7 @@ def main() -> None:
         df = pd.DataFrame(rows, columns=columns)
     except Exception as e:
         print(f"Warning: fetch_payments_from_postgres encountered an issue ({e}). Creating empty output file.")
-        df = pd.DataFrame(columns=["apac_card_number", "amount", "payment_datetime"])
+        df = pd.DataFrame(columns=["apac_card_number", "amount", "payment_datetime", "reference_number"])
 
     if output_file is None:
         output_file = PAYMENT_DATA_DIR / "payment_data_fallback.csv"

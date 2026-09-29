@@ -208,10 +208,16 @@ def parse_args() -> argparse.Namespace:
         help="Optional row cap for the generated prediction evidence CSV. Use 0 for no limit.",
     )
     parser.add_argument(
-        "--history_window_months",
-        type=int,
-        default=int(os.getenv("HISTORY_WINDOW_MONTHS", "6")),
-        help="Number of months of history to fetch.",
+        "--saturday-mode",
+        choices=["bank_saturdays", "all_saturdays", "none"],
+        default="bank_saturdays",
+        help="Saturday suppression mode: 'bank_saturdays' (2nd & 4th Saturday) [default], 'all_saturdays', or 'none'.",
+    )
+    parser.add_argument(
+        "--suppress-sundays",
+        action="store_true",
+        default=True,
+        help="Suppress recommendations on Sundays [default: True].",
     )
     args = parser.parse_args()
     missing = [
@@ -387,13 +393,17 @@ def resolve_drift_baseline_source_months(
 # def selected_history_files(source_month: str, latest_files: list[Path]) -> list[Path]:
 #     source_period = parse_month(source_month)
     # previous_periods = [source_period - 2, source_period - 1]
-def selected_history_files(source_month: str, latest_files: list[Path], history_window: int) -> list[Path]:
+def selected_history_files(source_month: str, latest_files: list[Path] | Path, history_window: int = 3) -> list[Path]:
     source_period = parse_month(source_month)
     previous_periods = [source_period - i for i in range(history_window - 1, 0, -1)]
     files: list[Path] = []
     for period in previous_periods:
         files.extend(path for path in monthly_extract_files(str(period)) if path.exists())
-    files.extend(path for path in latest_files if path.exists())
+    if isinstance(latest_files, (Path, str)):
+        latest_list = [Path(latest_files)]
+    else:
+        latest_list = list(latest_files)
+    files.extend(path for path in latest_list if path.exists())
 
     deduped: list[Path] = []
     seen: set[Path] = set()
@@ -889,6 +899,108 @@ def _scheduler_name(
 
 def _template_name(*, due_type: str, mode: str, language: str) -> str:
     return f"{due_type}_AIML_{NAME_CHANNEL_BY_MODE[mode]}_{language}"
+
+
+def fetch_digital_rules_lookup(conn, schema: str) -> dict[tuple[str, str, str], str]:
+    """
+    Fetches digital_rules table from Postgres and builds lookup map:
+    (digital_rule_id_str, mode_upper, language_upper) -> iteration (template_name)
+    """
+    lookup: dict[tuple[str, str, str], str] = {}
+    if not conn:
+        return lookup
+    try:
+        query = sql.SQL(
+            """
+            SELECT id, mode, language, iteration
+            FROM {table_ref}
+            WHERE iteration IS NOT NULL AND iteration <> ''
+            """
+        ).format(table_ref=qualified_identifier(schema, "digital_rules"))
+        with conn.cursor() as cur:
+            cur.execute(query)
+            for rule_id, mode, language, iteration in cur.fetchall():
+                if rule_id is not None and mode and language and iteration:
+                    rule_id_str = str(rule_id).strip()
+                    mode_u = str(mode).strip().upper()
+                    lang_u = str(language).strip().upper()
+                    iter_val = str(iteration).strip()
+                    lookup[(rule_id_str, mode_u, lang_u)] = iter_val
+                    lookup.setdefault((rule_id_str, mode_u, ""), iter_val)
+    except Exception as e:
+        logger.warning("Could not pre-fetch digital_rules lookup table: %s", e)
+    return lookup
+
+
+def build_latest_digital_rule_map(history_files: list[Path]) -> dict[tuple[str, str, str], str]:
+    """
+    Reads historical communication CSVs and maps:
+    (apac_card_number, mode_upper, language_upper) -> latest digital_rule_id (str)
+    """
+    latest_map: dict[tuple[str, str, str], str] = {}
+    for csv_file in history_files:
+        if not csv_file or not Path(csv_file).exists():
+            continue
+        try:
+            df = pd.read_csv(csv_file, dtype=str)
+            if "digital_rule_id" not in df.columns:
+                continue
+            apac_col = (
+                "apac_card_number"
+                if "apac_card_number" in df.columns
+                else ("APAC_CARD_NUMBER" if "APAC_CARD_NUMBER" in df.columns else "Loan_number")
+            )
+            mode_col = "communication_type" if "communication_type" in df.columns else "mode"
+            lang_col = "verbiage_language" if "verbiage_language" in df.columns else "language"
+
+            df_valid = df[df["digital_rule_id"].notna() & df["digital_rule_id"].astype(str).str.strip().ne("")].copy()
+            if df_valid.empty:
+                continue
+
+            if "created_date" in df_valid.columns:
+                df_valid["_created_ts"] = pd.to_datetime(df_valid["created_date"], errors="coerce")
+                df_valid = df_valid.sort_values("_created_ts", ascending=True)
+
+            for _, row in df_valid.iterrows():
+                apac = str(row[apac_col]).strip() if apac_col in row and pd.notna(row[apac_col]) else ""
+                mode = str(row[mode_col]).strip().upper() if mode_col in row and pd.notna(row[mode_col]) else ""
+                lang = str(row[lang_col]).strip().upper() if lang_col in row and pd.notna(row[lang_col]) else ""
+                rule_id = str(row["digital_rule_id"]).strip()
+                if apac and mode and rule_id:
+                    latest_map[(apac, mode, lang)] = rule_id
+                    latest_map[(apac, mode, "")] = rule_id
+        except Exception as e:
+            logger.warning("Error loading digital_rule_id from %s: %s", csv_file, e)
+    return latest_map
+
+
+def resolve_template_name(
+    *,
+    loan_number: str,
+    due_type: str,
+    mode: str,
+    language: str,
+    digital_rule_id_map: dict[tuple[str, str, str], str] | None = None,
+    digital_rules_lookup: dict[tuple[str, str, str], str] | None = None,
+) -> str:
+    """
+    Resolves template_name by looking up digital_rule_id for (loan_number, mode, language),
+    and retrieving the iteration value from digital_rules.
+    Falls back to default formatted template name if missing/not found.
+    """
+    default_name = _template_name(due_type=due_type, mode=mode, language=language)
+    if not digital_rule_id_map or not digital_rules_lookup:
+        return default_name
+
+    mode_u = mode.strip().upper()
+    lang_u = language.strip().upper()
+
+    rule_id = digital_rule_id_map.get((loan_number, mode_u, lang_u)) or digital_rule_id_map.get((loan_number, mode_u, ""))
+    if not rule_id:
+        return default_name
+
+    template_name = digital_rules_lookup.get((rule_id, mode_u, lang_u)) or digital_rules_lookup.get((rule_id, mode_u, ""))
+    return template_name or default_name
 
 
 def _dataset_time_label(value: str) -> str:
@@ -1405,6 +1517,8 @@ def _build_campaign_assignment_groups(
     vendor_map: dict[str, list[str]] | None = None,
     configured_emi_dates: list[str] | None = None,
     run_token: str,
+    digital_rule_id_map: dict[tuple[str, str, str], str] | None = None,
+    digital_rules_lookup: dict[tuple[str, str, str], str] | None = None,
 ) -> pd.DataFrame:
     df = pd.read_csv(prediction_file)
     df = df[df["MONTH"] == prediction_month_label].copy()
@@ -1424,10 +1538,13 @@ def _build_campaign_assignment_groups(
                 vertical_value = str(row.get("SOURCE_VERTICAL", row.get("VERTICAL", vertical))).strip().upper()
                 if not vertical_value or vertical_value == "UNKNOWN":
                     vertical_value = vertical.upper()
-                template_name = _template_name(
+                template_name = resolve_template_name(
+                    loan_number=loan_number,
                     due_type=due_type,
                     mode=mode,
                     language=language,
+                    digital_rule_id_map=digital_rule_id_map,
+                    digital_rules_lookup=digital_rules_lookup,
                 )
                 emi_cycle = _resolve_row_emi_cycle(row, emi_cycles)
                 dataset_name = f"{due_type}|{NAME_CHANNEL_BY_MODE[mode]}|{vertical_value}|{language}|{risk_code}|{emi_cycle}"
@@ -1517,6 +1634,8 @@ def _prepare_campaign_outputs(
     vendor_map: dict[str, list[str]] | None = None,
     configured_emi_dates: list[str] | None = None,
     run_date: datetime | None = None,
+    digital_rule_id_map: dict[tuple[str, str, str], str] | None = None,
+    digital_rules_lookup: dict[tuple[str, str, str], str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     run_token = (run_date or datetime.now(timezone.utc)).strftime("%d%m%y")
     assignment_groups = _build_campaign_assignment_groups(
@@ -1530,6 +1649,8 @@ def _prepare_campaign_outputs(
         vendor_map=vendor_map,
         configured_emi_dates=configured_emi_dates or [],
         run_token=run_token,
+        digital_rule_id_map=digital_rule_id_map,
+        digital_rules_lookup=digital_rules_lookup,
     )
     if assignment_groups.empty:
         empty_campaigns = pd.DataFrame(
@@ -2823,6 +2944,21 @@ def main() -> None:
                 )
             with log_step(
                 logger,
+                "apply_non_working_day_suppressions",
+                prediction_file=prediction_file,
+                saturday_mode=args.saturday_mode,
+                suppress_sundays=args.suppress_sundays,
+            ):
+                run_python_script(
+                    "apply_non_working_day_suppressions.py",
+                    "--prediction-file",
+                    str(prediction_file),
+                    "--saturday-mode",
+                    args.saturday_mode,
+                    logger=logger,
+                )
+            with log_step(
+                logger,
                 "build_prediction_evidence",
                 prediction_file=prediction_file,
                 prediction_evidence_limit=args.prediction_evidence_limit,
@@ -2939,6 +3075,8 @@ def main() -> None:
                         prediction_month_label,
                         args.model,
                     )
+                    digital_rules_lookup = fetch_digital_rules_lookup(conn, schema=args.source_schema or args.target_schema)
+                    digital_rule_id_map = build_latest_digital_rule_map(history_files)
                     campaign_df, mapping_df = _prepare_campaign_outputs(
                         prediction_file,
                         source_month_label=source_month_label,
@@ -2949,6 +3087,8 @@ def main() -> None:
                         vendors=_extract_campaign_vendors(args.campaign_vendor) or [args.campaign_vendor],
                         vendor_map=campaign_vendor_map,
                         configured_emi_dates=configured_emi_dates or [],
+                        digital_rule_id_map=digital_rule_id_map,
+                        digital_rules_lookup=digital_rules_lookup,
                     )
                     campaign_rows = store_campaign_recommendations(
                         conn,

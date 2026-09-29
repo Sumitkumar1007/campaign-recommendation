@@ -87,6 +87,8 @@ def main() -> None:
         .first()
         .reset_index()
     )
+    monthly[key_column] = monthly[key_column].astype(str).str.strip()
+    risk_df[key_column] = risk_df[key_column].astype(str).str.strip()
     monthly = monthly.merge(risk_df, on=[key_column, "MONTH"], how="left")
     if vertical_parts:
         vertical_df = (
@@ -95,6 +97,7 @@ def main() -> None:
             .first()
             .reset_index()
         )
+        vertical_df[key_column] = vertical_df[key_column].astype(str).str.strip()
         monthly = monthly.merge(vertical_df, on=[key_column, "MONTH"], how="left")
     monthly.to_csv(output_file, index=False)
     print(f"Saved {len(monthly):,} rows to {output_file}")

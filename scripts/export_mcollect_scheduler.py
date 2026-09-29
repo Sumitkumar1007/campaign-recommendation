@@ -189,7 +189,8 @@ def build_cron_trigger_specs(row: pd.Series, *, trigger_state: str) -> list[Cron
 def dataset_query_for(row: pd.Series, *, schema: str, campaign_table: str, mapping_table: str) -> str:
     mode = str(row["mode"]).replace("'", "''")
     vertical = str(row["vertical"]).replace("'", "''")
-    language = str(row["template_name"]).rsplit("_", 1)[-1].upper().replace("'", "''")
+    raw_lang = row.get("language") or row.get("verbiage_language") or str(row["template_name"]).rsplit("_", 1)[-1]
+    language = str(raw_lang).upper().replace("'", "''")
     risk = str(row["risk"]).replace("'", "''")
     emi_cycle = int(row["emi_cycle"])
     date_value = str(row["date"]).replace("'", "''")

@@ -60,7 +60,6 @@ from pipeline_common import DAY_COLUMNS, SCHEDULE_DAY_COLUMNS
 from predict_next_month_strategy_catboost import build_prediction_population, build_prediction_reason
 from generate_prediction_evidence import (
     build_prediction_evidence as build_pit_prediction_evidence,
-    _prepare_raw_communications,
     prediction_evidence_file,
 )
 from campaign_recommendation.api_service import bump_model_version
@@ -101,6 +100,7 @@ def test_fit_day_model_uses_dash_fallback_for_missing_or_single_class_day(tmp_pa
         "D+1",
         X_train,
         y_train,
+        sample_weight=None,
         iterations=500,
         learning_rate=0.05,
         depth=8,
@@ -138,6 +138,7 @@ def test_fit_day_model_uses_constant_non_dash_fallback_for_single_class_day(tmp_
         "D-1",
         X_train,
         y_train,
+        sample_weight=None,
         iterations=500,
         learning_rate=0.05,
         depth=8,
@@ -223,7 +224,7 @@ def test_selected_history_files_uses_previous_two_months_plus_latest(tmp_path: P
 
     monkeypatch.setattr("run_monthly_inference_pipeline.COMMUNICATION_DATA_DIR", communication_dir)
 
-    assert selected_history_files("2026-04", latest) == [feb, mar, latest]
+    assert selected_history_files("2026-04", latest, history_window=3) == [feb, mar, latest]
 
 
 def test_selected_history_files_ignores_noncanonical_matches(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -238,7 +239,7 @@ def test_selected_history_files_ignores_noncanonical_matches(tmp_path: Path, mon
 
     monkeypatch.setattr("run_monthly_inference_pipeline.COMMUNICATION_DATA_DIR", communication_dir)
 
-    assert selected_history_files("2026-04", latest) == [feb, mar, latest]
+    assert selected_history_files("2026-04", latest, history_window=3) == [feb, mar, latest]
 
 
 def test_rolling_feature_window_keeps_month_wise_lag_history() -> None:
@@ -1450,35 +1451,40 @@ def test_generate_prediction_evidence_aggregates_matching_offsets_across_months(
             }
         ]
     )
-    raw_communications = pd.DataFrame(
+    training_df = pd.DataFrame(
         [
             {
                 "APAC_CARD_NUMBER": "MOB-TEST-AI",
-                "emi_date": pd.Timestamp("2026-04-05"),
-                "event_date": pd.Timestamp("2026-04-10"),
-                "COMM_TYPE": "SMS",
-                "LANGUAGE": "ENGLISH",
-                "IS_SUCCESS": True,
-                "hour_bucket": 12,
+                "MONTH": "APR-2026",
+                "DAY": "D+5",
+                "SMS_TOTAL_INTENSITY": 1.0,
+                "SMS_SUCCESS_12PM_ENGLISH": 1.0,
+                "SMS_SUCCESS_10AM_ENGLISH": 0.0,
             },
             {
                 "APAC_CARD_NUMBER": "MOB-TEST-AI",
-                "emi_date": pd.Timestamp("2026-05-05"),
-                "event_date": pd.Timestamp("2026-05-10"),
-                "COMM_TYPE": "SMS",
-                "LANGUAGE": "ENGLISH",
-                "IS_SUCCESS": True,
-                "hour_bucket": 12,
+                "MONTH": "MAY-2026",
+                "DAY": "D+5",
+                "SMS_TOTAL_INTENSITY": 1.0,
+                "SMS_SUCCESS_12PM_ENGLISH": 1.0,
+                "SMS_SUCCESS_10AM_ENGLISH": 0.0,
             },
             {
                 "APAC_CARD_NUMBER": "MOB-TEST-AI",
-                "emi_date": pd.Timestamp("2026-06-05"),
-                "event_date": pd.Timestamp("2026-06-09"),
-                "COMM_TYPE": "SMS",
-                "LANGUAGE": "ENGLISH",
-                "IS_SUCCESS": True,
-                "hour_bucket": 10,
+                "MONTH": "JUN-2026",
+                "DAY": "D+4",
+                "SMS_TOTAL_INTENSITY": 1.0,
+                "SMS_SUCCESS_12PM_ENGLISH": 0.0,
+                "SMS_SUCCESS_10AM_ENGLISH": 1.0,
             },
+        ]
+    )
+    base_population = pd.DataFrame(
+        [
+            {
+                "APAC_CARD_NUMBER": "MOB-TEST-AI",
+                "entity_key": "MOB-TEST-AI",
+            }
         ]
     )
     ranked_probability_map = {
@@ -1488,8 +1494,9 @@ def test_generate_prediction_evidence_aggregates_matching_offsets_across_months(
 
     evidence = build_pit_prediction_evidence(
         prediction_rows=prediction_rows,
-        raw_communications=raw_communications,
+        training_df=training_df,
         ranked_probability_map=ranked_probability_map,
+        base_population=base_population,
     )
 
     d_plus_4 = evidence[evidence["day"] == "D+4"].iloc[0]
@@ -1500,66 +1507,60 @@ def test_generate_prediction_evidence_aggregates_matching_offsets_across_months(
     assert d_plus_4["SMS_TOTAL_INTENSITY"] == 1.0
     assert d_plus_5["SMS_SUCCESS_12PM_ENGLISH"] == 2.0
     assert d_plus_5["SMS_SUCCESS_10AM_ENGLISH"] == 0.0
-    assert d_plus_5["SMS_TOTAL_INTENSITY"] == 3.0
-    assert d_plus_5["historical_successfeature1"] == "SMS_SUCCESS_12PM_ENGLISH"
-    assert d_plus_5["historical_successprecentage1"] == 66.67
-
-
-def test_generate_prediction_evidence_combines_same_day_offsets_from_loaded_month_files(tmp_path: Path) -> None:
-    columns = [
-        "apac_card_number",
-        "comm_status",
-        "communication_type",
-        "verbiage_language",
-        "vertical",
-        "risk",
-        "emi_date",
-        "date",
-        "created_date",
-    ]
-    rows_by_file = {
-        "comm_data_APR2026.csv": [
-            ["MOB-TEST-AI", "DELIVERED", "SMS", "English", "LAP", "MEDIUM", "05/04/2026", "10/04/2026", "10/04/2026 12:15:00"],
-        ],
-        "comm_data_MAY2026.csv": [
-            ["MOB-TEST-AI", "DELIVERED", "SMS", "English", "LAP", "MEDIUM", "05/05/2026", "10/05/2026", "10/05/2026 12:30:00"],
-        ],
-        "comm_data_JUN2026.csv": [
-            ["MOB-TEST-AI", "DELIVERED", "SMS", "English", "LAP", "MEDIUM", "05/06/2026", "10/06/2026", "10/06/2026 12:45:00"],
-        ],
-    }
-    files = []
-    for file_name, rows in rows_by_file.items():
-        file_path = tmp_path / file_name
-        pd.DataFrame(rows, columns=columns).to_csv(file_path, index=False)
-        files.append(file_path)
-
-    raw_communications = _prepare_raw_communications(files)
-    prediction_rows = pd.DataFrame(
-        [
-            {
-                "Loan_number": "MOB-TEST-AI",
-                "SOURCE_MONTH_USED": "JUN-2026",
-                "MONTH": "JUL-2026",
-                "EMI_DATE": "15/07/2026",
-                "SOURCE_RISK": "MEDIUM",
-                "SOURCE_VERTICAL": "LAP",
-            }
-        ]
-    )
-
-    evidence = build_pit_prediction_evidence(
-        prediction_rows=prediction_rows,
-        raw_communications=raw_communications,
-        ranked_probability_map={
-            ("MOB-TEST-AI", "D+5"): [("SMS-12PM-ENGLISH", 0.91), ("SMS-9AM-ENGLISH", 0.05), ("WH-9AM-ENGLISH", 0.04)]
-        },
-    )
-
-    d_plus_5 = evidence[evidence["day"] == "D+5"].iloc[0]
-
-    assert d_plus_5["SMS_SUCCESS_12PM_ENGLISH"] == 3.0
-    assert d_plus_5["SMS_TOTAL_INTENSITY"] == 3.0
+    assert d_plus_5["SMS_TOTAL_INTENSITY"] == 2.0
     assert d_plus_5["historical_successfeature1"] == "SMS_SUCCESS_12PM_ENGLISH"
     assert d_plus_5["historical_successprecentage1"] == 100.0
+
+
+def test_link_and_external_payment_multipliers():
+    import pandas as pd
+    from scripts.generate_strategy_dataset import process_chunk
+
+    df_comm = pd.DataFrame([
+        {
+            "apac_card_number": "APAC-LINK-001",
+            "communication_type": "SMS",
+            "comm_status": "CLICKED",
+            "verbiage_language": "ENGLISH",
+            "risk": "LOW",
+            "vertical": "LAP",
+            "emi_date": "2026-04-10",
+            "created_date": "2026-04-05 11:00:00",
+            "date": "2026-04-05",
+            "payment_unique_id": "LINK-PAY-123",
+        },
+        {
+            "apac_card_number": "APAC-EXT-002",
+            "communication_type": "SMS",
+            "comm_status": "DELIVERED",
+            "verbiage_language": "ENGLISH",
+            "risk": "LOW",
+            "vertical": "LAP",
+            "emi_date": "2026-04-10",
+            "created_date": "2026-04-05 11:00:00",
+            "date": "2026-04-05",
+            "payment_unique_id": "",
+        },
+    ])
+
+    paid_keys = {("APAC-LINK-001", "APR-2026"), ("APAC-EXT-002", "APR-2026")}
+    link_ref_numbers = {"LINK-PAY-123"}
+    external_payment_dates = {("APAC-EXT-002", "2026-04-05")}
+
+    feat, strategy, risk = process_chunk(
+        df_comm,
+        weighting_enabled=True,
+        paid_keys=paid_keys,
+        link_ref_numbers=link_ref_numbers,
+        external_payment_dates=external_payment_dates,
+        link_payment_multiplier=5.0,
+        external_payment_multiplier=2.5,
+    )
+
+    link_score = strategy.loc[strategy["ENTITY_KEY"] == "APAC-LINK-001", "count"].values[0]
+    ext_score = strategy.loc[strategy["ENTITY_KEY"] == "APAC-EXT-002", "count"].values[0]
+
+    assert link_score == 1.0 * 5.0  # Base 1.0 * 5.0 link multiplier
+    assert ext_score == 1.0 * 2.5   # Base 1.0 * 2.5 external multiplier
+
 

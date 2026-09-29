@@ -18,6 +18,68 @@ RISK_TOP_K = {
     "HIGH": 3,
 }
 
+PREDUE_LIMITS_BY_RISK = {
+    "LOW": {"target_min": 2, "target_max": 2},
+    "MEDIUM": {"target_min": 3, "target_max": 4},
+    "HIGH": {"target_min": 4, "target_max": 5},
+}
+DEFAULT_PREDUE_STRATEGY = "SMS-11AM-ENGLISH"
+
+
+def apply_predue_risk_rules(df: pd.DataFrame, default_strategy: str = DEFAULT_PREDUE_STRATEGY) -> pd.DataFrame:
+    """
+    Enforces D-5 full base communication rule and risk-based pre-due touchpoint limits:
+    - D-5 is mandatory for 100% of base population (defaults to SMS-11AM-ENGLISH if blank).
+    - LOW Risk: Exactly 2 communications across D-5..D-1.
+    - MEDIUM Risk: 3 to 4 communications across D-5..D-1.
+    - HIGH Risk: 4 to 5 communications across D-5..D-1.
+    """
+    df = df.copy()
+    risk_col = "SOURCE_RISK" if "SOURCE_RISK" in df.columns else ("RISK" if "RISK" in df.columns else None)
+    other_predue_days = ["D-4", "D-3", "D-2", "D-1"]
+
+    for idx, row in df.iterrows():
+        risk_raw = str(row[risk_col]).upper().strip() if risk_col and pd.notna(row[risk_col]) else "LOW"
+        limits = PREDUE_LIMITS_BY_RISK.get(risk_raw, PREDUE_LIMITS_BY_RISK["LOW"])
+        target_min = limits["target_min"]
+        target_max = limits["target_max"]
+
+        # 1. Mandatory D-5 Full Base Communication
+        d5_val = str(row.get("D-5", "-")).strip()
+        if d5_val in ("", "-", "None", "nan"):
+            df.at[idx, "D-5"] = default_strategy
+
+        # 2. Identify active days among D-4, D-3, D-2, D-1
+        active_other = [
+            day for day in other_predue_days
+            if str(row.get(day, "-")).strip() not in ("", "-", "None", "nan")
+        ]
+
+        current_active = 1 + len(active_other)
+
+        # 3. Trim extra pre-due days if count exceeds target_max
+        if current_active > target_max:
+            allowed_other_count = target_max - 1
+            allowed_other = set(active_other[:allowed_other_count])
+            for day in other_predue_days:
+                if day not in allowed_other:
+                    df.at[idx, day] = "-"
+
+        # 4. Fill in missing pre-due days if count is below target_min
+        elif current_active < target_min:
+            needed = target_min - current_active
+            priority_fill = ["D-1", "D-2", "D-3", "D-4"]
+            filled = 0
+            for day in priority_fill:
+                if filled >= needed:
+                    break
+                val = str(df.at[idx, day]).strip() if day in df.columns else "-"
+                if val in ("", "-", "None", "nan"):
+                    df.at[idx, day] = default_strategy
+                    filled += 1
+
+    return df
+
 
 
 def candidate_hours(send_hour_window: dict[str, int]) -> list[int]:
@@ -44,6 +106,7 @@ def build_rolling_feature_windows(
 ) -> pd.DataFrame:
     features = features.copy()
     key_column = "ENTITY_KEY" if "ENTITY_KEY" in features.columns else "APAC_CARD_NUMBER"
+    features[key_column] = features[key_column].astype(str).str.strip()
     features["MONTH_PERIOD"] = month_to_period(features["MONTH"])
     features = features.dropna(subset=["MONTH_PERIOD"])
     features = (
@@ -95,6 +158,8 @@ def prepare_next_month_dataset(
     features = pd.read_csv(feature_file).copy()
     schedule = pd.read_csv(schedule_file).copy()
     key_column = "ENTITY_KEY" if "ENTITY_KEY" in features.columns or "ENTITY_KEY" in schedule.columns else "APAC_CARD_NUMBER"
+    features[key_column] = features[key_column].astype(str).str.strip()
+    schedule[key_column] = schedule[key_column].astype(str).str.strip()
     if history_window_months is not None:
         features = build_rolling_feature_windows(features, history_window_months)
 

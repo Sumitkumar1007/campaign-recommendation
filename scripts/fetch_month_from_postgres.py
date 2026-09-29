@@ -237,6 +237,8 @@ def build_query(schema: str, table: str, vertical_column: str, party_id_column: 
                 src.apac_card_number,
                 src.comm_status,
                 src.communication_type,
+                src.payment_unique_id,
+                src.digital_rule_id,
                 src.verbiage_language,
                 src.{vertical_column} AS vertical,
                 src.risk,
@@ -249,12 +251,15 @@ def build_query(schema: str, table: str, vertical_column: str, party_id_column: 
                 src.created_date,
                 src.last_modified_date
             FROM {table_ref} src
+            WHERE src.created_by ='digital'
         )
         SELECT
             id,
             apac_card_number,
             comm_status,
             communication_type,
+            payment_unique_id,
+            digital_rule_id,
             verbiage_language,
             vertical,
             risk,

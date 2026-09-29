@@ -172,6 +172,11 @@ def build_source_feature_table(feature_df: pd.DataFrame) -> pd.DataFrame:
         col if isinstance(col, str) and col in key_columns else f"DAY_TOTAL_{col}"
         for col in day_activity.columns
     ]
+    for col in key_columns:
+        if col in merged.columns:
+            merged[col] = merged[col].astype(str).str.strip()
+        if col in day_activity.columns:
+            day_activity[col] = day_activity[col].astype(str).str.strip()
     merged = merged.merge(day_activity, on=key_columns, how="left")
 
     risk_df = (
@@ -179,6 +184,9 @@ def build_source_feature_table(feature_df: pd.DataFrame) -> pd.DataFrame:
         .apply(lambda g: pd.Series({"RISK": derive_risk(g)}))
         .reset_index(drop=True)
     )
+    for col in key_columns:
+        if col in risk_df.columns:
+            risk_df[col] = risk_df[col].astype(str).str.strip()
     merged = merged.merge(risk_df, on=key_columns, how="left")
     merged = merged.rename(columns={"MONTH": "SOURCE_MONTH", "MONTH_PERIOD": "SOURCE_MONTH_PERIOD"})
     return merged
@@ -207,6 +215,9 @@ def build_supervised_pairs(
     source_df = build_source_feature_table(feature_df)
     target_df = build_target_table(schedule_df)
     source_df["TARGET_MONTH_PERIOD"] = source_df["SOURCE_MONTH_PERIOD"] + target_offset_months
+
+    source_df["APAC_CARD_NUMBER"] = source_df["APAC_CARD_NUMBER"].astype(str).str.strip()
+    target_df["APAC_CARD_NUMBER"] = target_df["APAC_CARD_NUMBER"].astype(str).str.strip()
 
     merged = source_df.merge(
         target_df,

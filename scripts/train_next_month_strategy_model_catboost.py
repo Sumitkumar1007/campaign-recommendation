@@ -204,18 +204,13 @@ def resolve_source_month_splits(
         prediction_source_months,
     ])
     if not has_explicit_split and targetable_months:
-        if len(targetable_months) >= 3:
-            effective_train = targetable_months[:-2]
-            effective_validation = targetable_months[-2:-1]
-            effective_test = targetable_months[-1:]
-        elif len(targetable_months) == 2:
-            effective_train = targetable_months[:1]
+        if len(targetable_months) >= 2:
+            effective_train = targetable_months[:-1]
             effective_validation = targetable_months[-1:]
-            effective_test = []
         else:
             effective_train = targetable_months
             effective_validation = []
-            effective_test = []
+        effective_test = []
 
         effective_prediction = [all_months[-1]] if all_months else []
         return effective_train, effective_validation, effective_test, effective_prediction

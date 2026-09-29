@@ -123,6 +123,9 @@ def main() -> None:
         for column in DAY_WEIGHT_COLUMNS:
             weight_wide[column] = 1.0
 
+    wide[key_column] = wide[key_column].astype(str).str.strip()
+    weight_wide[key_column] = weight_wide[key_column].astype(str).str.strip()
+    risk_df[key_column] = risk_df[key_column].astype(str).str.strip()
     wide = wide.merge(weight_wide, on=[key_column, "MONTH"], how="left")
     wide = wide.merge(risk_df, on=[key_column, "MONTH"], how="left")
     wide = wide.rename(columns={key_column: "ENTITY_KEY"})
