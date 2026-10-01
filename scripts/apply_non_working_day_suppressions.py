@@ -128,25 +128,21 @@ def suppress_non_working_days_in_dataframe(
                 continue
 
             target_date = base_emi_date + datetime.timedelta(days=offset)
-            current_val = str(row.get(day_col, "-")).strip()
-
-            if current_val in ("", "-", "None", "nan"):
-                continue
-
-            should_suppress = False
+            suppress_reason = None
 
             if suppress_sundays and is_sunday(target_date):
-                should_suppress = True
+                suppress_reason = "Sunday"
                 stats["sunday_suppressions"] += 1
             elif saturday_mode == "bank_saturdays" and is_non_working_saturday(target_date):
-                should_suppress = True
+                saturday_occ = (target_date.day - 1) // 7 + 1
+                suppress_reason = "2nd Saturday" if saturday_occ == 2 else "4th Saturday"
                 stats["saturday_suppressions"] += 1
             elif saturday_mode == "all_saturdays" and is_saturday(target_date):
-                should_suppress = True
+                suppress_reason = "Saturday"
                 stats["saturday_suppressions"] += 1
 
-            if should_suppress:
-                df.at[idx, day_col] = "-"
+            if suppress_reason:
+                df.at[idx, day_col] = suppress_reason
                 stats["total_suppressions"] += 1
 
     return df, stats

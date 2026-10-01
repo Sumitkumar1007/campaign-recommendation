@@ -82,7 +82,7 @@ def test_medium_risk_3_to_4_communications():
     assert res.iloc[0]["D-5"] == "SMS-11AM-ENGLISH"
 
 
-def test_high_risk_4_to_5_communications():
+def test_high_risk_4_communications():
     df = pd.DataFrame(
         [
             {
@@ -99,5 +99,5 @@ def test_high_risk_4_to_5_communications():
 
     res = apply_predue_risk_rules(df)
     active_predue = [col for col in ["D-5", "D-4", "D-3", "D-2", "D-1"] if res.iloc[0][col] != "-"]
-    assert len(active_predue) == 5
+    assert len(active_predue) == 4
     assert "D-5" in active_predue

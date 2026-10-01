@@ -406,7 +406,7 @@ def main() -> None:
 
     out_dir = Path(args.output_dir) if args.output_dir else pred_path.parent
 
-    predictions_df = pd.read_csv(pred_path)
+    predictions_df = pd.read_csv(pred_path, dtype=str).fillna("")
     counts_file, pct_file = generate_summary_workbooks(predictions_df, out_dir, pred_path.stem)
 
     print(f"Saved counts summary Excel file to: {counts_file}")

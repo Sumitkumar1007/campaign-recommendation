@@ -301,6 +301,9 @@ def process_chunk(
     external_payment_dates: set[tuple[str, str]] | None = None,
     link_payment_multiplier: float = 5.0,
     external_payment_multiplier: float = 2.5,
+    link_pay_counts: dict[tuple[str, str], int] | None = None,
+    ext_pay_counts: dict[tuple[str, str], int] | None = None,
+    tot_pay_counts: dict[tuple[str, str], int] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df = chunk.copy()
     if "risk" not in df.columns:
@@ -388,11 +391,32 @@ def process_chunk(
 
             # Fallback: Monthly account payment match
             if (entity, month) in paid_keys:
-                return base_score * link_payment_multiplier
+                return base_score * external_payment_multiplier
 
         return base_score
 
+    def get_payment_flags(row: pd.Series) -> tuple[int, int, int]:
+        if not paid_keys or row["COMM_TYPE"] not in {"SMS", "WH", "WHATSAPP", "VOICE", "VOICE_BOT"}:
+            return 0, 0, 0
+        entity = str(row[key_col]).strip()
+        month = str(row["MONTH"]).strip().upper()
+        pay_unique_id = str(row.get("payment_unique_id", "") or "").strip()
+        comm_date_val = row.get("date")
+        comm_date_str = comm_date_val.strftime("%Y-%m-%d") if pd.notna(comm_date_val) else ""
+
+        if pay_unique_id and link_ref_numbers and pay_unique_id in link_ref_numbers:
+            return 1, 0, 1
+        if comm_date_str and external_payment_dates and (entity, comm_date_str) in external_payment_dates:
+            return 0, 1, 1
+        if (entity, month) in paid_keys:
+            return 0, 1, 1
+        return 0, 0, 0
+
     df["SUCCESS_SCORE"] = df.apply(success_score, axis=1)
+    p_flags = df.apply(get_payment_flags, axis=1)
+    df["IS_LINK_PAYMENT"] = [p[0] for p in p_flags]
+    df["IS_EXT_PAYMENT"] = [p[1] for p in p_flags]
+    df["IS_ANY_PAYMENT"] = [p[2] for p in p_flags]
 
     totals = (
         df.groupby([key_col, "MONTH", "DAY", "COMM_TYPE"], sort=False)
@@ -400,6 +424,51 @@ def process_chunk(
         .reset_index(name="count")
     )
     totals["feature"] = totals["COMM_TYPE"] + "_TOTAL_INTENSITY"
+
+    # Payment feature aggregations per (key_col, MONTH, DAY)
+    link_pay_feats = (
+        df.groupby([key_col, "MONTH", "DAY"], sort=False)["IS_LINK_PAYMENT"]
+        .sum()
+        .reset_index(name="count")
+    )
+    link_pay_feats["feature"] = "LINK_PAYMENT_COUNT"
+
+    ext_pay_feats = (
+        df.groupby([key_col, "MONTH", "DAY"], sort=False)["IS_EXT_PAYMENT"]
+        .sum()
+        .reset_index(name="count")
+    )
+    ext_pay_feats["feature"] = "EXT_PAYMENT_COUNT"
+
+    tot_pay_feats = (
+        df.groupby([key_col, "MONTH", "DAY"], sort=False)["IS_ANY_PAYMENT"]
+        .sum()
+        .reset_index(name="count")
+    )
+    tot_pay_feats["feature"] = "TOTAL_PAYMENT_COUNT"
+
+    if link_pay_counts or ext_pay_counts or tot_pay_counts:
+        for idx, r in link_pay_feats.iterrows():
+            entity = str(r[key_col]).strip()
+            month = str(r["MONTH"]).strip().upper()
+            k = (entity, month)
+            l_c = (link_pay_counts or {}).get(k, 0)
+            if l_c > 0:
+                link_pay_feats.at[idx, "count"] = float(l_c)
+        for idx, r in ext_pay_feats.iterrows():
+            entity = str(r[key_col]).strip()
+            month = str(r["MONTH"]).strip().upper()
+            k = (entity, month)
+            e_c = (ext_pay_counts or {}).get(k, 0)
+            if e_c > 0:
+                ext_pay_feats.at[idx, "count"] = float(e_c)
+        for idx, r in tot_pay_feats.iterrows():
+            entity = str(r[key_col]).strip()
+            month = str(r["MONTH"]).strip().upper()
+            k = (entity, month)
+            t_c = (tot_pay_counts or {}).get(k, 0)
+            if t_c > 0:
+                tot_pay_feats.at[idx, "count"] = float(t_c)
 
     failed = (
         df.loc[~df["IS_SUCCESS"]]
@@ -455,6 +524,9 @@ def process_chunk(
 
     feature_frames = [
         totals[[key_col, "MONTH", "DAY", "feature", "count"]],
+        link_pay_feats[[key_col, "MONTH", "DAY", "feature", "count"]],
+        ext_pay_feats[[key_col, "MONTH", "DAY", "feature", "count"]],
+        tot_pay_feats[[key_col, "MONTH", "DAY", "feature", "count"]],
     ]
     if not failed.empty:
         feature_frames.append(
@@ -615,9 +687,12 @@ def build_dataset(
     paid_keys: set[tuple[str, str]] | None = None
     link_ref_numbers: set[str] | None = None
     external_payment_dates: set[tuple[str, str]] | None = None
+    link_pay_counts: dict[tuple[str, str], int] | None = None
+    ext_pay_counts: dict[tuple[str, str], int] | None = None
+    tot_pay_counts: dict[tuple[str, str], int] | None = None
     if payment_files:
         print(f"Loading payment data (Link Multiplier={link_payment_multiplier}x, External Multiplier={external_payment_multiplier}x)...")
-        paid_keys, _, link_ref_numbers, external_payment_dates = load_paid_keys(payment_files)
+        paid_keys, _, link_ref_numbers, external_payment_dates, link_pay_counts, ext_pay_counts, tot_pay_counts = load_paid_keys(payment_files)
         print(f"Loaded {len(paid_keys)} unique payment events ({len(link_ref_numbers)} link refs, {len(external_payment_dates)} date refs).")
 
     sample_cards = (
@@ -649,6 +724,9 @@ def build_dataset(
                 external_payment_dates=external_payment_dates,
                 link_payment_multiplier=link_payment_multiplier,
                 external_payment_multiplier=external_payment_multiplier,
+                link_pay_counts=link_pay_counts,
+                ext_pay_counts=ext_pay_counts,
+                tot_pay_counts=tot_pay_counts,
             )
             if not feature_counts.empty:
                 feature_parts.append(feature_counts)

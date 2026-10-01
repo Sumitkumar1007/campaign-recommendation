@@ -11,7 +11,8 @@ DAY_COLUMNS = [*PREDUE_DAY_COLUMNS, *POSTDUE_DAY_COLUMNS]
 SCHEDULE_DAY_COLUMNS = [*PREDUE_DAY_COLUMNS, "D", *POSTDUE_DAY_COLUMNS]
 DAY_WEIGHT_COLUMN_MAP = {day: f"{day}__WEIGHT" for day in DAY_COLUMNS}
 DAY_WEIGHT_COLUMNS = [DAY_WEIGHT_COLUMN_MAP[day] for day in DAY_COLUMNS]
-NON_FEATURE_COLUMNS = DAY_COLUMNS + DAY_WEIGHT_COLUMNS + ["TARGET_MONTH", "TARGET_MONTH_PERIOD", "TARGET_RISK", "VERTICAL"]
+AUDIT_PAYMENT_COLUMNS = ["HAS_LINK_PAYMENT", "HAS_EXTERNAL_PAYMENT", "LINK_PAYMENT_FLAG", "EXTERNAL_PAYMENT_FLAG"]
+NON_FEATURE_COLUMNS = DAY_COLUMNS + DAY_WEIGHT_COLUMNS + AUDIT_PAYMENT_COLUMNS + ["TARGET_MONTH", "TARGET_MONTH_PERIOD", "TARGET_RISK", "VERTICAL"]
 RISK_TOP_K = {
     "LOW": 1,
     "MEDIUM": 2,
@@ -19,9 +20,9 @@ RISK_TOP_K = {
 }
 
 PREDUE_LIMITS_BY_RISK = {
-    "LOW": {"target_min": 2, "target_max": 2},
-    "MEDIUM": {"target_min": 3, "target_max": 4},
-    "HIGH": {"target_min": 4, "target_max": 5},
+    "LOW": {"target_exact": 2},
+    "MEDIUM": {"target_exact": 3},
+    "HIGH": {"target_exact": 4},
 }
 DEFAULT_PREDUE_STRATEGY = "SMS-11AM-ENGLISH"
 
@@ -30,44 +31,51 @@ def apply_predue_risk_rules(df: pd.DataFrame, default_strategy: str = DEFAULT_PR
     """
     Enforces D-5 full base communication rule and risk-based pre-due touchpoint limits:
     - D-5 is mandatory for 100% of base population (defaults to SMS-11AM-ENGLISH if blank).
-    - LOW Risk: Exactly 2 communications across D-5..D-1.
-    - MEDIUM Risk: 3 to 4 communications across D-5..D-1.
-    - HIGH Risk: 4 to 5 communications across D-5..D-1.
+    - Ensures single communication per day (selects 1st option if multiple given).
+    - LOW Risk: Exactly 2 communications across D-5..D-1 (1 per day).
+    - MEDIUM Risk: Exactly 3 communications across D-5..D-1 (1 per day).
+    - HIGH Risk: Exactly 4 communications across D-5..D-1 (1 per day).
     """
     df = df.copy()
     risk_col = "SOURCE_RISK" if "SOURCE_RISK" in df.columns else ("RISK" if "RISK" in df.columns else None)
     other_predue_days = ["D-4", "D-3", "D-2", "D-1"]
 
+    # 1. Enforce single communication per day across all pre-due days
+    for day in PREDUE_DAY_COLUMNS:
+        if day in df.columns:
+            df[day] = df[day].fillna("-").astype(str).apply(
+                lambda val: val.split("|")[0].strip() if "|" in val else val.strip()
+            )
+
     for idx, row in df.iterrows():
         risk_raw = str(row[risk_col]).upper().strip() if risk_col and pd.notna(row[risk_col]) else "LOW"
         limits = PREDUE_LIMITS_BY_RISK.get(risk_raw, PREDUE_LIMITS_BY_RISK["LOW"])
-        target_min = limits["target_min"]
-        target_max = limits["target_max"]
+        target_exact = limits["target_exact"]
 
-        # 1. Mandatory D-5 Full Base Communication
-        d5_val = str(row.get("D-5", "-")).strip()
+        # 2. Mandatory D-5 Full Base Communication
+        d5_val = str(df.at[idx, "D-5"]).strip() if "D-5" in df.columns else "-"
         if d5_val in ("", "-", "None", "nan"):
             df.at[idx, "D-5"] = default_strategy
 
-        # 2. Identify active days among D-4, D-3, D-2, D-1
+        # 3. Identify active days among D-4, D-3, D-2, D-1
         active_other = [
             day for day in other_predue_days
-            if str(row.get(day, "-")).strip() not in ("", "-", "None", "nan")
+            if str(df.at[idx, day]).strip() not in ("", "-", "None", "nan")
         ]
 
         current_active = 1 + len(active_other)
 
-        # 3. Trim extra pre-due days if count exceeds target_max
-        if current_active > target_max:
-            allowed_other_count = target_max - 1
+        # 4. Trim extra pre-due days if count exceeds target_exact
+        if current_active > target_exact:
+            allowed_other_count = target_exact - 1
             allowed_other = set(active_other[:allowed_other_count])
             for day in other_predue_days:
                 if day not in allowed_other:
                     df.at[idx, day] = "-"
 
-        # 4. Fill in missing pre-due days if count is below target_min
-        elif current_active < target_min:
-            needed = target_min - current_active
+        # 5. Fill in missing pre-due days if count is below target_exact
+        elif current_active < target_exact:
+            needed = target_exact - current_active
             priority_fill = ["D-1", "D-2", "D-3", "D-4"]
             filled = 0
             for day in priority_fill:
@@ -155,8 +163,8 @@ def prepare_next_month_dataset(
     target_offset_months: int,
     history_window_months: int | None = None,
 ) -> pd.DataFrame:
-    features = pd.read_csv(feature_file).copy()
-    schedule = pd.read_csv(schedule_file).copy()
+    features = pd.read_csv(feature_file, dtype=str).copy()
+    schedule = pd.read_csv(schedule_file, dtype=str).copy()
     key_column = "ENTITY_KEY" if "ENTITY_KEY" in features.columns or "ENTITY_KEY" in schedule.columns else "APAC_CARD_NUMBER"
     features[key_column] = features[key_column].astype(str).str.strip()
     schedule[key_column] = schedule[key_column].astype(str).str.strip()
@@ -179,17 +187,20 @@ def prepare_next_month_dataset(
         if column not in schedule.columns:
             schedule[column] = 1.0
 
+    schedule_cols = [
+        key_column,
+        "TARGET_MONTH",
+        "TARGET_MONTH_PERIOD",
+        "TARGET_RISK",
+        *DAY_COLUMNS,
+        *DAY_WEIGHT_COLUMNS,
+    ]
+    for col in AUDIT_PAYMENT_COLUMNS:
+        if col in schedule.columns and col not in schedule_cols:
+            schedule_cols.append(col)
+
     return features.merge(
-        schedule[
-            [
-                key_column,
-                "TARGET_MONTH",
-                "TARGET_MONTH_PERIOD",
-                "TARGET_RISK",
-                *DAY_COLUMNS,
-                *DAY_WEIGHT_COLUMNS,
-            ]
-        ],
+        schedule[schedule_cols],
         on=[key_column, "TARGET_MONTH_PERIOD"],
         how="left",
     )

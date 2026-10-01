@@ -166,9 +166,25 @@ def fetch_payment_extracts(args: argparse.Namespace, logger: logging.Logger, mon
 
 
 def build_training_artifacts(input_files: list[Path], payment_files: list[Path], month_source: str, logger: logging.Logger) -> None:
+    from project_paths import PAYMENT_DATA_DIR
     training_output = TRAINING_DATA_DIR / "strategy_training_dataset_train.csv"
     schedule_output = SCHEDULE_DATA_DIR / "strategy_schedule_dataset_train.csv"
     feature_output = FEATURE_DATA_DIR / "strategy_monthly_features_train.csv"
+    consolidated_report = PAYMENT_DATA_DIR / "consolidated_payment_report.csv"
+
+    with log_step(logger, "generate_consolidated_payment_report"):
+        run_python_script(
+            "generate_consolidated_payment_report.py",
+            "--communication-files",
+            *[str(path) for path in input_files],
+            "--payment-files",
+            *[str(path) for path in payment_files],
+            "--output-file",
+            str(consolidated_report),
+            logger=logger,
+        )
+        logger.info("Generated consolidated payment report | output_file=%s exists=%s", consolidated_report, consolidated_report.exists())
+
     with log_step(logger, "generate_strategy_dataset", input_files=','.join(str(path) for path in input_files)):
         run_python_script(
             "generate_strategy_dataset.py",
@@ -179,7 +195,7 @@ def build_training_artifacts(input_files: list[Path], payment_files: list[Path],
             "--input-files",
             *[str(path) for path in input_files],
             "--payment-files",
-            *[str(path) for path in payment_files],
+            str(consolidated_report),
             logger=logger,
         )
         logger.info("Generated training dataset | output_file=%s exists=%s", training_output, training_output.exists())
@@ -200,6 +216,8 @@ def build_training_artifacts(input_files: list[Path], payment_files: list[Path],
             str(training_output),
             "--output-file",
             str(feature_output),
+            "--payment-files",
+            str(consolidated_report),
             logger=logger,
         )
         logger.info("Generated feature dataset | output_file=%s exists=%s", feature_output, feature_output.exists())

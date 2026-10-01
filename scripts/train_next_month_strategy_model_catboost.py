@@ -168,6 +168,12 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional model version token used to save version-specific artifacts, for example v002.",
     )
+    parser.add_argument(
+        "--use-random-data-split",
+        action="store_true",
+        default=os.getenv("USE_RANDOM_DATA_SPLIT", "false").strip().lower() in {"1", "true", "yes", "on"},
+        help="Use random 70/15/15 stratified data split across all labeled data instead of chronological month split.",
+    )
     return parser.parse_args()
 
 
@@ -494,6 +500,8 @@ def write_training_daywise_model_input_audit(
                     "day": day,
                     "targetStrategy": row.get(day),
                     "dayWeight": row.get(DAY_WEIGHT_COLUMN_MAP[day], 1.0),
+                    "hasLinkPayment": row.get("HAS_LINK_PAYMENT", row.get(DAY_WEIGHT_COLUMN_MAP[day], 1.0) == 5.0),
+                    "hasExternalPayment": row.get("HAS_EXTERNAL_PAYMENT", row.get(DAY_WEIGHT_COLUMN_MAP[day], 1.0) == 2.5),
                     **feature_values,
                 }
             )
@@ -508,6 +516,8 @@ def write_training_daywise_model_input_audit(
         "day",
         "targetStrategy",
         "dayWeight",
+        "hasLinkPayment",
+        "hasExternalPayment",
         *feature_columns,
     ]
     pd.DataFrame(records).reindex(columns=output_columns).to_csv(output_file, index=False)
@@ -556,6 +566,9 @@ def main() -> None:
             )
 
         with log_step(logger, "split_dataset"):
+            use_random_split = getattr(args, "use_random_data_split", False) or (
+                os.getenv("USE_RANDOM_DATA_SPLIT", "false").strip().lower() in {"1", "true", "yes", "on"}
+            )
             effective_train_source_months, effective_validation_source_months, effective_test_source_months, effective_prediction_source_months = resolve_source_month_splits(
                 dataset,
                 args.train_source_months,
@@ -563,16 +576,25 @@ def main() -> None:
                 args.test_source_months,
                 args.prediction_source_months,
             )
-            train_df = split_by_source_month(dataset, effective_train_source_months, require_target=True)
-            validation_df = split_by_source_month(dataset, effective_validation_source_months, require_target=True)
-            test_df = split_by_source_month(dataset, effective_test_source_months, require_target=True)
-            prediction_df = split_by_source_month(dataset, effective_prediction_source_months, require_target=False)
+            if use_random_split:
+                from sklearn.model_selection import train_test_split
+                all_labeled_df = dataset.dropna(subset=["TARGET_MONTH"]).copy()
+                prediction_df = split_by_source_month(dataset, effective_prediction_source_months, require_target=False)
+                train_df, temp_df = train_test_split(all_labeled_df, test_size=0.30, random_state=42)
+                validation_df, test_df = train_test_split(temp_df, test_size=0.50, random_state=42)
+                logger.info("Using Random Data Split (70%% Train / 15%% Validation / 15%% Test across all labeled rows)")
+            else:
+                train_df = split_by_source_month(dataset, effective_train_source_months, require_target=True)
+                validation_df = split_by_source_month(dataset, effective_validation_source_months, require_target=True)
+                test_df = split_by_source_month(dataset, effective_test_source_months, require_target=True)
+                prediction_df = split_by_source_month(dataset, effective_prediction_source_months, require_target=False)
             logger.info(
-                "Split rows | train=%s validation=%s test=%s prediction_candidates=%s",
+                "Split rows | train=%s validation=%s test=%s prediction_candidates=%s random_split=%s",
                 len(train_df),
                 len(validation_df),
                 len(test_df),
                 len(prediction_df),
+                use_random_split,
             )
             logger.info(
                 "Effective source months | train=%s validation=%s test=%s prediction=%s",
@@ -703,11 +725,12 @@ def main() -> None:
                 f"targets with month offset {args.target_offset_months} using the latest "
                 f"{args.history_window_months} months of per-account feature history."
             ),
+            "split_method": "random_split (70% Train / 15% Validation / 15% Test)" if use_random_split else "month_based_split",
             "target_offset_months": args.target_offset_months,
             "history_window_months": args.history_window_months,
-            "train_source_months": effective_train_source_months,
-            "validation_source_months": effective_validation_source_months,
-            "test_source_months": effective_test_source_months,
+            "train_source_months": ["ALL_MONTHS_RANDOM_SAMPLED_70%"] if use_random_split else effective_train_source_months,
+            "validation_source_months": ["ALL_MONTHS_RANDOM_SAMPLED_15%"] if use_random_split else effective_validation_source_months,
+            "test_source_months": ["ALL_MONTHS_RANDOM_SAMPLED_15%"] if use_random_split else effective_test_source_months,
             "prediction_source_months": effective_prediction_source_months,
             "n_jobs": args.n_jobs,
             "iterations": args.iterations,
@@ -753,7 +776,7 @@ def main() -> None:
             logger.info("Saved versioned metrics | path=%s bytes=%s", versioned_metrics_file, versioned_metrics_file.stat().st_size)
 
         with log_step(logger, "write_predictions"):
-            prediction_rows = prediction_df[prediction_df["TARGET_MONTH"].isna()].copy()
+            prediction_rows = prediction_df[prediction_df["SOURCE_MONTH_PERIOD"].notna()].copy() if "SOURCE_MONTH_PERIOD" in prediction_df.columns else prediction_df.copy()
             logger.info("Prediction rows needing future target | rows=%s", len(prediction_rows))
             if not prediction_rows.empty:
                 X_pred = build_feature_matrix(prediction_rows).reindex(columns=X_train.columns, fill_value=0)

@@ -81,7 +81,7 @@ def _default_cases_file(prediction_month: str) -> Path:
 
 
 def _load_prediction_rows(prediction_file: Path) -> pd.DataFrame:
-    predictions = pd.read_csv(prediction_file).copy()
+    predictions = pd.read_csv(prediction_file, dtype=str).copy()
     required = {"Loan_number", "SOURCE_MONTH_USED", "MONTH", "EMI_DATE", "SOURCE_RISK", "SOURCE_VERTICAL"}
     missing = required.difference(predictions.columns)
     if missing:

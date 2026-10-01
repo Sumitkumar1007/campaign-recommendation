@@ -175,7 +175,7 @@ def _normalize_text(series: pd.Series, default: str = "UNKNOWN") -> pd.Series:
 
 
 def load_base_population(base_population_file: Path, source_month_label: str) -> pd.DataFrame:
-    base = pd.read_csv(base_population_file).copy()
+    base = pd.read_csv(base_population_file, dtype=str).copy()
     required = {"apac_card_number", "risk", "vertical", "collectable_amount", "emi_date"}
     missing = required.difference(base.columns)
     if missing:
@@ -206,8 +206,7 @@ def build_prediction_population(
     base_population[key_column] = base_population[key_column].astype(str).str.strip()
     dataset = dataset.copy()
     dataset[key_column] = dataset[key_column].astype(str).str.strip()
-    feature_rows = dataset[dataset["TARGET_MONTH"].isna()].copy()
-    feature_rows = feature_rows[feature_rows["SOURCE_MONTH_PERIOD"].notna()].copy()
+    feature_rows = dataset[dataset["SOURCE_MONTH_PERIOD"].notna()].copy()
     feature_rows = feature_rows[feature_rows["SOURCE_MONTH_PERIOD"] <= source_month_period].copy()
     feature_rows = (
         feature_rows.sort_values([key_column, "SOURCE_MONTH_PERIOD"])
@@ -608,6 +607,7 @@ def main() -> None:
                     row_limit=args.model_input_audit_row_limit,
                     logger=logger,
                 )
+                prediction_output["IS_NEW_CUSTOMER"] = "False"
                 prediction_outputs.append(prediction_output)
 
         if not blank_rows.empty:
@@ -633,6 +633,7 @@ def main() -> None:
                 )
                 for row_idx in range(len(blank_output))
             ]
+            blank_output["IS_NEW_CUSTOMER"] = "True"
             prediction_outputs.append(blank_output)
 
         if prediction_outputs:
@@ -648,24 +649,36 @@ def main() -> None:
                     "MONTH",
                     *SCHEDULE_DAY_COLUMNS,
                     "PREDICTION_REASON",
+                    "IS_NEW_CUSTOMER",
                 ]
             )
 
-        with log_step(logger, "write_predictions", prediction_file=prediction_file):
+        if "IS_NEW_CUSTOMER" not in prediction_output.columns:
+            prediction_output["IS_NEW_CUSTOMER"] = "False"
+        else:
+            prediction_output["IS_NEW_CUSTOMER"] = prediction_output["IS_NEW_CUSTOMER"].fillna("False")
+
+        with log_step(logger, "write_raw_predictions", prediction_file=prediction_file):
             prediction_output["D"] = "-"
-            prediction_output = apply_predue_risk_rules(prediction_output)
-            prediction_output = prediction_output[
-                [
-                    "SOURCE_RISK",
-                    "SOURCE_VERTICAL",
-                    "EMI_DATE",
-                    "Loan_number",
-                    "SOURCE_MONTH_USED",
-                    "MONTH",
-                    *SCHEDULE_DAY_COLUMNS,
-                    "PREDICTION_REASON",
-                ]
+            output_cols = [
+                "SOURCE_RISK",
+                "SOURCE_VERTICAL",
+                "EMI_DATE",
+                "Loan_number",
+                "SOURCE_MONTH_USED",
+                "MONTH",
+                *SCHEDULE_DAY_COLUMNS,
+                "PREDICTION_REASON",
+                "IS_NEW_CUSTOMER",
             ]
+            raw_prediction_file = prediction_file.parent / f"{prediction_file.stem}_raw.csv"
+            raw_output = prediction_output.reindex(columns=output_cols).fillna("-")
+            raw_output.to_csv(raw_prediction_file, index=False)
+            logger.info("Saved raw predictions CSV | file=%s rows=%s", raw_prediction_file, len(raw_output))
+
+        with log_step(logger, "write_predictions", prediction_file=prediction_file):
+            prediction_output = apply_predue_risk_rules(prediction_output)
+            prediction_output = prediction_output.reindex(columns=output_cols).fillna("-")
             prediction_output.to_csv(prediction_file, index=False)
             logger.info("Saved predictions | rows=%s bytes=%s", len(prediction_output), prediction_file.stat().st_size)
             try:

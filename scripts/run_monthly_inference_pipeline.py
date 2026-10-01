@@ -44,6 +44,7 @@ from project_paths import (
     LOG_DIR,
     METRICS_DIR,
     MODEL_DIR,
+    PAYMENT_DATA_DIR,
     PREDICTIONS_DIR,
     SCHEDULE_DATA_DIR,
     SCRIPTS_DIR,
@@ -458,11 +459,16 @@ def _count_daywise_labels(df: pd.DataFrame, day_columns: list[str]) -> dict[str,
 
 
 def _count_blank_predictions(df: pd.DataFrame, day_columns: list[str]) -> dict[str, object]:
-    normalized = df[day_columns].fillna("-").astype(str).apply(lambda col: col.str.strip())
+    present_columns = [day for day in day_columns if day in df.columns]
+    if not present_columns:
+        return {
+            "blank_counts_by_day": {},
+            "all_blank_rows": 0,
+        }
+    normalized = df[present_columns].fillna("-").astype(str).apply(lambda col: col.str.strip())
     blank_counts = {
         day: int((normalized[day] == "-").sum())
-        for day in day_columns
-        if day in normalized.columns
+        for day in present_columns
     }
     all_blank_rows = int(normalized.apply(lambda row: all(value == "-" for value in row), axis=1).sum())
     return {
@@ -479,6 +485,7 @@ def build_prediction_summary(
     model_name: str,
     campaign_df: pd.DataFrame,
     mapping_df: pd.DataFrame,
+    schedule_file: Path | None = None,
 ) -> dict[str, object]:
     predictions = pd.read_csv(prediction_file)
     predictions = predictions[predictions["MONTH"] == prediction_month_label].copy()
@@ -517,6 +524,32 @@ def build_prediction_summary(
 
     blank_prediction_counts = _count_blank_predictions(predictions, day_columns)
 
+    new_customer_counts = {}
+    if "IS_NEW_CUSTOMER" in predictions.columns:
+        is_new_series = predictions["IS_NEW_CUSTOMER"].astype(str).str.upper().str.strip()
+        new_customer_counts = {
+            "new_customers": int((is_new_series == "TRUE").sum()),
+            "existing_customers": int((is_new_series == "FALSE").sum()),
+            "total_customers": int(len(predictions)),
+        }
+
+    fallback_strategy = {}
+    target_schedule = schedule_file if schedule_file and schedule_file.exists() else (
+        SCHEDULE_DATA_DIR / "strategy_schedule_dataset_train.csv"
+        if (SCHEDULE_DATA_DIR / "strategy_schedule_dataset_train.csv").exists()
+        else SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv"
+    )
+    if target_schedule and target_schedule.exists():
+        try:
+            from identify_new_customer_fallbacks import build_average_strategy_by_risk
+            fallback_by_risk = build_average_strategy_by_risk(target_schedule)
+            for risk_code, strat_map in fallback_by_risk.items():
+                fallback_strategy[f"{risk_code}_strategy"] = strat_map
+                fallback_strategy[f"{risk_code.capitalize()}_strategy"] = strat_map
+                fallback_strategy[risk_code] = strat_map
+        except Exception:
+            pass
+
     return {
         "source_month": source_month_label,
         "prediction_month": prediction_month_label,
@@ -529,6 +562,8 @@ def build_prediction_summary(
         "predicted_label_counts": _count_top_labels(predictions, day_columns),
         "predicted_label_counts_by_day": _count_daywise_labels(predictions, day_columns),
         "blank_prediction_counts": blank_prediction_counts,
+        "new_customer_counts": new_customer_counts,
+        "fallback_strategy": fallback_strategy,
         "campaign_mode_counts": campaign_mode_counts,
         "campaign_vendor_counts": campaign_vendor_counts,
         "campaign_vertical_counts": campaign_vertical_counts,
@@ -791,15 +826,18 @@ def store_prediction_snapshots(
     source_risk_col = "SOURCE_RISK" if "SOURCE_RISK" in df.columns else "RISK"
     rows = []
     for _, row in df.iterrows():
-        payload = {
-            day: row[day]
-            for day in ALL_CAMPAIGN_DAYS
-            if day in row.index
-        }
+        payload = {}
+        for day in ALL_CAMPAIGN_DAYS:
+            if day in row.index:
+                val = row[day]
+                if pd.isna(val) or val is None or str(val).strip().lower() in ("nan", "none", "<na>", "null", ""):
+                    payload[day] = "-"
+                else:
+                    payload[day] = str(val).strip()
         reason_payload = None
         if "PREDICTION_REASON" in row.index and not pd.isna(row["PREDICTION_REASON"]):
             raw_reason = str(row["PREDICTION_REASON"]).strip()
-            if raw_reason:
+            if raw_reason and raw_reason.lower() not in ("nan", "none", "<na>", "null"):
                 try:
                     reason_payload = json.loads(raw_reason)
                 except json.JSONDecodeError:
@@ -901,42 +939,58 @@ def _template_name(*, due_type: str, mode: str, language: str) -> str:
     return f"{due_type}_AIML_{NAME_CHANNEL_BY_MODE[mode]}_{language}"
 
 
-def fetch_digital_rules_lookup(conn, schema: str) -> dict[tuple[str, str, str], str]:
+def fetch_digital_rules_lookup(conn, schema: str, logger: logging.Logger | None = None) -> dict[tuple[str, str, str], str]:
     """
     Fetches digital_rules table from Postgres and builds lookup map:
     (digital_rule_id_str, mode_upper, language_upper) -> iteration (template_name)
     """
+    log = logger or logging.getLogger("monthly_inference_pipeline")
     lookup: dict[tuple[str, str, str], str] = {}
     if not conn:
         return lookup
-    try:
-        query = sql.SQL(
-            """
-            SELECT id, mode, language, iteration
-            FROM {table_ref}
-            WHERE iteration IS NOT NULL AND iteration <> ''
-            """
-        ).format(table_ref=qualified_identifier(schema, "digital_rules"))
-        with conn.cursor() as cur:
-            cur.execute(query)
-            for rule_id, mode, language, iteration in cur.fetchall():
-                if rule_id is not None and mode and language and iteration:
-                    rule_id_str = str(rule_id).strip()
-                    mode_u = str(mode).strip().upper()
-                    lang_u = str(language).strip().upper()
-                    iter_val = str(iteration).strip()
-                    lookup[(rule_id_str, mode_u, lang_u)] = iter_val
-                    lookup.setdefault((rule_id_str, mode_u, ""), iter_val)
-    except Exception as e:
-        logger.warning("Could not pre-fetch digital_rules lookup table: %s", e)
+
+    # Try mode_ column first (as in Postgres schema), fallback to mode if missing
+    columns_to_try = ["mode_", "mode"]
+    rows = None
+    table_ref = qualified_identifier(schema, "digital_rules")
+
+    for col in columns_to_try:
+        try:
+            query = sql.SQL(
+                """
+                SELECT id, {mode_col} AS mode, language, iteration
+                FROM {table_ref}
+                WHERE iteration IS NOT NULL AND iteration <> ''
+                """
+            ).format(mode_col=sql.Identifier(col), table_ref=table_ref)
+            with conn.cursor() as cur:
+                cur.execute(query)
+                rows = cur.fetchall()
+                break
+        except Exception:
+            continue
+
+    if rows is not None:
+        for rule_id, mode, language, iteration in rows:
+            if rule_id is not None and mode and language and iteration:
+                rule_id_str = str(rule_id).strip()
+                mode_u = str(mode).strip().upper()
+                lang_u = str(language).strip().upper()
+                iter_val = str(iteration).strip()
+                lookup[(rule_id_str, mode_u, lang_u)] = iter_val
+                lookup.setdefault((rule_id_str, mode_u, ""), iter_val)
+    else:
+        log.warning("Could not pre-fetch digital_rules lookup table from schema=%s", schema)
+
     return lookup
 
 
-def build_latest_digital_rule_map(history_files: list[Path]) -> dict[tuple[str, str, str], str]:
+def build_latest_digital_rule_map(history_files: list[Path], logger: logging.Logger | None = None) -> dict[tuple[str, str, str], str]:
     """
     Reads historical communication CSVs and maps:
     (apac_card_number, mode_upper, language_upper) -> latest digital_rule_id (str)
     """
+    log = logger or logging.getLogger("monthly_inference_pipeline")
     latest_map: dict[tuple[str, str, str], str] = {}
     for csv_file in history_files:
         if not csv_file or not Path(csv_file).exists():
@@ -970,7 +1024,7 @@ def build_latest_digital_rule_map(history_files: list[Path]) -> dict[tuple[str, 
                     latest_map[(apac, mode, lang)] = rule_id
                     latest_map[(apac, mode, "")] = rule_id
         except Exception as e:
-            logger.warning("Error loading digital_rule_id from %s: %s", csv_file, e)
+            log.warning("Error loading digital_rule_id from %s: %s", csv_file, e)
     return latest_map
 
 
@@ -1381,7 +1435,7 @@ def _resolve_row_emi_cycle(row: pd.Series, default_cycles: list[int]) -> int:
 
 
 def _load_prediction_context_lookup(prediction_file: Path, prediction_month_label: str) -> dict[str, dict[str, object]]:
-    df = pd.read_csv(prediction_file)
+    df = pd.read_csv(prediction_file, dtype=str).fillna("")
     df = df[df["MONTH"] == prediction_month_label].copy()
     lookup: dict[str, dict[str, object]] = {}
     for _, row in df.iterrows():
@@ -1520,7 +1574,7 @@ def _build_campaign_assignment_groups(
     digital_rule_id_map: dict[tuple[str, str, str], str] | None = None,
     digital_rules_lookup: dict[tuple[str, str, str], str] | None = None,
 ) -> pd.DataFrame:
-    df = pd.read_csv(prediction_file)
+    df = pd.read_csv(prediction_file, dtype=str).fillna("")
     df = df[df["MONTH"] == prediction_month_label].copy()
     rows: list[dict] = []
 
@@ -2276,9 +2330,42 @@ def compute_model_drift_metrics(
     if "MONTH" in train_df.columns:
         train_df["SOURCE_MONTH"] = train_df["MONTH"]
         
-    # Filter it to only include the months the model actually trained on
+    def _norm_m(val: Any) -> str:
+        if not val or pd.isna(val):
+            return ""
+        val_str = str(val).strip().upper()
+        try:
+            return pd.Period(pd.to_datetime(val_str), freq="M").strftime("%Y-%m")
+        except Exception:
+            return val_str
+
     if baseline_source_months and "SOURCE_MONTH" in train_df.columns:
-        train_df = train_df[train_df["SOURCE_MONTH"].astype(str).isin(baseline_source_months)]
+        # Check if baseline_source_months contains string tokens from random split (e.g. ALL_MONTHS_RANDOM_SAMPLED_70%)
+        is_string_token_split = any("ALL_MONTHS" in str(m).upper() for m in baseline_source_months)
+        if is_string_token_split:
+            valid_months = train_df["SOURCE_MONTH"].dropna().unique()
+            if len(valid_months) > 0:
+                def _sort_key(m: Any) -> float:
+                    try:
+                        return pd.to_datetime(str(m)).timestamp()
+                    except Exception:
+                        return 0.0
+                latest_month = sorted(valid_months, key=_sort_key)[-1]
+                train_df = train_df[train_df["SOURCE_MONTH"] == latest_month]
+                logger.info("Random split detected. Filtering drift baseline to the most recent month (%s) to prevent historical lag dilution.", latest_month)
+            else:
+                logger.info("Random split detected in baseline metadata (%s). Using full training dataset for drift baseline.", baseline_source_months)
+        else:
+            norm_baseline = {_norm_m(m) for m in baseline_source_months if m}
+            filtered_train_df = train_df[train_df["SOURCE_MONTH"].apply(_norm_m).isin(norm_baseline)]
+            if not filtered_train_df.empty:
+                train_df = filtered_train_df
+            else:
+                logger.warning(
+                    "Drift baseline month filtering yielded 0 rows (baseline_source_months=%s). "
+                    "Falling back to full training feature dataset.",
+                    baseline_source_months,
+                )
         
     # Cap it at 10,000 rows just like the original training script did to keep drift math fast
     if len(train_df) > 10000:
@@ -2824,15 +2911,32 @@ def main() -> None:
         #         *[str(path) for path in history_files],
         #         logger=logger,
         #     )
+        consolidated_report = PAYMENT_DATA_DIR / "consolidated_payment_report.csv"
+        existing_payment_files = sorted(PAYMENT_DATA_DIR.glob("payment_data_*.csv"))
+        with log_step(logger, "generate_consolidated_payment_report"):
+            run_python_script(
+                "generate_consolidated_payment_report.py",
+                "--communication-files",
+                *[str(path) for path in history_files],
+                "--payment-files",
+                *[str(path) for path in existing_payment_files],
+                "--output-file",
+                str(consolidated_report),
+                logger=logger,
+            )
+            logger.info("Generated consolidated payment report for inference | output_file=%s exists=%s", consolidated_report, consolidated_report.exists())
+
         with log_step(logger, "prepare_inference_features"):
             run_python_script(
                 "generate_strategy_dataset.py",
                 "--output-file",
-                str(TRAINING_DATA_DIR / "strategy_training_dataset_inference.csv"),  # <-- CHANGED
+                str(TRAINING_DATA_DIR / "strategy_training_dataset_inference.csv"),
                 "--month-source",
                 args.feature_month_source,
                 "--input-files",
                 *[str(path) for path in history_files],
+                "--payment-files",
+                str(consolidated_report),
                 logger=logger,
             )
         # with log_step(logger, "build_schedule_dataset"):
@@ -2866,9 +2970,11 @@ def main() -> None:
             run_python_script(
                 "build_monthly_feature_dataset.py",
                 "--input-file",
-                str(TRAINING_DATA_DIR / "strategy_training_dataset_inference.csv"),  # <-- CHANGED
+                str(TRAINING_DATA_DIR / "strategy_training_dataset_inference.csv"),
                 "--output-file",
-                str(FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv"),   # <-- CHANGED
+                str(FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv"),
+                "--payment-files",
+                str(PAYMENT_DATA_DIR / "consolidated_payment_report.csv"),
                 logger=logger,
             )
 
@@ -3075,8 +3181,8 @@ def main() -> None:
                         prediction_month_label,
                         args.model,
                     )
-                    digital_rules_lookup = fetch_digital_rules_lookup(conn, schema=args.source_schema or args.target_schema)
-                    digital_rule_id_map = build_latest_digital_rule_map(history_files)
+                    digital_rules_lookup = fetch_digital_rules_lookup(conn, schema=args.source_schema or args.target_schema, logger=logger)
+                    digital_rule_id_map = build_latest_digital_rule_map(history_files, logger=logger)
                     campaign_df, mapping_df = _prepare_campaign_outputs(
                         prediction_file,
                         source_month_label=source_month_label,
@@ -3133,6 +3239,7 @@ def main() -> None:
             model_name=args.model,
             campaign_df=campaign_df,
             mapping_df=mapping_df,
+            schedule_file=fallback_schedule_file,
         )
         if drift_report is not None:
             # --- CHANGED: Save the full drift report including feature_metrics ---

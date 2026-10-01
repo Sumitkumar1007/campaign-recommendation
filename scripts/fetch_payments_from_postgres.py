@@ -48,11 +48,11 @@ def build_query(schema: str, table: str) -> sql.Composed:
             OR payment_datetime::text LIKE %(alt_month_prefix2)s
             OR (
                 CASE 
-                    WHEN payment_datetime::text ~ '^[0-9]{4}-[0-9]{2}' THEN payment_datetime::timestamp
+                    WHEN payment_datetime::text ~ '^[0-9]{{4}}-[0-9]{{2}}' THEN payment_datetime::timestamp
                     ELSE NULL 
                 END >= %(month_start)s 
                 AND CASE 
-                    WHEN payment_datetime::text ~ '^[0-9]{4}-[0-9]{2}' THEN payment_datetime::timestamp
+                    WHEN payment_datetime::text ~ '^[0-9]{{4}}-[0-9]{{2}}' THEN payment_datetime::timestamp
                     ELSE NULL 
                 END < %(next_month_start)s
             )
@@ -60,7 +60,6 @@ def build_query(schema: str, table: str) -> sql.Composed:
         AND apac_card_number IS NOT NULL
         """
     ).format(table_ref=table_ref)
-
 
 def main() -> None:
     output_file: Path | None = None
@@ -103,22 +102,26 @@ def main() -> None:
             password=args.password,
         )
         query = build_query(args.schema, args.table)
+        params = {
+            "month_start": month_start,
+            "next_month_start": next_month_start,
+            "month_prefix": month_prefix,
+            "alt_month_prefix1": alt_month_prefix1,
+            "alt_month_prefix2": alt_month_prefix2,
+        }
         with connect_db(config) as conn:
-            cursor = conn.execute(
-                query,
-                {
-                    "month_start": month_start,
-                    "next_month_start": next_month_start,
-                    "month_prefix": month_prefix,
-                    "alt_month_prefix1": alt_month_prefix1,
-                    "alt_month_prefix2": alt_month_prefix2,
-                },
-            )
+            # query_rendered = query.as_string(conn) if hasattr(query, "as_string") else str(query)
+            # print(f"[FETCH PAYMENTS] Target Table: {args.schema}.{args.table}")
+            # print(f"[FETCH PAYMENTS] Executing SQL Query:\n{query_rendered}")
+            # print(f"[FETCH PAYMENTS] Query Parameters: {params}")
+            cursor = conn.execute(query, params)
             rows = cursor.fetchall()
             columns = [column.name for column in cursor.description]
         df = pd.DataFrame(rows, columns=columns)
     except Exception as e:
-        print(f"Warning: fetch_payments_from_postgres encountered an issue ({e}). Creating empty output file.")
+        import traceback
+        print(f"Error in fetch_payments_from_postgres | schema={schema_str} table={table_str} source_month={source_month_str}: {e}")
+        traceback.print_exc()
         df = pd.DataFrame(columns=["apac_card_number", "amount", "payment_datetime", "reference_number"])
 
     if output_file is None:

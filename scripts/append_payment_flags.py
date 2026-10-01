@@ -44,11 +44,23 @@ def month_label_from_payment_file(path: Path) -> str | None:
 
 def load_paid_keys(
     payment_files: list[Path],
-) -> tuple[set[tuple[str, str]], set[str], set[str], set[tuple[str, str]]]:
+) -> tuple[
+    set[tuple[str, str]],
+    set[str],
+    set[str],
+    set[tuple[str, str]],
+    dict[tuple[str, str], int],
+    dict[tuple[str, str], int],
+    dict[tuple[str, str], int],
+]:
     paid: set[tuple[str, str]] = set()
     fetched_months: set[str] = set()
     link_ref_numbers: set[str] = set()
     external_payment_dates: set[tuple[str, str]] = set()
+    link_pay_counts: dict[tuple[str, str], int] = {}
+    ext_pay_counts: dict[tuple[str, str], int] = {}
+    tot_pay_counts: dict[tuple[str, str], int] = {}
+
     for payment_file in payment_files:
         if not payment_file.exists():
             continue
@@ -63,30 +75,58 @@ def load_paid_keys(
             usecols.append("payment_datetime")
         if "reference_number" in header:
             usecols.append("reference_number")
+        if "month" in header:
+            usecols.append("month")
+        if "payment_flag" in header:
+            usecols.append("payment_flag")
 
         for chunk in pd.read_csv(payment_file, usecols=usecols, dtype=str, chunksize=200_000):
             apacs = normalize_apac(chunk["apac_card_number"])
+            m_col = chunk["month"].fillna("").astype(str).str.upper().str.strip() if "month" in chunk.columns else pd.Series("", index=chunk.index)
+            dt_months = pd.Series("", index=chunk.index)
             if "payment_datetime" in chunk.columns:
                 parsed_dates = pd.to_datetime(chunk["payment_datetime"], errors="coerce")
-                parsed_months = parsed_dates.dt.strftime("%b-%Y").str.upper()
-                months = parsed_months.fillna(month_label if month_label else "")
+                dt_months = parsed_dates.dt.strftime("%b-%Y").str.upper().fillna("")
                 date_strs = parsed_dates.dt.strftime("%Y-%m-%d")
             else:
-                months = pd.Series(month_label, index=chunk.index)
                 date_strs = pd.Series(None, index=chunk.index)
 
+            months = m_col.replace({"": None}).fillna(dt_months.replace({"": None})).fillna(month_label if month_label else "")
             ref_nums = chunk["reference_number"].fillna("").astype(str).str.strip() if "reference_number" in chunk.columns else pd.Series("", index=chunk.index)
+            flags = chunk["payment_flag"].fillna("").astype(str).str.upper().str.strip() if "payment_flag" in chunk.columns else pd.Series("", index=chunk.index)
 
-            for apac, month, date_str, ref_num in zip(apacs, months, date_strs, ref_nums, strict=False):
-                if apac and pd.notna(month):
-                    normalized_month = str(month).upper().strip()
-                    paid.add((apac, normalized_month))
-                    fetched_months.add(normalized_month)
-                if ref_num:
-                    link_ref_numbers.add(ref_num)
+            for apac, month, date_str, ref_num, flag in zip(apacs, months, date_strs, ref_nums, flags, strict=False):
+                if not apac or not month or month == "UNKNOWN":
+                    continue
+                normalized_month = str(month).upper().strip()
+                key = (apac, normalized_month)
+
+                if flag == "NO_COMMUNICATION_PAYMENT":
+                    continue
+
+                paid.add(key)
+                fetched_months.add(normalized_month)
+                tot_pay_counts[key] = tot_pay_counts.get(key, 0) + 1
+
+                if flag == "LINK_PAYMENT":
+                    if ref_num:
+                        link_ref_numbers.add(ref_num)
+                    link_pay_counts[key] = link_pay_counts.get(key, 0) + 1
+                elif flag == "EXTERNAL_PAYMENT":
+                    ext_pay_counts[key] = ext_pay_counts.get(key, 0) + 1
+                    if date_str and pd.notna(date_str):
+                        external_payment_dates.add((apac, str(date_str)))
+                else:
+                    if ref_num:
+                        link_ref_numbers.add(ref_num)
+                        link_pay_counts[key] = link_pay_counts.get(key, 0) + 1
+                    else:
+                        ext_pay_counts[key] = ext_pay_counts.get(key, 0) + 1
+
                 if apac and date_str and pd.notna(date_str):
                     external_payment_dates.add((apac, str(date_str)))
-    return paid, fetched_months, link_ref_numbers, external_payment_dates
+
+    return paid, fetched_months, link_ref_numbers, external_payment_dates, link_pay_counts, ext_pay_counts, tot_pay_counts
 
 
 def append_payment_flags(feature_file: Path, payment_files: list[Path], output_file: Path) -> pd.DataFrame:
@@ -97,7 +137,7 @@ def append_payment_flags(feature_file: Path, payment_files: list[Path], output_f
     if "MONTH" not in features.columns:
         raise ValueError("Feature file must contain MONTH.")
 
-    paid_keys, fetched_months, _, _ = load_paid_keys(payment_files)
+    paid_keys, fetched_months, _, _, _, _, _ = load_paid_keys(payment_files)
     features = features.drop(columns=FLAG_COLUMNS, errors="ignore")
     keys = list(zip(normalize_apac(features[key_column]), features["MONTH"].fillna("").astype(str).str.upper().str.strip(), strict=False))
     features["paid_flag"] = [1 if key in paid_keys else 0 for key in keys]

@@ -22,7 +22,28 @@ def strategy_use_party_id() -> bool:
 
 
 def normalize_identifier(series: pd.Series, *, default: str = "") -> pd.Series:
-    return series.fillna(default).astype(str).str.strip().replace({"": default})
+    if pd.api.types.is_float_dtype(series):
+        series = series.apply(
+            lambda x: f"{int(x)}" if pd.notna(x) and float(x).is_integer() else (f"{x:.0f}" if pd.notna(x) else "")
+        )
+    raw = series.fillna(default).astype(str).str.strip()
+
+    def clean_val(val: str) -> str:
+        if not val or val == default or val.lower() in ("nan", "none", "<na>", "null"):
+            return default
+        try:
+            if "." in val or "e" in val.lower():
+                num = float(val)
+                if num.is_integer():
+                    return str(int(num))
+        except (ValueError, OverflowError):
+            pass
+        if val.endswith(".0"):
+            val = val[:-2]
+        return val
+
+    clean = raw.apply(clean_val)
+    return clean.replace({"": default, "nan": default, "NaN": default, "None": default})
 
 
 def annotate_entity_key(

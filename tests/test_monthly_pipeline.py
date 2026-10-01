@@ -1564,3 +1564,171 @@ def test_link_and_external_payment_multipliers():
     assert ext_score == 1.0 * 2.5   # Base 1.0 * 2.5 external multiplier
 
 
+def test_normalize_identifier_and_payment_counts():
+    import pandas as pd
+    from scripts.entity_keys import normalize_identifier
+    from scripts.generate_strategy_dataset import process_chunk
+
+    # Test float and scientific notation normalization
+    s = pd.Series([12345678.0, "98765432.0", "1.23456e+07", "APAC-999", None, "nan"])
+    clean_s = normalize_identifier(s)
+    assert clean_s.tolist() == ["12345678", "98765432", "12345600", "APAC-999", "", ""]
+
+    # Test payment counts when account has 10 communications but 6 actual payments
+    rows = []
+    for _ in range(10):
+        rows.append({
+            "apac_card_number": "12345678.0",
+            "communication_type": "SMS",
+            "comm_status": "DELIVERED",
+            "verbiage_language": "ENGLISH",
+            "risk": "LOW",
+            "vertical": "LAP",
+            "emi_date": "2026-06-10",
+            "created_date": "2026-06-05 11:00:00",
+            "date": "2026-06-05",
+            "payment_unique_id": "",
+        })
+    df_comm = pd.DataFrame(rows)
+
+    ext_pay_counts = {("12345678", "JUN-2026"): 6}
+    paid_keys = {("12345678", "JUN-2026")}
+
+    feat, _, _ = process_chunk(
+        df_comm,
+        weighting_enabled=True,
+        paid_keys=paid_keys,
+        ext_pay_counts=ext_pay_counts,
+    )
+
+    ext_count_feat = feat.loc[feat["feature"] == "EXT_PAYMENT_COUNT", "count"].values[0]
+    assert ext_count_feat == 6
+
+
+def test_drift_calculation_with_random_split_token():
+    from scripts.drift_utils import compute_drift_report
+
+    baseline_df = pd.DataFrame({
+        "SMS_TOTAL_INTENSITY": [1, 2, 3, 4, 5],
+        "WH_TOTAL_INTENSITY": [0, 1, 0, 1, 0],
+    })
+    inference_df = pd.DataFrame({
+        "SMS_TOTAL_INTENSITY": [1, 2, 2, 3, 4],
+        "WH_TOTAL_INTENSITY": [0, 0, 0, 1, 0],
+    })
+
+    report = compute_drift_report(
+        baseline_df=baseline_df,
+        inference_df=inference_df,
+    )
+
+    assert "drift_percentage" in report
+    assert "overall_psi" in report
+    assert "status" in report
+    assert report["baseline_rows"] == 5
+    assert report["inference_rows"] == 5
+
+
+def test_new_customer_fallback_and_summary_json(tmp_path: Path) -> None:
+    from identify_new_customer_fallbacks import apply_fallbacks_to_prediction_file, build_average_strategy_by_risk
+    from run_monthly_inference_pipeline import build_prediction_summary
+
+    schedule_csv = tmp_path / "schedule.csv"
+    schedule_df = pd.DataFrame({
+        "RISK": ["LOW", "LOW", "MEDIUM", "HIGH"],
+        "D-5": ["SMS-10-ENGLISH", "SMS-10-ENGLISH", "WH-12-ENGLISH", "VOICE-10-ENGLISH"],
+        "D-4": ["SMS-10-ENGLISH", "SMS-10-ENGLISH", "WH-12-ENGLISH", "VOICE-10-ENGLISH"],
+        "D-3": ["-", "-", "-", "-"],
+        "D-2": ["-", "-", "-", "-"],
+        "D-1": ["-", "-", "-", "-"],
+        "D": ["-", "-", "-", "-"],
+        "D+1": ["-", "-", "-", "-"],
+        "D+2": ["-", "-", "-", "-"],
+        "D+3": ["-", "-", "-", "-"],
+        "D+4": ["-", "-", "-", "-"],
+        "D+5": ["-", "-", "-", "-"],
+    })
+    schedule_df.to_csv(schedule_csv, index=False)
+
+    fallback_by_risk = build_average_strategy_by_risk(schedule_csv)
+    assert "LOW" in fallback_by_risk
+    assert fallback_by_risk["LOW"]["D-5"] == "SMS-10-ENGLISH"
+
+    pred_csv = tmp_path / "predictions.csv"
+    pred_df = pd.DataFrame({
+        "SOURCE_RISK": ["LOW", "MEDIUM"],
+        "SOURCE_VERTICAL": ["LAP", "LAP"],
+        "EMI_DATE": ["2026-05-10", "2026-05-10"],
+        "Loan_number": ["ACC001", "ACC002"],
+        "SOURCE_MONTH_USED": ["APR-2026", "APR-2026"],
+        "MONTH": ["MAY-2026", "MAY-2026"],
+        "D-5": ["-", "-"],
+        "D-4": ["-", "-"],
+        "D-3": ["-", "-"],
+        "D-2": ["-", "-"],
+        "D-1": ["-", "-"],
+        "D": ["-", "-"],
+        "D+1": ["-", "-"],
+        "D+2": ["-", "-"],
+        "D+3": ["-", "-"],
+        "D+4": ["-", "-"],
+        "D+5": ["-", "-"],
+        "PREDICTION_REASON": ["", ""],
+        "IS_NEW_CUSTOMER": ["False", "False"],
+    })
+    pred_df.to_csv(pred_csv, index=False)
+
+    fallback_rows = pd.DataFrame([
+        {
+            "apacCardNumber": "ACC001",
+            "originalRisk": "LOW",
+            "fallbackRiskUsed": "LOW",
+            "vertical": "LAP",
+            "day": "D-5",
+            "recommendedStrategy": "SMS-10-ENGLISH",
+            "isActionable": "true",
+            "reason": "Cold-start fallback used for new customer",
+        },
+        {
+            "apacCardNumber": "ACC001",
+            "originalRisk": "LOW",
+            "fallbackRiskUsed": "LOW",
+            "vertical": "LAP",
+            "day": "D-4",
+            "recommendedStrategy": "SMS-10-ENGLISH",
+            "isActionable": "true",
+            "reason": "Cold-start fallback used for new customer",
+        },
+    ])
+
+    updated_count = apply_fallbacks_to_prediction_file(pred_csv, fallback_rows)
+    assert updated_count > 0
+
+    updated_pred = pd.read_csv(pred_csv, dtype=str)
+    assert "IS_NEW_CUSTOMER" in updated_pred.columns
+    row0 = updated_pred[updated_pred["Loan_number"] == "ACC001"].iloc[0]
+    row1 = updated_pred[updated_pred["Loan_number"] == "ACC002"].iloc[0]
+    assert row0["IS_NEW_CUSTOMER"] == "True"
+    assert row0["D-5"] == "SMS-10-ENGLISH"
+    assert row1["IS_NEW_CUSTOMER"] == "False"
+
+    summary = build_prediction_summary(
+        prediction_file=pred_csv,
+        source_month_label="APR-2026",
+        prediction_month_label="MAY-2026",
+        model_name="catboost_3m",
+        campaign_df=pd.DataFrame(),
+        mapping_df=pd.DataFrame(),
+        schedule_file=schedule_csv,
+    )
+
+    assert "new_customer_counts" in summary
+    assert summary["new_customer_counts"]["new_customers"] == 1
+    assert summary["new_customer_counts"]["existing_customers"] == 1
+    assert "fallback_strategy" in summary
+    assert "LOW_strategy" in summary["fallback_strategy"]
+    assert summary["fallback_strategy"]["LOW_strategy"]["D-5"] == "SMS-10-ENGLISH"
+
+
+
+

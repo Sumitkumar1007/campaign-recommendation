@@ -84,13 +84,15 @@ def test_upload_with_retry_succeeds_after_transient_failure(tmp_path, monkeypatc
         private_key_path=None,
         private_key_passphrase=None,
         remote_path='/remote/drop',
+        remote_dataset_path='/remote/drop',
+        remote_scheduler_path='/remote/drop',
         retries=3,
         retry_delay_seconds=0.0,
         timeout_seconds=10,
         fail_on_error=True,
     )
 
-    uploaded, remote_path, error = erw.upload_with_retry(local_file, config)
+    uploaded, remote_path, error = erw.upload_with_retry(local_file, config, remote_dir=config.remote_path)
 
     assert uploaded is True
     assert remote_path == '/remote/drop/sample.xlsx'

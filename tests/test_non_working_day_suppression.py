@@ -84,8 +84,8 @@ def test_suppress_non_working_days_in_dataframe():
     )
 
     assert updated_df.iloc[0]["D-1"] == "SMS-11AM-ENGLISH"  # Friday preserved
-    assert updated_df.iloc[0]["D+1"] == "-"                # Sunday suppressed
-    assert updated_df.iloc[0]["D+7"] == "-"                # 2nd Saturday suppressed
+    assert updated_df.iloc[0]["D+1"] == "Sunday"            # Sunday suppressed with reason
+    assert updated_df.iloc[0]["D+7"] == "2nd Saturday"       # 2nd Saturday suppressed with reason
     assert updated_df.iloc[0]["D+14"] == "SMS-9AM-ENGLISH" # 3rd Saturday preserved
 
     assert stats["sunday_suppressions"] == 1
@@ -112,5 +112,5 @@ def test_suppress_all_saturdays_mode():
     )
 
     assert updated_df.iloc[0]["D-1"] == "SMS-11AM-ENGLISH"
-    assert updated_df.iloc[0]["D+14"] == "-"  # 3rd Saturday suppressed in all_saturdays mode
+    assert updated_df.iloc[0]["D+14"] == "Saturday"  # 3rd Saturday suppressed in all_saturdays mode
     assert stats["saturday_suppressions"] == 1

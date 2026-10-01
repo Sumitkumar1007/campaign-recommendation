@@ -169,7 +169,16 @@ def apply_fallbacks_to_prediction_file(prediction_file: Path, fallback_rows: pd.
         for row in fallback_rows.itertuples(index=False)
     }
 
+    if "IS_NEW_CUSTOMER" not in predictions.columns:
+        predictions["IS_NEW_CUSTOMER"] = "False"
+
     updated = 0
+    existing_loans = set(predictions["Loan_number"].astype(str).str.strip())
+    vertical_map: dict[str, str] = {
+        str(row.apacCardNumber).strip(): str(row.vertical).strip().upper()
+        for row in fallback_rows.itertuples(index=False)
+    }
+
     for idx, row in predictions.iterrows():
         loan = str(row.get("Loan_number", "")).strip()
         if loan not in risk_map:
@@ -183,9 +192,40 @@ def apply_fallbacks_to_prediction_file(prediction_file: Path, fallback_rows: pd.
             predictions.at[idx, "D"] = "-"
         if "PREDICTION_REASON" in predictions.columns:
             predictions.at[idx, "PREDICTION_REASON"] = reason_map[loan]
+        predictions.at[idx, "IS_NEW_CUSTOMER"] = "True"
         updated += 1
 
-    if updated:
+    missing_loans = set(risk_map.keys()) - existing_loans
+    if missing_loans:
+        sample_month_used = predictions["SOURCE_MONTH_USED"].iloc[0] if "SOURCE_MONTH_USED" in predictions.columns and not predictions.empty else ""
+        sample_month = predictions["MONTH"].iloc[0] if "MONTH" in predictions.columns and not predictions.empty else ""
+
+        new_rows = []
+        for loan in missing_loans:
+            risk = risk_map[loan]
+            vertical = vertical_map.get(loan, "LAP")
+            reason = reason_map.get(loan, "")
+            row_dict = {
+                "SOURCE_RISK": risk,
+                "SOURCE_VERTICAL": vertical,
+                "EMI_DATE": "",
+                "Loan_number": loan,
+                "SOURCE_MONTH_USED": sample_month_used,
+                "MONTH": sample_month,
+                "PREDICTION_REASON": reason,
+                "IS_NEW_CUSTOMER": "True",
+            }
+            for day in DAY_COLUMNS:
+                row_dict[day] = fallback_map.get((loan, day), "-")
+            if "D" in row_dict:
+                row_dict["D"] = "-"
+            new_rows.append(row_dict)
+
+        new_df = pd.DataFrame(new_rows)
+        predictions = pd.concat([predictions, new_df], ignore_index=True)
+        updated += len(missing_loans)
+
+    if updated or "IS_NEW_CUSTOMER" in predictions.columns:
         predictions.to_csv(prediction_file, index=False)
     return updated
 

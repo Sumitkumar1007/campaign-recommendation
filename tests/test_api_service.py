@@ -55,10 +55,11 @@ class DummyAIConfigRepo:
         self.created.append(kwargs)
         self.entries[kwargs["transaction_id"]] = kwargs
 
-    def update_entry(self, **kwargs) -> None:
+    def update_entry(self, **kwargs) -> int:
         self.updated.append(kwargs)
         existing = self.entries.setdefault(kwargs["transaction_id"], {"transaction_id": kwargs["transaction_id"]})
         existing.update(kwargs)
+        return 1
 
     def fetch_by_transaction_id(self, transaction_id: str):
         return self.entries.get(transaction_id)
