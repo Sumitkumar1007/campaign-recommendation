@@ -2832,6 +2832,10 @@ def main() -> None:
     prediction_month_label = month_label(args.predict_month)
     
     # --- DYNAMIC HISTORY WINDOW: Read directly from local model file ---
+    # Default fallback if file is missing or doesn't specify
+    if not hasattr(args, "history_window_months") or args.history_window_months is None:
+        args.history_window_months = 3 if args.model == "catboost_3m" else 6
+
     if args.model in {"catboost", "catboost_3m"}:
         model_suffix = "catboost_3m" if args.model == "catboost_3m" else "catboost"
         model_file = Path(args.model_file) if args.model_file else model_artifact_path(
@@ -3075,6 +3079,8 @@ def main() -> None:
                     str(prediction_file),
                     "--model-file",
                     str(model_file),
+                    "--training-dataset-file",
+                    str(TRAINING_DATA_DIR / "strategy_training_dataset_inference.csv"),
                     "--feature-file",
                     # str(FEATURE_DATA_DIR / "strategy_monthly_features.csv"),
                     str(FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv"),   # <-- CHANGED
@@ -3116,37 +3122,41 @@ def main() -> None:
                 )
 
         with log_step(logger, "compute_model_drift", model_file=model_file, metrics_file=metrics_file):
-            drift_report = compute_model_drift_metrics(
-                # feature_file=FEATURE_DATA_DIR / "strategy_monthly_features.csv",
-                # feature_file=FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv",
-                # schedule_file=SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv",
-                train_feature_file=FEATURE_DATA_DIR / "strategy_monthly_features_train.csv",       # <-- NEW
-                inference_feature_file=FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv", # <-- CHANGED
-                schedule_file=SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv", # <-- CHANGED
-                base_population_file=source_cases_file,
-                model_file=model_file,
-                metrics_file=metrics_file,
-                source_month_label=source_month_label,
-            )
-            metrics_payload = _load_metrics_metadata(metrics_file)
-            accuracy_value = None
-            validation_metrics = metrics_payload.get("validation_metrics") if isinstance(metrics_payload, dict) else None
-            train_metrics = metrics_payload.get("train_metrics") if isinstance(metrics_payload, dict) else None
-            accuracy_source = validation_metrics if isinstance(validation_metrics, dict) and validation_metrics.get("average_day_accuracy") is not None else train_metrics
-            if isinstance(accuracy_source, dict) and accuracy_source.get("average_day_accuracy") is not None:
-                accuracy_value = round(float(accuracy_source["average_day_accuracy"]) * 100, 2)
-            drift_report["current_accuracy"] = accuracy_value
-            logger.info(
-                "Drift summary | baseline_rows=%s inference_rows=%s blank_inference_rows=%s feature_count=%s drift_percentage=%s overall_psi=%s max_feature_psi=%s status=%s",
-                drift_report["baseline_rows"],
-                drift_report["inference_rows"],
-                drift_report["blank_inference_rows"],
-                drift_report["feature_count"],
-                drift_report["drift_percentage"],
-                drift_report["overall_psi"],
-                drift_report["max_feature_psi"],
-                drift_report["status"],
-            )
+            try:
+                drift_report = compute_model_drift_metrics(
+                    # feature_file=FEATURE_DATA_DIR / "strategy_monthly_features.csv",
+                    # feature_file=FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv",
+                    # schedule_file=SCHEDULE_DATA_DIR / "strategy_schedule_dataset_all_months.csv",
+                    train_feature_file=FEATURE_DATA_DIR / "strategy_monthly_features_train.csv",       # <-- NEW
+                    inference_feature_file=FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv", # <-- CHANGED
+                    schedule_file=SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv", # <-- CHANGED
+                    base_population_file=source_cases_file,
+                    model_file=model_file,
+                    metrics_file=metrics_file,
+                    source_month_label=source_month_label,
+                )
+                metrics_payload = _load_metrics_metadata(metrics_file)
+                accuracy_value = None
+                validation_metrics = metrics_payload.get("validation_metrics") if isinstance(metrics_payload, dict) else None
+                train_metrics = metrics_payload.get("train_metrics") if isinstance(metrics_payload, dict) else None
+                accuracy_source = validation_metrics if isinstance(validation_metrics, dict) and validation_metrics.get("average_day_accuracy") is not None else train_metrics
+                if isinstance(accuracy_source, dict) and accuracy_source.get("average_day_accuracy") is not None:
+                    accuracy_value = round(float(accuracy_source["average_day_accuracy"]) * 100, 2)
+                drift_report["current_accuracy"] = accuracy_value
+                logger.info(
+                    "Drift summary | baseline_rows=%s inference_rows=%s blank_inference_rows=%s feature_count=%s drift_percentage=%s overall_psi=%s max_feature_psi=%s status=%s",
+                    drift_report["baseline_rows"],
+                    drift_report["inference_rows"],
+                    drift_report["blank_inference_rows"],
+                    drift_report["feature_count"],
+                    drift_report["drift_percentage"],
+                    drift_report["overall_psi"],
+                    drift_report["max_feature_psi"],
+                    drift_report["status"],
+                )
+            except FileNotFoundError as e:
+                logger.warning(f"Skipping model drift calculation: {e}")
+                drift_report = None
 
         if not args.skip_db_store:
             with log_step(logger, "store_snapshots", target_schema=args.target_schema):

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -43,7 +44,9 @@ def resolve_venv_python() -> Path:
     configured = os.getenv("VENV_PYTHON", "").strip()
     if configured:
         return Path(configured).expanduser()
-    return DEFAULT_VENV_PYTHON
+    if DEFAULT_VENV_PYTHON.exists():
+        return DEFAULT_VENV_PYTHON
+    return Path(sys.executable)
 
 
 def load_dotenv(path: Path | None = None) -> None:
@@ -818,104 +821,104 @@ class ApiAuditLogRepository:
             )
             conn.commit()
 
-    def update_latest_entry(
+    def update_entry(
         self,
         *,
-        entry_type: str,
         reference_number: str,
-        request_url: str,
-        response_body: str,
         status: str,
+        response_body: str,
+        entry_type: str | None = None,
+        request_url: str | None = None,
         message: str | None = None,
         success_count: int | None = None,
         failure_count: int | None = None,
         total_records: int | None = None,
         processing_time_ms: int | None = None,
-    ) -> None:
+    ) -> int:
         with self.connect() as conn:
             self.ensure_table(conn)
             cursor = conn.execute(
                 sql.SQL(
                     """
                     UPDATE {table_ref}
-                    SET message = %s,
-                        response_body = %s,
+                    SET "type" = COALESCE(%s, "type"),
+                        request_url = COALESCE(NULLIF(request_url, ''), %s),
+                        message = %s,
                         status = %s,
-                        success_count = %s,
-                        failure_count = %s,
-                        total_records = %s,
+                        response_body = %s,
+                        total_records = COALESCE(%s, total_records),
+                        success_count = COALESCE(%s, success_count),
+                        failure_count = COALESCE(%s, failure_count),
                         processing_time_ms = COALESCE(%s, processing_time_ms),
                         modified_by = %s,
                         modified_on = %s
-                    WHERE id = (
-                        SELECT id
-                        FROM {table_ref}
-                        WHERE "type" = %s
-                          AND reference_number = %s
-                        ORDER BY COALESCE(modified_on, created_on) DESC, id DESC
-                        LIMIT 1
-                    )
+                    WHERE LOWER(TRIM(reference_number)) = LOWER(TRIM(%s))
                     """
                 ).format(table_ref=qualified_identifier(self.config.target_schema, self.config.api_audit_table)),
                 (
+                    entry_type,
+                    request_url,
                     message,
-                    response_body,
                     status,
+                    response_body,
+                    str(total_records) if total_records is not None else None,
                     str(success_count) if success_count is not None else None,
                     str(failure_count) if failure_count is not None else None,
-                    str(total_records) if total_records is not None else None,
                     str(processing_time_ms) if processing_time_ms is not None else None,
                     "AIML",
                     utcnow_naive(),
-                    entry_type,
                     reference_number,
                 ),
             )
-            if int(cursor.rowcount or 0) == 0:
-                now = utcnow_naive()
-                conn.execute(
-                    sql.SQL(
-                        """
-                        INSERT INTO {table_ref} (
-                            "type", reference_number, request_url, message, status, request_body, response_body,
-                            created_by, created_on, modified_by, modified_on,
-                            delete_flag, channel, tenant_id, module_name, client_name,
-                            total_records, success_count, failure_count, processing_time_ms
-                        )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        """
-                    ).format(table_ref=qualified_identifier(self.config.target_schema, self.config.api_audit_table)),
-                    (
-                        entry_type,
-                        reference_number,
-                        request_url,
-                        message,
-                        status,
-                        None,
-                        response_body,
-                        "AIML",
-                        now,
-                        "AIML",
-                        now,
-                        "N",
-                        "API",
-                        "DIGITAL",
-                        "AIML",
-                        "DIGITAL",
-                        str(total_records) if total_records is not None else None,
-                        str(success_count) if success_count is not None else None,
-                        str(failure_count) if failure_count is not None else None,
-                        str(processing_time_ms) if processing_time_ms is not None else None,
-                    ),
-                )
             conn.commit()
+            return int(cursor.rowcount or 0)
+
+    def fetch_by_reference_number(self, reference_number: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            self.ensure_table(conn)
+            row = conn.execute(
+                sql.SQL(
+                    """
+                    SELECT "type", reference_number, request_url, message, status, request_body, response_body,
+                           created_by, created_on, modified_by, modified_on,
+                           total_records, success_count, failure_count, processing_time_ms
+                    FROM {table_ref}
+                    WHERE LOWER(TRIM(reference_number)) = LOWER(TRIM(%s))
+                    ORDER BY COALESCE(modified_on, created_on) DESC, id DESC
+                    LIMIT 1
+                    """
+                ).format(table_ref=qualified_identifier(self.config.target_schema, self.config.api_audit_table)),
+                (reference_number,),
+            ).fetchone()
+            if row is None:
+                return None
+            return {
+                "type": row[0],
+                "reference_number": row[1],
+                "request_url": row[2],
+                "message": row[3],
+                "status": row[4],
+                "request_body": row[5],
+                "response_body": row[6],
+                "created_by": row[7],
+                "created_on": row[8].isoformat() if row[8] else None,
+                "modified_by": row[9],
+                "modified_on": row[10].isoformat() if row[10] else None,
+                "total_records": row[11],
+                "success_count": row[12],
+                "failure_count": row[13],
+                "processing_time_ms": row[14],
+            }
 
 
 class NoopApiAuditLogRepository:
-    def create_entry(self, **kwargs) -> None:
+    def create_entry(self, **kwargs: Any) -> None:
         return None
 
-    def update_latest_entry(self, **kwargs) -> None:
+    def update_entry(self, **kwargs: Any) -> int:
+        return 0
+
+    def fetch_by_reference_number(self, reference_number: str) -> dict[str, Any] | None:
         return None
 
 
@@ -1140,17 +1143,65 @@ class AIMLApiService:
                 log_context,
             )
 
+    def _wait_for_api_audit_row(
+        self,
+        reference_number: str,
+        *,
+        initial_delay_seconds: float = 0.0,
+        timeout_seconds: float = AI_CONFIG_UPDATE_WAIT_TIMEOUT_SECONDS,
+        poll_interval_seconds: float = AI_CONFIG_UPDATE_WAIT_INTERVAL_SECONDS,
+    ) -> None:
+        if initial_delay_seconds > 0:
+            self.logger.info(
+                "Waiting before api_audit_log lookup | reference_number=%s delay_seconds=%s",
+                reference_number,
+                initial_delay_seconds,
+            )
+            time.sleep(initial_delay_seconds)
+        deadline = time.monotonic() + max(timeout_seconds, 0.0)
+        while True:
+            if self.api_audit_repo.fetch_by_reference_number(reference_number) is not None:
+                return
+            if time.monotonic() >= deadline:
+                raise FileNotFoundError(
+                    f"reference_number {reference_number} not found in api_audit_log after waiting {timeout_seconds} seconds."
+                )
+            time.sleep(max(poll_interval_seconds, 0.0))
+
+    def _update_api_audit_entry(
+        self,
+        *,
+        reference_number: str,
+        initial_delay_seconds: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
+        updated_rows = self.api_audit_repo.update_entry(reference_number=reference_number, **kwargs)
+        if updated_rows:
+            return
+        self._wait_for_api_audit_row(reference_number, initial_delay_seconds=initial_delay_seconds)
+        updated_rows = self.api_audit_repo.update_entry(reference_number=reference_number, **kwargs)
+        if not updated_rows:
+            raise FileNotFoundError(f"reference_number {reference_number} not found in api_audit_log for update.")
+
     def _safe_create_api_audit_entry(self, *, log_context: str, **kwargs: Any) -> None:
         try:
-            self.api_audit_repo.create_entry(**kwargs)
+            ref = kwargs.get("reference_number")
+            if ref and self.api_audit_repo.fetch_by_reference_number(ref) is not None:
+                self._update_api_audit_entry(reference_number=ref, **kwargs)
+            else:
+                self.api_audit_repo.create_entry(**kwargs)
         except Exception:
-            self.logger.exception("Failed to create api_audit_log row | context=%s", log_context)
+            self.logger.exception("Failed to create or update api_audit_log row | context=%s", log_context)
 
-    def _safe_update_api_audit_entry(self, *, log_context: str, **kwargs: Any) -> None:
+    def _safe_update_api_audit_entry(self, *, log_context: str, reference_number: str, **kwargs: Any) -> None:
         try:
-            self.api_audit_repo.update_latest_entry(**kwargs)
+            self._update_api_audit_entry(reference_number=reference_number, **kwargs)
         except Exception:
-            self.logger.exception("Failed to update api_audit_log row | context=%s", log_context)
+            self.logger.exception(
+                "Failed to update api_audit_log | reference_number=%s context=%s",
+                reference_number,
+                log_context,
+            )
 
     def _configured_training_month_duration(self) -> int | None:
         query = sql.SQL(
@@ -1207,13 +1258,20 @@ class AIMLApiService:
 
         if "months" not in payload:
             return HTTPStatus.BAD_REQUEST, failure_response(transaction_id, "months is required.")
-        months = int(payload.get("months", 3))
+        try:
+            months = int(payload.get("months"))
+            if months <= 0:
+                raise ValueError("months must be greater than 0.")
+        except (TypeError, ValueError) as exc:
+            return HTTPStatus.BAD_REQUEST, failure_response(transaction_id, f"Invalid months parameter: {exc}")
+
         configured_months = self._configured_training_month_duration()
         if configured_months is not None and months != configured_months:
             return HTTPStatus.BAD_REQUEST, failure_response(
                 transaction_id,
                 f"months must match configured training duration {configured_months}.",
             )
+
         model_name = self.config.model_name
         current_model_version = self.current_model_version()
         next_model_version = self.next_model_version()
@@ -1338,18 +1396,15 @@ class AIMLApiService:
                 training_window=str(months),
                 model_version=current_model_version,
             )
-            self._safe_create_api_audit_entry(
+            self._safe_update_api_audit_entry(
                 log_context="training_accepted",
                 entry_type="TRAINING",
                 reference_number=transaction_id,
                 request_url=request_url,
-                request_body=json_dumps_compact(payload),
                 response_body=accepted_response_body,
                 status="ACCEPTED",
                 message="Request accepted for processing.",
-                success_count=0,
-                failure_count=0,
-                total_records=0,
+                initial_delay_seconds=AI_CONFIG_UPDATE_INITIAL_DELAY_SECONDS,
             )
             run_logged_subprocess(
                 prepare_command,
@@ -1481,18 +1536,15 @@ class AIMLApiService:
                 model_version=model_version,
                 training_window="10 days",
             )
-            self._safe_create_api_audit_entry(
+            self._safe_update_api_audit_entry(
                 log_context="inference_accepted",
                 entry_type="INFERENCE",
                 reference_number=transaction_id,
                 request_url=request_url,
-                request_body=json_dumps_compact(payload),
                 response_body=accepted_response_body,
                 status="ACCEPTED",
                 message="Request accepted for processing.",
-                success_count=0,
-                failure_count=0,
-                total_records=0,
+                initial_delay_seconds=AI_CONFIG_UPDATE_INITIAL_DELAY_SECONDS,
             )
             run_logged_subprocess(
                 command,
@@ -1737,6 +1789,12 @@ def json_response(start_response: Callable[..., Any], status_code: int, payload:
     return [body]
 
 
+def request_url_from_environ(environ: dict[str, Any], path: str) -> str:
+    scheme = environ.get("wsgi.url_scheme", "http")
+    host = environ.get("HTTP_HOST") or f"{environ.get('SERVER_NAME', 'localhost')}:{environ.get('SERVER_PORT', '8080')}"
+    return f"{scheme}://{host}{path}"
+
+
 class AIMLApiApp:
     def __init__(self, service: AIMLApiService):
         self.service = service
@@ -1782,13 +1840,15 @@ class AIMLApiApp:
             if path == "/api/v1/training":
                 if method != "POST":
                     return json_response(start_response, HTTPStatus.METHOD_NOT_ALLOWED, {"message": "Method not allowed."})
-                status_code, payload = self.service.trigger_training(read_json_body(environ), request_url=path)
+                full_url = request_url_from_environ(environ, path)
+                status_code, payload = self.service.trigger_training(read_json_body(environ), request_url=full_url)
                 return json_response(start_response, status_code, payload)
 
             if path == "/api/v1/inference":
                 if method != "POST":
                     return json_response(start_response, HTTPStatus.METHOD_NOT_ALLOWED, {"message": "Method not allowed."})
-                status_code, payload = self.service.trigger_inference(read_json_body(environ), request_url=path)
+                full_url = request_url_from_environ(environ, path)
+                status_code, payload = self.service.trigger_inference(read_json_body(environ), request_url=full_url)
                 return json_response(start_response, status_code, payload)
 
             return json_response(start_response, HTTPStatus.NOT_FOUND, {"message": "Not found."})
