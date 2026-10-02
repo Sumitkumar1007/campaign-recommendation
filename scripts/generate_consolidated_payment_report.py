@@ -50,15 +50,27 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def find_apac_column(columns: list[str] | pd.Index) -> str | None:
+    cols_map = {str(c).replace("\ufeff", "").strip().lower(): c for c in columns}
+    for candidate in ["apac_card_number", "apaccardnumber", "loan_number", "account_number", "contract_number"]:
+        if candidate in cols_map:
+            return str(cols_map[candidate])
+    return None
+
+
 def month_label_from_filename(path: Path) -> str | None:
     stem = path.stem
     for prefix in ["payment_data_", "communication_data_", "digital_cases_"]:
         if stem.startswith(prefix):
-            token = stem.replace(prefix, "", 1)
-            try:
-                return pd.to_datetime(token, format="%b%Y", errors="coerce").strftime("%b-%Y").upper()
-            except Exception:
-                pass
+            token = stem.replace(prefix, "", 1).strip()
+            if re.fullmatch(r"[A-Za-z]{3}\d{4}", token, re.IGNORECASE):
+                try:
+                    return datetime.strptime(token, "%b%Y").strftime("%b-%Y").upper()
+                except Exception:
+                    pass
+            parsed = pd.to_datetime(token, errors="coerce")
+            if not pd.isna(parsed):
+                return parsed.strftime("%b-%Y").upper()
     return None
 
 
@@ -79,16 +91,16 @@ def generate_consolidated_payment_report(
     all_comm_apacs: set[str] = set()
 
     for c_file in communication_files:
-        if not c_file.exists():
+        if not c_file.exists() or c_file.stat().st_size <= 60:
             continue
         try:
             file_month = month_label_from_filename(c_file)
-            for chunk in pd.read_csv(c_file, dtype=str, chunksize=100_000):
-                apac_col = "apac_card_number" if "apac_card_number" in chunk.columns else "APAC_CARD_NUMBER"
-                if apac_col not in chunk.columns:
+            for chunk in pd.read_csv(c_file, dtype=str, chunksize=100_000, encoding="utf-8-sig"):
+                apac_col = find_apac_column(chunk.columns)
+                if not apac_col:
                     continue
                 
-                chunk["APAC_CARD_NUMBER"] = chunk[apac_col].fillna("").astype(str).str.strip()
+                chunk["APAC_CARD_NUMBER"] = chunk[apac_col].fillna("").astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
                 pay_id_col = "payment_unique_id" if "payment_unique_id" in chunk.columns else "PAYMENT_UNIQUE_ID"
                 comm_type_col = "communication_type" if "communication_type" in chunk.columns else "COMMUNICATION_TYPE"
                 date_col = "date" if "date" in chunk.columns else ("created_date" if "created_date" in chunk.columns else "")
@@ -97,7 +109,10 @@ def generate_consolidated_payment_report(
                     apac = row["APAC_CARD_NUMBER"]
                     if not apac:
                         continue
+                    clean_apac = apac.lstrip("0")
                     all_comm_apacs.add(apac)
+                    if clean_apac:
+                        all_comm_apacs.add(clean_apac)
                     pay_id = str(row.get(pay_id_col, "") or "").strip() if pay_id_col else ""
                     comm_type = str(row.get(comm_type_col, "") or "").strip() if comm_type_col else ""
                     comm_date_str = ""
@@ -119,13 +134,24 @@ def generate_consolidated_payment_report(
                         comm_unique_ids[pay_id] = comm_info
                     if comm_date_str:
                         comm_apac_dates.add((apac, comm_date_str))
-                        if (apac, comm_date_str) not in comm_account_date_ids or (pay_id and not comm_account_date_ids[(apac, comm_date_str)].get("payment_unique_id")):
-                            comm_account_date_ids[(apac, comm_date_str)] = comm_info
+                        if clean_apac:
+                            comm_apac_dates.add((clean_apac, comm_date_str))
+                        for key_apac in {apac, clean_apac}:
+                            if not key_apac:
+                                continue
+                            if (key_apac, comm_date_str) not in comm_account_date_ids or (pay_id and not comm_account_date_ids[(key_apac, comm_date_str)].get("payment_unique_id")):
+                                comm_account_date_ids[(key_apac, comm_date_str)] = comm_info
                     if month_label:
-                        if (apac, month_label) not in comm_account_month_ids or (pay_id and not comm_account_month_ids[(apac, month_label)].get("payment_unique_id")):
-                            comm_account_month_ids[(apac, month_label)] = comm_info
-                    if apac not in comm_account_latest_id or (pay_id and not comm_account_latest_id[apac].get("payment_unique_id")):
-                        comm_account_latest_id[apac] = comm_info
+                        for key_apac in {apac, clean_apac}:
+                            if not key_apac:
+                                continue
+                            if (key_apac, month_label) not in comm_account_month_ids or (pay_id and not comm_account_month_ids[(key_apac, month_label)].get("payment_unique_id")):
+                                comm_account_month_ids[(key_apac, month_label)] = comm_info
+                    for key_apac in {apac, clean_apac}:
+                        if not key_apac:
+                            continue
+                        if key_apac not in comm_account_latest_id or (pay_id and not comm_account_latest_id[key_apac].get("payment_unique_id")):
+                            comm_account_latest_id[key_apac] = comm_info
         except Exception as exc:
             logger.warning("Error reading communication file %s: %s", c_file, exc)
 
@@ -141,16 +167,16 @@ def generate_consolidated_payment_report(
     report_rows: list[dict[str, object]] = []
 
     for p_file in payment_files:
-        if not p_file.exists():
+        if not p_file.exists() or p_file.stat().st_size <= 60:
             continue
         try:
             file_month_label = month_label_from_filename(p_file)
-            for chunk in pd.read_csv(p_file, dtype=str, chunksize=100_000):
-                apac_col = "apac_card_number" if "apac_card_number" in chunk.columns else "APAC_CARD_NUMBER"
-                if apac_col not in chunk.columns:
+            for chunk in pd.read_csv(p_file, dtype=str, chunksize=100_000, encoding="utf-8-sig"):
+                apac_col = find_apac_column(chunk.columns)
+                if not apac_col:
                     continue
 
-                chunk["APAC_CARD_NUMBER"] = chunk[apac_col].fillna("").astype(str).str.strip()
+                chunk["APAC_CARD_NUMBER"] = chunk[apac_col].fillna("").astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
                 ref_col = "reference_number" if "reference_number" in chunk.columns else "REFERENCE_NUMBER"
                 dt_col = "payment_datetime" if "payment_datetime" in chunk.columns else "PAYMENT_DATETIME"
 
@@ -158,6 +184,7 @@ def generate_consolidated_payment_report(
                     apac = row["APAC_CARD_NUMBER"]
                     if not apac:
                         continue
+                    clean_apac = apac.lstrip("0")
                     ref_num = str(row.get(ref_col, "") or "").strip() if ref_col else ""
                     pay_dt_raw = row.get(dt_col, "") if dt_col else ""
                     pay_dt = pd.to_datetime(pay_dt_raw, errors="coerce") if pd.notna(pay_dt_raw) else pd.NaT
@@ -188,15 +215,18 @@ def generate_consolidated_payment_report(
                         match_verdict = "VALID_LINK_PAYMENT"
 
                     # Check 2: External Payment Match (p.apac_card_number in communication dataset & date/month match)
-                    elif apac in all_comm_apacs:
+                    elif apac in all_comm_apacs or (clean_apac and clean_apac in all_comm_apacs):
                         payment_flag = "EXTERNAL_PAYMENT"
                         matched_comm_date = pay_date_str
                         payment_multiplier = 2.5
                         match_verdict = "VALID_EXTERNAL_PAYMENT"
                         ext_comm_info = (
                             comm_account_date_ids.get((apac, pay_date_str))
+                            or comm_account_date_ids.get((clean_apac, pay_date_str))
                             or comm_account_month_ids.get((apac, month_label))
+                            or comm_account_month_ids.get((clean_apac, month_label))
                             or comm_account_latest_id.get(apac)
+                            or comm_account_latest_id.get(clean_apac)
                         )
                         if ext_comm_info:
                             matched_pay_id = ext_comm_info.get("payment_unique_id", "")

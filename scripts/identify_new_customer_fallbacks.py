@@ -45,22 +45,26 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def find_apac_column(columns: list[str] | pd.Index) -> str | None:
+    cols_map = {str(c).replace("\ufeff", "").strip().lower(): c for c in columns}
+    for candidate in ["apac_card_number", "apaccardnumber", "loan_number", "account_number", "contract_number"]:
+        if candidate in cols_map:
+            return str(cols_map[candidate])
+    return None
+
+
 def normalize_apac(series: pd.Series) -> pd.Series:
-    return series.fillna("").astype(str).str.strip()
+    s = series.fillna("").astype(str).str.strip()
+    return s.str.replace(r"\.0$", "", regex=True)
 
 
 def load_case_apacs(cases_file: Path) -> pd.DataFrame:
-    cases = pd.read_csv(cases_file, dtype=str)
-    if "apac_card_number" in cases.columns:
-        apac_column = "apac_card_number"
-    elif "APAC_CARD_NUMBER" in cases.columns:
-        apac_column = "APAC_CARD_NUMBER"
-    elif "Loan_number" in cases.columns:
-        apac_column = "Loan_number"
-    else:
+    cases = pd.read_csv(cases_file, dtype=str, encoding="utf-8-sig")
+    col = find_apac_column(cases.columns)
+    if not col:
         raise ValueError("Cases file must contain apac_card_number, APAC_CARD_NUMBER, or Loan_number.")
 
-    output = pd.DataFrame({"apacCardNumber": normalize_apac(cases[apac_column])})
+    output = pd.DataFrame({"apacCardNumber": normalize_apac(cases[col])})
     if "risk" in cases.columns:
         output["originalRisk"] = cases["risk"].fillna("").astype(str).str.upper().str.strip()
     elif "RISK" in cases.columns:
@@ -79,11 +83,22 @@ def load_case_apacs(cases_file: Path) -> pd.DataFrame:
 def load_history_apacs(communication_files: list[Path]) -> set[str]:
     history: set[str] = set()
     for csv_file in communication_files:
-        header = pd.read_csv(csv_file, nrows=0).columns
-        if "apac_card_number" not in header:
+        if not csv_file.exists():
             continue
-        for chunk in pd.read_csv(csv_file, usecols=["apac_card_number"], dtype=str, chunksize=200_000):
-            history.update(normalize_apac(chunk["apac_card_number"]))
+        try:
+            header = pd.read_csv(csv_file, nrows=0, encoding="utf-8-sig").columns
+        except Exception:
+            continue
+        col = find_apac_column(header)
+        if not col:
+            continue
+        try:
+            for chunk in pd.read_csv(csv_file, usecols=[col], dtype=str, chunksize=200_000, encoding="utf-8-sig"):
+                normed = normalize_apac(chunk[col])
+                history.update(normed)
+                history.update(normed.str.lstrip("0"))
+        except Exception:
+            continue
     history.discard("")
     return history
 
@@ -238,7 +253,11 @@ def main() -> None:
 
     case_apacs = load_case_apacs(cases_file)
     history_apacs = load_history_apacs(communication_files)
-    new_cases = case_apacs[~case_apacs["apacCardNumber"].isin(history_apacs)].copy()
+    is_in_history = (
+        case_apacs["apacCardNumber"].isin(history_apacs)
+        | case_apacs["apacCardNumber"].str.lstrip("0").isin(history_apacs)
+    )
+    new_cases = case_apacs[~is_in_history].copy()
     fallback_by_risk = build_average_strategy_by_risk(Path(args.schedule_file))
     output = build_fallback_rows(new_cases, fallback_by_risk)
     output.to_csv(output_file, index=False)

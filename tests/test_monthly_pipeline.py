@@ -1730,5 +1730,22 @@ def test_new_customer_fallback_and_summary_json(tmp_path: Path) -> None:
     assert summary["fallback_strategy"]["LOW_strategy"]["D-5"] == "SMS-10-ENGLISH"
 
 
+def test_load_history_apacs_handles_column_variations_and_leading_zeros(tmp_path: Path) -> None:
+    from identify_new_customer_fallbacks import load_history_apacs
+
+    comm1 = tmp_path / "comm1.csv"
+    comm1.write_text("\ufeffAPAC_CARD_NUMBER\n000103513083651301\n", encoding="utf-8-sig")
+
+    comm2 = tmp_path / "comm2.csv"
+    comm2.write_text("Loan_number\n014403562438726001\n", encoding="utf-8")
+
+    history = load_history_apacs([comm1, comm2])
+    assert "000103513083651301" in history
+    assert "103513083651301" in history
+    assert "014403562438726001" in history
+    assert "14403562438726001" in history
+
+
+
 
 

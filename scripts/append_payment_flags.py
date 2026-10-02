@@ -29,17 +29,31 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def find_apac_column(columns: list[str] | pd.Index) -> str | None:
+    cols_map = {str(c).replace("\ufeff", "").strip().lower(): c for c in columns}
+    for candidate in ["apac_card_number", "apaccardnumber", "loan_number", "account_number", "contract_number"]:
+        if candidate in cols_map:
+            return str(cols_map[candidate])
+    return None
+
+
 def normalize_apac(series: pd.Series) -> pd.Series:
-    return series.fillna("").astype(str).str.strip()
+    s = series.fillna("").astype(str).str.strip()
+    return s.str.replace(r"\.0$", "", regex=True)
 
 
 def month_label_from_payment_file(path: Path) -> str | None:
     stem = path.stem
-    token = stem.replace("payment_data_", "", 1)
-    try:
-        return datetime.strptime(token, "%b%Y").strftime("%b-%Y").upper()
-    except Exception:
-        return None
+    token = stem.replace("payment_data_", "", 1).strip()
+    if re.fullmatch(r"[A-Za-z]{3}\d{4}", token, re.IGNORECASE):
+        try:
+            return datetime.strptime(token, "%b%Y").strftime("%b-%Y").upper()
+        except Exception:
+            pass
+    parsed = pd.to_datetime(token, errors="coerce")
+    if not pd.isna(parsed):
+        return parsed.strftime("%b-%Y").upper()
+    return None
 
 
 def load_paid_keys(
@@ -62,17 +76,23 @@ def load_paid_keys(
     tot_pay_counts: dict[tuple[str, str], int] = {}
 
     for payment_file in payment_files:
-        if not payment_file.exists():
+        if not payment_file.exists() or payment_file.stat().st_size <= 60:
             continue
-        header = pd.read_csv(payment_file, nrows=0).columns
-        if "apac_card_number" not in header:
+        try:
+            header = pd.read_csv(payment_file, nrows=0, encoding="utf-8-sig").columns
+        except Exception:
+            continue
+        apac_col = find_apac_column(header)
+        if not apac_col:
             continue
         month_label = month_label_from_payment_file(payment_file)
         if month_label:
             fetched_months.add(month_label)
-        usecols = ["apac_card_number"]
+        usecols = [apac_col]
         if "payment_datetime" in header:
             usecols.append("payment_datetime")
+        elif "PAYMENT_DATETIME" in header:
+            usecols.append("PAYMENT_DATETIME")
         if "reference_number" in header:
             usecols.append("reference_number")
         if "month" in header:
