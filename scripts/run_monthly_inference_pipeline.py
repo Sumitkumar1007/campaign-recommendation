@@ -642,6 +642,33 @@ def fetch_current_cases_extract(
     )
 
 
+def fetch_payment_extract(
+    args: argparse.Namespace,
+    output_file: Path,
+    fetch_month: str,
+    logger: logging.Logger,
+) -> None:
+    run_python_script(
+        "fetch_payments_from_postgres.py",
+        "--schema",
+        args.source_schema,
+        "--table",
+        os.getenv("PAYMENT_TABLE_NAME", "payment"),
+        "--source-month",
+        fetch_month,
+        "--output-file",
+        str(output_file),
+        logger=logger,
+        env_updates={
+            "PGHOST": args.host,
+            "PGPORT": str(args.port),
+            "PGDATABASE": args.dbname,
+            "PGUSER": args.user,
+            "PGPASSWORD": args.password,
+        },
+    )
+
+
 def run_python_script(
     script_name: str,
     *script_args: str,
@@ -2880,6 +2907,11 @@ def main() -> None:
         with log_step(logger, "fetch_communication_history", source_month=args.source_month):
             for fetch_month, output_file in history_fetches:
                 fetch_communication_extract(args, output_file, fetch_month, logger)
+        with log_step(logger, "fetch_payment_history", source_month=args.source_month):
+            for fetch_month, _ in history_fetches:
+                month_token = month_file_token(parse_month(fetch_month))
+                payment_output_file = PAYMENT_DATA_DIR / f"payment_data_{month_token}.csv"
+                fetch_payment_extract(args, payment_output_file, fetch_month, logger)
         with log_step(logger, "fetch_current_cases", source_month=args.source_month):
             fetch_current_cases_extract(args, source_cases_file, args.predict_month, logger)
 
