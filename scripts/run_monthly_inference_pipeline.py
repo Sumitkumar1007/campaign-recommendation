@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import uuid
@@ -1109,9 +1110,24 @@ def _dataset_day_label(value: str) -> str:
     return "-".join(_dataset_day_token(part) for part in str(value).split(",") if part.strip())
 
 
+def extract_base_language(val: object) -> str:
+    if val is None or pd.isna(val):
+        return "ENGLISH"
+    text = str(val).strip()
+    if not text or text.lower() == "nan":
+        return "ENGLISH"
+    if "_" in text:
+        last_token = text.rsplit("_", 1)[-1].strip()
+        if last_token:
+            return last_token.upper()
+    token = re.split(r"[-_ ]", text)[0].upper()
+    return token
+
+
 def _dataset_name(*, due_type: str, mode: str, vertical: str, language: str, risk_code: str, emi_cycle: int, date_value: str, time_value: str) -> str:
+    clean_lang = extract_base_language(language)
     return (
-        f"{due_type} AIML {NAME_CHANNEL_BY_MODE[mode]} {vertical.upper()} {language} {risk_code} "
+        f"{due_type} AIML {NAME_CHANNEL_BY_MODE[mode]} {vertical.upper()} {clean_lang} {risk_code} "
         f"EMI {emi_cycle}TH {_dataset_day_label(date_value)} {_dataset_time_label(time_value)}"
     )
 
@@ -1789,7 +1805,7 @@ def _prepare_campaign_outputs(
             due_type=str(row["due_type"]),
             mode=str(row["mode"]),
             vertical=str(row["vertical"]),
-            language=str(row["template_name"]).rsplit("_", 1)[-1],
+            language=str(row.get("language") or row.get("template_name")),
             risk_code=str(row["risk"]),
             emi_cycle=int(row["emi_cycle"]),
             date_value=str(row["date"]),

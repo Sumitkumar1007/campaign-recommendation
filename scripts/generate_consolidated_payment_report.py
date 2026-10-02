@@ -269,6 +269,7 @@ def generate_consolidated_payment_report(
     report_df = pd.DataFrame(report_rows)
     output_path = ensure_parent_dir(output_file)
     if not report_df.empty:
+        report_df = report_df.drop_duplicates(subset=["apac_card_number", "reference_number", "payment_datetime"])
         report_df.to_csv(output_path, index=False)
         logger.info("Saved consolidated payment report | path=%s rows=%s", output_path, len(report_df))
     else:

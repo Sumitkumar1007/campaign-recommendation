@@ -144,11 +144,11 @@ def fetch_month_extracts(args: argparse.Namespace, logger: logging.Logger, month
 
 
 def fetch_payment_extracts(args: argparse.Namespace, logger: logging.Logger, months: list[str]) -> list[Path]:
-    from project_paths import PAYMENT_DATA_DIR
+    from fetch_payments_from_postgres import default_output_file
     files: list[Path] = []
     with log_step(logger, "fetch_training_payments"):
         for month in months:
-            payment_file = PAYMENT_DATA_DIR / f"payment_data_{month}.csv"
+            payment_file = default_output_file(month)
             run_python_script(
                 "fetch_payments_from_postgres.py",
                 "--host", args.host,
