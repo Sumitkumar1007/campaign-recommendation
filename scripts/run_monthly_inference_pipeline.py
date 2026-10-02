@@ -927,7 +927,7 @@ def _parse_strategy(strategy: str) -> tuple[str, str, str] | None:
     mode = MODE_BY_STRATEGY_CHANNEL.get(channel.upper())
     if mode is None:
         return None
-    normalized_language = language.upper().strip()
+    normalized_language = extract_base_language(language)
     return mode, _format_scheduler_hour(hour_label), normalized_language
 
 
@@ -1110,18 +1110,35 @@ def _dataset_day_label(value: str) -> str:
     return "-".join(_dataset_day_token(part) for part in str(value).split(",") if part.strip())
 
 
+KNOWN_LANGUAGES = {
+    "ENGLISH", "HINDI", "TELUGU", "TAMIL", "KANNADA", "MARATHI",
+    "GUJARATI", "BENGALI", "MALAYALAM", "PUNJABI", "ODIA", "ASSAMESE", "REGIONAL",
+}
+
+
 def extract_base_language(val: object) -> str:
     if val is None or pd.isna(val):
         return "ENGLISH"
-    text = str(val).strip()
-    if not text or text.lower() == "nan":
+    text = str(val).strip().upper()
+    if not text or text.lower() in ("nan", "none", "<na>"):
         return "ENGLISH"
+
+    tokens = [t.strip() for t in re.split(r"[-_ ]+", text) if t.strip()]
+    for token in tokens:
+        if token in KNOWN_LANGUAGES:
+            return token
+
     if "_" in text:
-        last_token = text.rsplit("_", 1)[-1].strip()
-        if last_token:
-            return last_token.upper()
-    token = re.split(r"[-_ ]", text)[0].upper()
-    return token
+        last = text.rsplit("_", 1)[-1].strip()
+        if last and last not in {"REMINDER", "DUE", "DATE", "PRE", "POST"}:
+            return last
+
+    skip_keywords = {"PREDUE", "POSTDUE", "PRE", "POST", "AIML", "SMS", "WHATSAPP", "VOICE", "REMINDER", "DUE", "DATE", "RULE", "TEMPLATE"}
+    for token in tokens:
+        if token not in skip_keywords and not token.isdigit():
+            return token
+
+    return tokens[0] if tokens else "ENGLISH"
 
 
 def _dataset_name(*, due_type: str, mode: str, vertical: str, language: str, risk_code: str, emi_cycle: int, date_value: str, time_value: str) -> str:
@@ -1805,7 +1822,7 @@ def _prepare_campaign_outputs(
             due_type=str(row["due_type"]),
             mode=str(row["mode"]),
             vertical=str(row["vertical"]),
-            language=str(row.get("language") or row.get("template_name")),
+            language=str(row["language"]),  # <--- DIRECTLY PASS ROW["LANGUAGE"]
             risk_code=str(row["risk"]),
             emi_cycle=int(row["emi_cycle"]),
             date_value=str(row["date"]),

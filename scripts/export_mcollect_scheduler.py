@@ -189,7 +189,14 @@ def build_cron_trigger_specs(row: pd.Series, *, trigger_state: str) -> list[Cron
 def dataset_query_for(row: pd.Series, *, schema: str, campaign_table: str, mapping_table: str) -> str:
     mode = str(row["mode"]).replace("'", "''")
     vertical = str(row["vertical"]).replace("'", "''")
-    raw_lang = row.get("language") or row.get("verbiage_language") or row.get("template_name")
+    raw_lang = row.get("language") or row.get("verbiage_language")
+    if not raw_lang or pd.isna(raw_lang) or str(raw_lang).strip() == "":
+        ds_name = str(row.get("dataset_name", "")).strip()
+        tokens = ds_name.split()
+        if len(tokens) >= 5 and tokens[1] == "AIML":
+            raw_lang = tokens[4]
+        else:
+            raw_lang = row.get("template_name")
     language = extract_base_language(raw_lang).replace("'", "''")
     risk = str(row["risk"]).replace("'", "''")
     emi_cycle = int(row["emi_cycle"])

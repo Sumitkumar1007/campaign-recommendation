@@ -107,3 +107,31 @@ def test_dataset_query_decoupled_from_template_name():
     assert "amcm.language = 'ENGLISH'" in query
     assert "amcm.mode = 'SMS'" in query
     assert "amcm.vertical = 'LAP'" in query
+
+
+def test_dataset_query_strips_template_name_noise():
+    row = pd.Series(
+        {
+            "mode": "SMS",
+            "vertical": "EL",
+            "template_name": "English-Pre Due Date Reminder",
+            "risk": "LR",
+            "emi_cycle": 7,
+            "date": "D-5,D-1",
+            "time": "11:00:00",
+            "source_month": "SEP-2026",
+            "prediction_month": "OCT-2026",
+        }
+    )
+
+    query = dataset_query_for(
+        row,
+        schema="digital_collections",
+        campaign_table="ai_ml_campaign_recommendations",
+        mapping_table="ai_ml_campaign_mapping",
+    )
+
+    assert "amcm.language = 'ENGLISH'" in query
+    assert "ENGLISH-PRE DUE DATE REMINDER" not in query
+    assert "English-Pre Due Date Reminder" not in query
+
