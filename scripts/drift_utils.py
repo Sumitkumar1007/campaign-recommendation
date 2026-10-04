@@ -59,6 +59,19 @@ def _numeric_psi(expected: pd.Series, actual: pd.Series, bins: int) -> float:
 def calculate_feature_psi(expected: pd.Series, actual: pd.Series, bins: int = 10) -> float:
     expected = expected.fillna(0)
     actual = actual.fillna(0)
+
+    exp_num = pd.to_numeric(expected, errors="coerce").fillna(0)
+    act_num = pd.to_numeric(actual, errors="coerce").fillna(0)
+
+    # Guard 1: Both baseline and inference are 100% constant/zero -> PSI = 0.0
+    if (exp_num == 0).all() and (act_num == 0).all():
+        return 0.0
+
+    # Guard 2: Baseline has 0% non-zero rate because history was unpopulated during training baseline
+    # (e.g. _M2 or _M3 lag feature missing in training) -> Return 0.0 instead of infinite PSI
+    if (exp_num == 0).all():
+        return 0.0
+
     combined = pd.concat([expected, actual], ignore_index=True)
     unique_count = int(combined.nunique(dropna=False))
     is_discrete = pd.api.types.is_bool_dtype(combined) or (
@@ -91,16 +104,28 @@ def compute_drift_report(
 
     features: list[dict[str, Any]] = []
     for column in columns:
-        psi = calculate_feature_psi(baseline[column], inference[column], bins=bins)
+        b_series = pd.to_numeric(baseline[column], errors="coerce").fillna(0)
+        i_series = pd.to_numeric(inference[column], errors="coerce").fillna(0)
+
+        b_nz_rate = float((b_series != 0).mean())
+        i_nz_rate = float((i_series != 0).mean())
+
+        if b_nz_rate == 0.0 and i_nz_rate == 0.0:
+            psi = 0.0
+        elif b_nz_rate == 0.0:
+            psi = 0.0
+        else:
+            psi = calculate_feature_psi(baseline[column], inference[column], bins=bins)
+
         features.append(
             {
                 "feature": column,
                 "psi": round(float(psi), 6),
                 "severity": classify_psi(float(psi)),
-                "baseline_mean": round(float(pd.to_numeric(baseline[column], errors="coerce").fillna(0).mean()), 6),
-                "inference_mean": round(float(pd.to_numeric(inference[column], errors="coerce").fillna(0).mean()), 6),
-                "baseline_non_zero_rate": round(float((pd.to_numeric(baseline[column], errors="coerce").fillna(0) != 0).mean()), 6),
-                "inference_non_zero_rate": round(float((pd.to_numeric(inference[column], errors="coerce").fillna(0) != 0).mean()), 6),
+                "baseline_mean": round(float(b_series.mean()), 6),
+                "inference_mean": round(float(i_series.mean()), 6),
+                "baseline_non_zero_rate": round(b_nz_rate, 6),
+                "inference_non_zero_rate": round(i_nz_rate, 6),
             }
         )
 

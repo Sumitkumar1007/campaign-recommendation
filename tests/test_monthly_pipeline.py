@@ -261,8 +261,15 @@ def test_rolling_feature_window_keeps_month_wise_lag_history() -> None:
 
     assert january["SMS_TOTAL_INTENSITY_M1"] == 1
     assert january["SMS_TOTAL_INTENSITY_M2"] == 0
+    assert january["SMS_TOTAL_INTENSITY_MEAN"] == 1.0
+    assert january["HAS_M1_DATA"] == 1
+    assert january["HAS_M2_DATA"] == 0
+
     assert march["SMS_TOTAL_INTENSITY_M1"] == 4
     assert march["SMS_TOTAL_INTENSITY_M2"] == 2
+    assert march["SMS_TOTAL_INTENSITY_MEAN"] == 3.0  # (4 + 2) / 2
+    assert march["HAS_M1_DATA"] == 1
+    assert march["HAS_M2_DATA"] == 1
     assert march["WH_TOTAL_INTENSITY_M1"] == 1
     assert march["WH_TOTAL_INTENSITY_M2"] == 1
     assert march["SMS_SUCCESS_9AM_ENGLISH_M1"] == 2

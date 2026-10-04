@@ -141,20 +141,53 @@ def build_rolling_feature_windows(
 
     features[numeric_columns] = features[numeric_columns].fillna(0)
     lagged_parts = [features[[key_column, "MONTH_PERIOD"]].copy()]
+    has_data_flags: dict[str, pd.Series] = {}
+
     for lag in range(1, history_window_months + 1):
         shifted = features.groupby(key_column, sort=False)[numeric_columns].shift(lag - 1)
         lagged_parts.append(shifted.add_suffix(f"_M{lag}"))
+        
+        # Indicator flag: 1 if historical month was present in extracted data for this entity, else 0
+        has_data = shifted.iloc[:, 0].notna() if not shifted.empty else pd.Series(False, index=features.index)
+        has_data_flags[f"HAS_M{lag}_DATA"] = has_data.astype(int)
 
     rolled = pd.concat(lagged_parts, axis=1)
+
+    # Attach history indicator flags
+    for flag_name, flag_series in has_data_flags.items():
+        rolled[flag_name] = flag_series.values
+
+    # Calculate count of available historical months per row
+    available_months = sum(has_data_flags.values())
+    available_months_clipped = available_months.clip(lower=1)
+
+    # Compute Normalized Average (_MEAN) across available historical months for every numeric feature
+    for column in numeric_columns:
+        lag_cols = [f"{column}_M{lag}" for lag in range(1, history_window_months + 1)]
+        sum_lags = rolled[lag_cols].sum(axis=1, skipna=True)
+        rolled[f"{column}_MEAN"] = sum_lags / available_months_clipped
+
     rolled["MONTH"] = (
         rolled["MONTH_PERIOD"].dt.to_timestamp().dt.strftime("%b-%Y").str.upper()
     )
     rolled["RISK"] = features["RISK"].fillna("UNKNOWN").astype(str).str.upper().values
     rolled[lag_columns] = rolled[lag_columns].fillna(0)
+
+    # Complete output column list preserving expected ordering
+    all_lag_cols = [
+        col for lag in range(1, history_window_months + 1)
+        for col in [f"{c}_M{lag}" for c in numeric_columns]
+    ]
+    mean_cols = [f"{c}_MEAN" for c in numeric_columns]
+    flag_cols = [f"HAS_M{lag}_DATA" for lag in range(1, history_window_months + 1)]
+
+    extra_cols = ["RISK"]
     if "VERTICAL" in features.columns:
         rolled["VERTICAL"] = features["VERTICAL"].fillna("UNKNOWN").astype(str).str.upper().values
-        return rolled[[key_column, "MONTH", *lag_columns, "RISK", "VERTICAL"]]
-    return rolled[[key_column, "MONTH", *lag_columns, "RISK"]]
+        extra_cols.append("VERTICAL")
+
+    out_cols = [key_column, "MONTH", *all_lag_cols, *mean_cols, *flag_cols, *extra_cols]
+    return rolled[out_cols]
 
 
 def prepare_next_month_dataset(
