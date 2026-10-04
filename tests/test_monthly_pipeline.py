@@ -277,6 +277,26 @@ def test_rolling_feature_window_keeps_month_wise_lag_history() -> None:
     assert march["RISK"] == "LOW"
 
 
+def test_build_rolling_feature_windows_handles_string_dtypes() -> None:
+    # Simulates features loaded via pd.read_csv(..., dtype=str)
+    str_features = pd.DataFrame(
+        {
+            "APAC_CARD_NUMBER": ["A1", "A1"],
+            "MONTH": ["JAN-2026", "FEB-2026"],
+            "SMS_TOTAL_INTENSITY": ["1", "3"],
+            "LINK_PAYMENT_COUNT": ["0", "2.0"],
+            "RISK": ["LOW", "MEDIUM"],
+        }
+    )
+
+    rolled = build_rolling_feature_windows(str_features, history_window_months=2)
+    feb = rolled[rolled["MONTH"] == "FEB-2026"].iloc[0]
+    assert feb["SMS_TOTAL_INTENSITY_MEAN"] == 2.0  # (3 + 1) / 2
+    assert feb["LINK_PAYMENT_COUNT_MEAN"] == 1.0     # (2.0 + 0) / 2
+    assert feb["HAS_M1_DATA"] == 1
+    assert feb["HAS_M2_DATA"] == 1
+
+
 
 
 def test_process_chunk_uses_risk_from_communications_and_emi_month() -> None:

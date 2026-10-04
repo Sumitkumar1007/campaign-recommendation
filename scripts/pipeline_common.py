@@ -139,7 +139,10 @@ def build_rolling_feature_windows(
             base_columns.append("VERTICAL")
         return pd.DataFrame(columns=base_columns)
 
-    features[numeric_columns] = features[numeric_columns].fillna(0)
+    # Ensure numeric columns are numeric dtypes even when loaded as dtype=str
+    for col in numeric_columns:
+        features[col] = pd.to_numeric(features[col], errors="coerce")
+
     lagged_parts = [features[[key_column, "MONTH_PERIOD"]].copy()]
     has_data_flags: dict[str, pd.Series] = {}
 
@@ -164,7 +167,7 @@ def build_rolling_feature_windows(
     # Compute Normalized Average (_MEAN) across available historical months for every numeric feature
     for column in numeric_columns:
         lag_cols = [f"{column}_M{lag}" for lag in range(1, history_window_months + 1)]
-        sum_lags = rolled[lag_cols].sum(axis=1, skipna=True)
+        sum_lags = rolled[lag_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).sum(axis=1, skipna=True)
         rolled[f"{column}_MEAN"] = sum_lags / available_months_clipped
 
     rolled["MONTH"] = (
