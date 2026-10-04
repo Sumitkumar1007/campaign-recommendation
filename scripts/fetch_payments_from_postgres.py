@@ -47,11 +47,11 @@ def build_query(schema: str, table: str) -> sql.Composed:
             OR payment_datetime::text LIKE %(alt_month_prefix2)s
             OR (
                 CASE 
-                    WHEN payment_datetime::text ~ '^[0-9]{4}-[0-9]{2}' THEN payment_datetime::timestamp
+                    WHEN payment_datetime::text ~ '^[0-9]{{4}}-[0-9]{{2}}' THEN payment_datetime::timestamp
                     ELSE NULL 
                 END >= %(month_start)s 
                 AND CASE 
-                    WHEN payment_datetime::text ~ '^[0-9]{4}-[0-9]{2}' THEN payment_datetime::timestamp
+                    WHEN payment_datetime::text ~ '^[0-9]{{4}}-[0-9]{{2}}' THEN payment_datetime::timestamp
                     ELSE NULL 
                 END < %(next_month_start)s
             )
