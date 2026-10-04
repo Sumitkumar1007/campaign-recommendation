@@ -206,55 +206,70 @@ def apply_fallbacks_to_prediction_file(prediction_file: Path, fallback_rows: pd.
     if "Loan_number" not in predictions.columns:
         raise ValueError("Prediction file must contain Loan_number column.")
 
-    fallback_map: dict[tuple[str, str], str] = {
-        (str(row.apacCardNumber).strip(), str(row.day).strip()): str(row.recommendedStrategy).strip() or "-"
-        for row in fallback_rows.itertuples(index=False)
-    }
-    risk_map: dict[str, str] = {
-        str(row.apacCardNumber).strip(): str(row.fallbackRiskUsed).strip().upper() or "LOW"
-        for row in fallback_rows.itertuples(index=False)
-    }
-    reason_map: dict[str, str] = {
-        str(row.apacCardNumber).strip(): str(row.reason).strip()
-        for row in fallback_rows.itertuples(index=False)
-    }
+    fallback_map: dict[tuple[str, str], str] = {}
+    risk_map: dict[str, str] = {}
+    reason_map: dict[str, str] = {}
+    vertical_map: dict[str, str] = {}
+
+    for row in fallback_rows.itertuples(index=False):
+        raw_card = str(row.apacCardNumber).strip()
+        clean_card = raw_card.replace(".0", "").lstrip("0")
+        strat = str(row.recommendedStrategy).strip() or "-"
+        risk_val = str(row.fallbackRiskUsed).strip().upper() or "LOW"
+        reas_val = str(row.reason).strip()
+        vert_val = str(row.vertical).strip().upper()
+
+        for key_c in {raw_card, clean_card, raw_card.zfill(18)}:
+            if not key_c:
+                continue
+            fallback_map[(key_c, str(row.day).strip())] = strat
+            risk_map[key_c] = risk_val
+            reason_map[key_c] = reas_val
+            vertical_map[key_c] = vert_val
 
     if "IS_NEW_CUSTOMER" not in predictions.columns:
         predictions["IS_NEW_CUSTOMER"] = "False"
 
     updated = 0
     existing_loans = set(predictions["Loan_number"].astype(str).str.strip())
-    vertical_map: dict[str, str] = {
-        str(row.apacCardNumber).strip(): str(row.vertical).strip().upper()
-        for row in fallback_rows.itertuples(index=False)
-    }
+    existing_clean_loans = {l.replace(".0", "").lstrip("0") for l in existing_loans}
 
     for idx, row in predictions.iterrows():
         loan = str(row.get("Loan_number", "")).strip()
-        if loan not in risk_map:
+        clean_loan = loan.replace(".0", "").lstrip("0")
+        matched_key = loan if loan in risk_map else (clean_loan if clean_loan in risk_map else None)
+
+        if matched_key is None:
             continue
+
         if "SOURCE_RISK" in predictions.columns:
-            predictions.at[idx, "SOURCE_RISK"] = risk_map[loan]
+            predictions.at[idx, "SOURCE_RISK"] = risk_map[matched_key]
         for day in DAY_COLUMNS:
             if day in predictions.columns:
-                predictions.at[idx, day] = fallback_map.get((loan, day), "-")
+                predictions.at[idx, day] = fallback_map.get((matched_key, day), "-")
         if "D" in predictions.columns:
             predictions.at[idx, "D"] = "-"
         if "PREDICTION_REASON" in predictions.columns:
-            predictions.at[idx, "PREDICTION_REASON"] = reason_map[loan]
+            predictions.at[idx, "PREDICTION_REASON"] = reason_map[matched_key]
         predictions.at[idx, "IS_NEW_CUSTOMER"] = "True"
         updated += 1
 
-    missing_loans = set(risk_map.keys()) - existing_loans
+    raw_fallback_cards = set(fallback_rows["apacCardNumber"].astype(str).str.strip())
+    missing_loans = [
+        card for card in raw_fallback_cards
+        if card not in existing_loans and card.replace(".0", "").lstrip("0") not in existing_clean_loans
+    ]
     if missing_loans:
         sample_month_used = predictions["SOURCE_MONTH_USED"].iloc[0] if "SOURCE_MONTH_USED" in predictions.columns and not predictions.empty else ""
         sample_month = predictions["MONTH"].iloc[0] if "MONTH" in predictions.columns and not predictions.empty else ""
 
         new_rows = []
         for loan in missing_loans:
-            risk = risk_map[loan]
-            vertical = vertical_map.get(loan, "LAP")
-            reason = reason_map.get(loan, "")
+            clean_loan = loan.replace(".0", "").lstrip("0")
+            matched_key = loan if loan in risk_map else clean_loan
+            risk = risk_map.get(matched_key, "LOW")
+            vertical = vertical_map.get(matched_key, "LAP")
+            reason = reason_map.get(matched_key, "")
             row_dict = {
                 "SOURCE_RISK": risk,
                 "SOURCE_VERTICAL": vertical,

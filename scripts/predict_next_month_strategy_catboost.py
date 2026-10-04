@@ -204,13 +204,24 @@ def build_prediction_population(
     key_column = "ENTITY_KEY" if "ENTITY_KEY" in dataset.columns else "APAC_CARD_NUMBER"
     base_population = base_population.copy()
     base_population[key_column] = base_population[key_column].astype(str).str.strip()
+    base_population["_JOIN_KEY"] = (
+        base_population[key_column]
+        .str.replace(r"\.0$", "", regex=True)
+        .str.lstrip("0")
+    )
+
     dataset = dataset.copy()
     dataset[key_column] = dataset[key_column].astype(str).str.strip()
     feature_rows = dataset[dataset["SOURCE_MONTH_PERIOD"].notna()].copy()
     feature_rows = feature_rows[feature_rows["SOURCE_MONTH_PERIOD"] <= source_month_period].copy()
+    feature_rows["_JOIN_KEY"] = (
+        feature_rows[key_column]
+        .str.replace(r"\.0$", "", regex=True)
+        .str.lstrip("0")
+    )
     feature_rows = (
-        feature_rows.sort_values([key_column, "SOURCE_MONTH_PERIOD"])
-        .drop_duplicates(subset=[key_column], keep="last")
+        feature_rows.sort_values(["_JOIN_KEY", "SOURCE_MONTH_PERIOD"])
+        .drop_duplicates(subset=["_JOIN_KEY"], keep="last")
         .reset_index(drop=True)
     )
     feature_rows = feature_rows.drop(
@@ -222,13 +233,16 @@ def build_prediction_population(
 
     merged = base_population.merge(
         feature_rows,
-        on=[key_column, "SOURCE_MONTH"],
+        on=["_JOIN_KEY", "SOURCE_MONTH"],
         how="left",
         indicator=True,
+        suffixes=("", "_feat"),
     )
+    if f"{key_column}_feat" in merged.columns:
+        merged = merged.drop(columns=[f"{key_column}_feat"])
     merged["SOURCE_MONTH_PERIOD"] = month_to_period(merged["SOURCE_MONTH"])
-    with_history = merged[merged["_merge"] == "both"].drop(columns=["_merge"]).copy()
-    without_history = merged[merged["_merge"] == "left_only"].drop(columns=["_merge"]).copy()
+    with_history = merged[merged["_merge"] == "both"].drop(columns=["_merge", "_JOIN_KEY"]).copy()
+    without_history = merged[merged["_merge"] == "left_only"].drop(columns=["_merge", "_JOIN_KEY"]).copy()
     return with_history, without_history
 
 
