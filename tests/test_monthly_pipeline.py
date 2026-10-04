@@ -1636,8 +1636,8 @@ def test_new_customer_fallback_and_summary_json(tmp_path: Path) -> None:
     schedule_csv = tmp_path / "schedule.csv"
     schedule_df = pd.DataFrame({
         "RISK": ["LOW", "LOW", "MEDIUM", "HIGH"],
-        "D-5": ["SMS-10-ENGLISH", "SMS-10-ENGLISH", "WH-12-ENGLISH", "VOICE-10-ENGLISH"],
-        "D-4": ["SMS-10-ENGLISH", "SMS-10-ENGLISH", "WH-12-ENGLISH", "VOICE-10-ENGLISH"],
+        "D-5": ["SMS-10AM-ENGLISH", "SMS-10AM-ENGLISH", "WH-12PM-ENGLISH", "VOICE-10AM-ENGLISH"],
+        "D-4": ["SMS-10AM-ENGLISH", "SMS-10AM-ENGLISH", "WH-12PM-ENGLISH", "VOICE-10AM-ENGLISH"],
         "D-3": ["-", "-", "-", "-"],
         "D-2": ["-", "-", "-", "-"],
         "D-1": ["-", "-", "-", "-"],
@@ -1652,7 +1652,7 @@ def test_new_customer_fallback_and_summary_json(tmp_path: Path) -> None:
 
     fallback_by_risk = build_average_strategy_by_risk(schedule_csv)
     assert "LOW" in fallback_by_risk
-    assert fallback_by_risk["LOW"]["D-5"] == "SMS-10-ENGLISH"
+    assert fallback_by_risk["LOW"]["D-5"] == "SMS-10AM-ENGLISH"
 
     pred_csv = tmp_path / "predictions.csv"
     pred_df = pd.DataFrame({
@@ -1685,7 +1685,7 @@ def test_new_customer_fallback_and_summary_json(tmp_path: Path) -> None:
             "fallbackRiskUsed": "LOW",
             "vertical": "LAP",
             "day": "D-5",
-            "recommendedStrategy": "SMS-10-ENGLISH",
+            "recommendedStrategy": "SMS-10AM-ENGLISH",
             "isActionable": "true",
             "reason": "Cold-start fallback used for new customer",
         },
@@ -1695,7 +1695,7 @@ def test_new_customer_fallback_and_summary_json(tmp_path: Path) -> None:
             "fallbackRiskUsed": "LOW",
             "vertical": "LAP",
             "day": "D-4",
-            "recommendedStrategy": "SMS-10-ENGLISH",
+            "recommendedStrategy": "SMS-10AM-ENGLISH",
             "isActionable": "true",
             "reason": "Cold-start fallback used for new customer",
         },
@@ -1709,7 +1709,7 @@ def test_new_customer_fallback_and_summary_json(tmp_path: Path) -> None:
     row0 = updated_pred[updated_pred["Loan_number"] == "ACC001"].iloc[0]
     row1 = updated_pred[updated_pred["Loan_number"] == "ACC002"].iloc[0]
     assert row0["IS_NEW_CUSTOMER"] == "True"
-    assert row0["D-5"] == "SMS-10-ENGLISH"
+    assert row0["D-5"] == "SMS-10AM-ENGLISH"
     assert row1["IS_NEW_CUSTOMER"] == "False"
 
     summary = build_prediction_summary(
@@ -1727,7 +1727,7 @@ def test_new_customer_fallback_and_summary_json(tmp_path: Path) -> None:
     assert summary["new_customer_counts"]["existing_customers"] == 1
     assert "fallback_strategy" in summary
     assert "LOW_strategy" in summary["fallback_strategy"]
-    assert summary["fallback_strategy"]["LOW_strategy"]["D-5"] == "SMS-10-ENGLISH"
+    assert summary["fallback_strategy"]["LOW_strategy"]["D-5"] == "SMS-10AM-ENGLISH"
 
 
 def test_load_history_apacs_handles_column_variations_and_leading_zeros(tmp_path: Path) -> None:

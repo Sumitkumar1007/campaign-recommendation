@@ -911,7 +911,27 @@ def store_prediction_snapshots(
 
 
 def _format_scheduler_hour(hour_label: str) -> str:
-    parsed = pd.to_datetime(hour_label.upper(), format="%I%p", errors="coerce")
+    label = hour_label.upper().strip()
+    slot_map = {
+        "8-11": "9AM",
+        "12-3": "12PM",
+        "4-7": "4PM",
+        "MORNING": "9AM",
+        "AFTERNOON": "12PM",
+        "EVENING": "4PM",
+    }
+    if label in slot_map:
+        label = slot_map[label]
+
+    if label.isdigit():
+        h = int(label)
+        if h < 9:
+            h = 9
+        elif h > 18:
+            h = 18
+        label = f"{h}AM" if h < 12 else ("12PM" if h == 12 else f"{h-12}PM")
+
+    parsed = pd.to_datetime(label, format="%I%p", errors="coerce")
     if pd.isna(parsed):
         raise ValueError(f"Invalid strategy hour label: {hour_label!r}")
     return parsed.strftime("%H:00:00")
@@ -920,10 +940,12 @@ def _format_scheduler_hour(hour_label: str) -> str:
 def _parse_strategy(strategy: str) -> tuple[str, str, str] | None:
     if not strategy or strategy == "-" or pd.isna(strategy):
         return None
-    parts = str(strategy).split("-", 2)
-    if len(parts) != 3:
+    parts = [p.strip() for p in str(strategy).split("-") if p.strip()]
+    if len(parts) < 3:
         return None
-    channel, hour_label, language = parts
+    channel = parts[0]
+    language = parts[-1]
+    hour_label = "-".join(parts[1:-1])
     mode = MODE_BY_STRATEGY_CHANNEL.get(channel.upper())
     if mode is None:
         return None

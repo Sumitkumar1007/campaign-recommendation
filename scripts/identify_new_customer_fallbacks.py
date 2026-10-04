@@ -103,8 +103,43 @@ def load_history_apacs(communication_files: list[Path]) -> set[str]:
     return history
 
 
+def normalize_fallback_strategy(strategy: str) -> str:
+    if not strategy or strategy == "-" or pd.isna(strategy):
+        return "-"
+    parts = [p.strip() for p in str(strategy).split("-") if p.strip()]
+    if len(parts) < 3:
+        return strategy
+    channel = parts[0]
+    language = parts[-1]
+    raw_hour = "-".join(parts[1:-1]).upper()
+
+    slot_map = {
+        "8-11": "9AM",
+        "12-3": "12PM",
+        "4-7": "4PM",
+        "MORNING": "9AM",
+        "AFTERNOON": "12PM",
+        "EVENING": "4PM",
+    }
+
+    if raw_hour in slot_map:
+        hour_str = slot_map[raw_hour]
+    elif raw_hour.isdigit():
+        h = int(raw_hour)
+        if h < 9:
+            h = 9
+        elif h > 18:
+            h = 18
+        hour_str = f"{h}AM" if h < 12 else ("12PM" if h == 12 else f"{h-12}PM")
+    else:
+        hour_str = raw_hour
+
+    return f"{channel}-{hour_str}-{language}"
+
+
 def most_common_strategy(values: pd.Series) -> str:
     normalized = values.fillna("").astype(str).str.strip()
+    normalized = normalized.map(normalize_fallback_strategy)
     normalized = normalized[normalized.ne("") & normalized.ne("-")]
     if normalized.empty:
         return "-"
