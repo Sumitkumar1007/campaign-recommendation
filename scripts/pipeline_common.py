@@ -40,12 +40,19 @@ def apply_predue_risk_rules(df: pd.DataFrame, default_strategy: str = DEFAULT_PR
     risk_col = "SOURCE_RISK" if "SOURCE_RISK" in df.columns else ("RISK" if "RISK" in df.columns else None)
     other_predue_days = ["D-4", "D-3", "D-2", "D-1"]
 
+    def get_first_valid_communication(val: str) -> str:
+        if "|" not in val:
+            return val.strip()
+        for p in val.split("|"):
+            p = p.strip()
+            if p not in ("", "-", "None", "nan"):
+                return p
+        return "-"
+
     # 1. Enforce single communication per day across all pre-due days
     for day in PREDUE_DAY_COLUMNS:
         if day in df.columns:
-            df[day] = df[day].fillna("-").astype(str).apply(
-                lambda val: val.split("|")[0].strip() if "|" in val else val.strip()
-            )
+            df[day] = df[day].fillna("-").astype(str).apply(get_first_valid_communication)
 
     for idx, row in df.iterrows():
         risk_raw = str(row[risk_col]).upper().strip() if risk_col and pd.notna(row[risk_col]) else "LOW"
