@@ -404,13 +404,22 @@ def process_chunk(
         comm_date_val = row.get("date")
         comm_date_str = comm_date_val.strftime("%Y-%m-%d") if pd.notna(comm_date_val) else ""
 
-        if pay_unique_id and link_ref_numbers and pay_unique_id in link_ref_numbers:
-            return 1, 0, 1
-        if comm_date_str and external_payment_dates and (entity, comm_date_str) in external_payment_dates:
-            return 0, 1, 1
-        if (entity, month) in paid_keys:
-            return 0, 1, 1
-        return 0, 0, 0
+        is_link = 1 if (pay_unique_id and link_ref_numbers and pay_unique_id in link_ref_numbers) else 0
+        
+        is_ext = 0
+        # Only assign external payment flag if there was actually an external payment for this account
+        if not is_link and ext_pay_counts and ext_pay_counts.get((entity, month), 0) > 0:
+            if comm_date_str and external_payment_dates and (entity, comm_date_str) in external_payment_dates:
+                is_ext = 1
+            else:
+                # Fallback: if there was an external payment this month, but we couldn't match the exact date,
+                # we don't blindly flag EVERY communication as an external payment for the daily counts.
+                # Since we want accurate daily counts, we only flag it if the date matches.
+                # (The monthly total is handled safely downstream in build_monthly_feature_dataset.py)
+                pass
+
+        is_any = 1 if (is_link or is_ext) else 0
+        return is_link, is_ext, is_any
 
     df["SUCCESS_SCORE"] = df.apply(success_score, axis=1)
     p_flags = df.apply(get_payment_flags, axis=1)
@@ -452,23 +461,17 @@ def process_chunk(
             entity = str(r[key_col]).strip()
             month = str(r["MONTH"]).strip().upper()
             k = (entity, month)
-            l_c = (link_pay_counts or {}).get(k, 0)
-            if l_c > 0:
-                link_pay_feats.at[idx, "count"] = float(l_c)
+            link_pay_feats.at[idx, "count"] = float((link_pay_counts or {}).get(k, 0))
         for idx, r in ext_pay_feats.iterrows():
             entity = str(r[key_col]).strip()
             month = str(r["MONTH"]).strip().upper()
             k = (entity, month)
-            e_c = (ext_pay_counts or {}).get(k, 0)
-            if e_c > 0:
-                ext_pay_feats.at[idx, "count"] = float(e_c)
+            ext_pay_feats.at[idx, "count"] = float((ext_pay_counts or {}).get(k, 0))
         for idx, r in tot_pay_feats.iterrows():
             entity = str(r[key_col]).strip()
             month = str(r["MONTH"]).strip().upper()
             k = (entity, month)
-            t_c = (tot_pay_counts or {}).get(k, 0)
-            if t_c > 0:
-                tot_pay_feats.at[idx, "count"] = float(t_c)
+            tot_pay_feats.at[idx, "count"] = float((tot_pay_counts or {}).get(k, 0))
 
     failed = (
         df.loc[~df["IS_SUCCESS"]]
