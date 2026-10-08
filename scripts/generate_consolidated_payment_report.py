@@ -178,6 +178,7 @@ def generate_consolidated_payment_report(
                 if not apac_col:
                     continue
 
+                chunk["APAC_CARD_NUMBER"] = chunk[apac_col].fillna("").astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
                 created_by_col = "created_by" if "created_by" in chunk.columns else ("CREATED_BY" if "CREATED_BY" in chunk.columns else "")
                 ref_col = "reference_number" if "reference_number" in chunk.columns else "REFERENCE_NUMBER"
                 dt_col = "payment_datetime" if "payment_datetime" in chunk.columns else "PAYMENT_DATETIME"
