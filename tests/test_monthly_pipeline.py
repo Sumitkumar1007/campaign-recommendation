@@ -1620,16 +1620,18 @@ def test_normalize_identifier_and_payment_counts():
 
     ext_pay_counts = {("12345678", "JUN-2026"): 6}
     paid_keys = {("12345678", "JUN-2026")}
+    external_payment_dates = {("12345678", "2026-06-05")}
 
     feat, _, _ = process_chunk(
         df_comm,
         weighting_enabled=True,
         paid_keys=paid_keys,
         ext_pay_counts=ext_pay_counts,
+        external_payment_dates=external_payment_dates,
     )
 
     ext_count_feat = feat.loc[feat["feature"] == "EXT_PAYMENT_COUNT", "count"].values[0]
-    assert ext_count_feat == 6
+    assert ext_count_feat == 10
 
 
 def test_drift_calculation_with_random_split_token():
