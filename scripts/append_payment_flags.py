@@ -96,10 +96,17 @@ def load_paid_keys(
             usecols.append("PAYMENT_DATETIME")
         if "reference_number" in header:
             usecols.append("reference_number")
+        if "payment_unique_id" in header:
+            usecols.append("payment_unique_id")
         if "month" in header:
             usecols.append("month")
         if "payment_flag" in header:
             usecols.append("payment_flag")
+        if "created_by" in header:
+            usecols.append("created_by")
+
+        LINK_CREATED_BY = {"-2", "pull-status", "system"}
+        EXT_CREATED_BY = {"fetch-status", "ubp"}
 
         for chunk in pd.read_csv(payment_file, usecols=usecols, dtype=str, chunksize=200_000):
             apacs = normalize_apac(chunk["apac_card_number"])
@@ -114,9 +121,11 @@ def load_paid_keys(
 
             months = m_col.replace({"": None}).fillna(dt_months.replace({"": None})).fillna(month_label if month_label else "")
             ref_nums = chunk["reference_number"].fillna("").astype(str).str.strip() if "reference_number" in chunk.columns else pd.Series("", index=chunk.index)
+            pay_unique_ids = chunk["payment_unique_id"].fillna("").astype(str).str.strip() if "payment_unique_id" in chunk.columns else pd.Series("", index=chunk.index)
             flags = chunk["payment_flag"].fillna("").astype(str).str.upper().str.strip() if "payment_flag" in chunk.columns else pd.Series("", index=chunk.index)
+            created_bys = chunk["created_by"].fillna("").astype(str).str.lower().str.strip() if "created_by" in chunk.columns else pd.Series("", index=chunk.index)
 
-            for apac, month, date_str, ref_num, flag in zip(apacs, months, date_strs, ref_nums, flags, strict=False):
+            for apac, month, date_str, ref_num, pay_uid, flag, created_by_val in zip(apacs, months, date_strs, ref_nums, pay_unique_ids, flags, created_bys, strict=False):
                 if not apac or not month or month == "UNKNOWN":
                     continue
                 normalized_month = str(month).upper().strip()
@@ -125,6 +134,13 @@ def load_paid_keys(
                 if flag == "NO_COMMUNICATION_PAYMENT":
                     continue
 
+                # Determine payment type if flag is not set directly
+                if not flag:
+                    if created_by_val in LINK_CREATED_BY:
+                        flag = "LINK_PAYMENT"
+                    elif created_by_val in EXT_CREATED_BY:
+                        flag = "EXTERNAL_PAYMENT"
+
                 paid.add(key)
                 fetched_months.add(normalized_month)
                 tot_pay_counts[key] = tot_pay_counts.get(key, 0) + 1
@@ -132,20 +148,24 @@ def load_paid_keys(
                 if flag == "LINK_PAYMENT":
                     if ref_num:
                         link_ref_numbers.add(ref_num)
+                    if pay_uid:
+                        link_ref_numbers.add(pay_uid)
                     link_pay_counts[key] = link_pay_counts.get(key, 0) + 1
                 elif flag == "EXTERNAL_PAYMENT":
                     ext_pay_counts[key] = ext_pay_counts.get(key, 0) + 1
                     if date_str and pd.notna(date_str):
                         external_payment_dates.add((apac, str(date_str)))
                 else:
-                    if ref_num:
-                        link_ref_numbers.add(ref_num)
+                    if ref_num or pay_uid or created_by_val in LINK_CREATED_BY:
+                        if ref_num:
+                            link_ref_numbers.add(ref_num)
+                        if pay_uid:
+                            link_ref_numbers.add(pay_uid)
                         link_pay_counts[key] = link_pay_counts.get(key, 0) + 1
                     else:
                         ext_pay_counts[key] = ext_pay_counts.get(key, 0) + 1
-
-                if apac and date_str and pd.notna(date_str):
-                    external_payment_dates.add((apac, str(date_str)))
+                        if date_str and pd.notna(date_str):
+                            external_payment_dates.add((apac, str(date_str)))
 
     return paid, fetched_months, link_ref_numbers, external_payment_dates, link_pay_counts, ext_pay_counts, tot_pay_counts
 
