@@ -178,9 +178,12 @@ def generate_consolidated_payment_report(
                 if not apac_col:
                     continue
 
-                chunk["APAC_CARD_NUMBER"] = chunk[apac_col].fillna("").astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+                created_by_col = "created_by" if "created_by" in chunk.columns else ("CREATED_BY" if "CREATED_BY" in chunk.columns else "")
                 ref_col = "reference_number" if "reference_number" in chunk.columns else "REFERENCE_NUMBER"
                 dt_col = "payment_datetime" if "payment_datetime" in chunk.columns else "PAYMENT_DATETIME"
+
+                LINK_CREATED_BY = {"-2", "pull-status", "system"}
+                EXT_CREATED_BY = {"fetch-status", "ubp"}
 
                 for _, row in chunk.iterrows():
                     apac = row["APAC_CARD_NUMBER"]
@@ -188,6 +191,8 @@ def generate_consolidated_payment_report(
                         continue
                     clean_apac = apac.lstrip("0")
                     ref_num = str(row.get(ref_col, "") or "").strip() if ref_col else ""
+                    created_by_val = str(row.get(created_by_col, "") or "").strip() if created_by_col else ""
+                    created_by_lower = created_by_val.lower()
                     pay_dt_raw = row.get(dt_col, "") if dt_col else ""
                     pay_dt = pd.to_datetime(pay_dt_raw, errors="coerce") if pd.notna(pay_dt_raw) else pd.NaT
 
@@ -199,30 +204,9 @@ def generate_consolidated_payment_report(
                         month_label = file_month_label if file_month_label else "UNKNOWN"
                         pay_date_str = ""
 
-                    # Classification logic
-                    payment_flag = "UNKNOWN"
-                    matched_comm_type = ""
-                    matched_comm_date = ""
-                    matched_pay_id = ""
-                    payment_multiplier = 1.0
-
-                    # Check 1: Link Payment Match (p.reference_number == c.payment_unique_id)
-                    if ref_num and ref_num in comm_unique_ids:
-                        payment_flag = "LINK_PAYMENT"
-                        comm_info = comm_unique_ids[ref_num]
-                        matched_comm_type = comm_info["communication_type"]
-                        matched_comm_date = comm_info["comm_date"]
-                        matched_pay_id = comm_info["payment_unique_id"]
-                        payment_multiplier = 5.0
-                        match_verdict = "VALID_LINK_PAYMENT"
-
-                    # Check 2: External Payment Match (p.apac_card_number in communication dataset & date/month match)
-                    elif apac in all_comm_apacs or (clean_apac and clean_apac in all_comm_apacs):
-                        payment_flag = "EXTERNAL_PAYMENT"
-                        matched_comm_date = pay_date_str
-                        payment_multiplier = 2.5
-                        match_verdict = "VALID_EXTERNAL_PAYMENT"
-                        ext_comm_info = (
+                    # Helper to find matching communication info by apac & date/month
+                    def find_comm_info_by_apac() -> dict[str, str] | None:
+                        return (
                             comm_account_date_ids.get((apac, pay_date_str))
                             or comm_account_date_ids.get((clean_apac, pay_date_str))
                             or comm_account_month_ids.get((apac, month_label))
@@ -230,27 +214,92 @@ def generate_consolidated_payment_report(
                             or comm_account_latest_id.get(apac)
                             or comm_account_latest_id.get(clean_apac)
                         )
-                        if ext_comm_info:
-                            matched_pay_id = ext_comm_info.get("payment_unique_id", "")
-                            matched_comm_type = ext_comm_info.get("communication_type", "")
-                            if not matched_comm_date:
-                                matched_comm_date = ext_comm_info.get("comm_date", "")
-                        if not matched_pay_id:
-                            matched_pay_id = ref_num if ref_num else f"EXT-{apac}-{pay_date_str or month_label}"
 
-                    # Check 3: APAC not found in communication dataset
+                    # Classification logic
+                    payment_flag = "UNKNOWN"
+                    matched_comm_type = ""
+                    matched_comm_date = ""
+                    matched_pay_id = ""
+                    payment_multiplier = 1.0
+
+                    if created_by_lower in LINK_CREATED_BY:
+                        payment_flag = "LINK_PAYMENT"
+                        payment_multiplier = 5.0
+                        match_verdict = "VALID_LINK_PAYMENT"
+
+                        # 1. Primary link match: reference_number == payment_unique_id
+                        if ref_num and ref_num in comm_unique_ids:
+                            comm_info = comm_unique_ids[ref_num]
+                            matched_comm_type = comm_info["communication_type"]
+                            matched_comm_date = comm_info["comm_date"]
+                            matched_pay_id = comm_info["payment_unique_id"]
+                        else:
+                            # 2. Secondary fallback: check via apac_card in communication logs
+                            comm_info = find_comm_info_by_apac()
+                            if comm_info:
+                                matched_pay_id = comm_info.get("payment_unique_id", ref_num)
+                                matched_comm_type = comm_info.get("communication_type", "")
+                                matched_comm_date = comm_info.get("comm_date", pay_date_str)
+                            else:
+                                matched_pay_id = ref_num if ref_num else f"LINK-{apac}-{pay_date_str or month_label}"
+                                matched_comm_date = pay_date_str
+
+                    elif created_by_lower in EXT_CREATED_BY:
+                        if apac in all_comm_apacs or (clean_apac and clean_apac in all_comm_apacs):
+                            payment_flag = "EXTERNAL_PAYMENT"
+                            payment_multiplier = 2.5
+                            match_verdict = "VALID_EXTERNAL_PAYMENT"
+                            matched_comm_date = pay_date_str
+                            ext_comm_info = find_comm_info_by_apac()
+                            if ext_comm_info:
+                                matched_pay_id = ext_comm_info.get("payment_unique_id", "")
+                                matched_comm_type = ext_comm_info.get("communication_type", "")
+                                if not matched_comm_date:
+                                    matched_comm_date = ext_comm_info.get("comm_date", "")
+                            if not matched_pay_id:
+                                matched_pay_id = ref_num if ref_num else f"EXT-{apac}-{pay_date_str or month_label}"
+                        else:
+                            payment_flag = "NO_COMMUNICATION_PAYMENT"
+                            payment_multiplier = 1.0
+                            match_verdict = "UNCONTACTED_ACCOUNT_PAYMENT"
+                            matched_pay_id = ref_num if ref_num else f"NOC-{apac}-{pay_date_str or month_label}"
+
                     else:
-                        payment_flag = "NO_COMMUNICATION_PAYMENT"
-                        payment_multiplier = 1.0
-                        match_verdict = "UNCONTACTED_ACCOUNT_PAYMENT"
-                        matched_pay_id = ref_num if ref_num else f"NOC-{apac}-{pay_date_str or month_label}"
+                        # Fallback for unknown / legacy created_by values
+                        if ref_num and ref_num in comm_unique_ids:
+                            payment_flag = "LINK_PAYMENT"
+                            comm_info = comm_unique_ids[ref_num]
+                            matched_comm_type = comm_info["communication_type"]
+                            matched_comm_date = comm_info["comm_date"]
+                            matched_pay_id = comm_info["payment_unique_id"]
+                            payment_multiplier = 5.0
+                            match_verdict = "VALID_LINK_PAYMENT"
+                        elif apac in all_comm_apacs or (clean_apac and clean_apac in all_comm_apacs):
+                            payment_flag = "EXTERNAL_PAYMENT"
+                            matched_comm_date = pay_date_str
+                            payment_multiplier = 2.5
+                            match_verdict = "VALID_EXTERNAL_PAYMENT"
+                            ext_comm_info = find_comm_info_by_apac()
+                            if ext_comm_info:
+                                matched_pay_id = ext_comm_info.get("payment_unique_id", "")
+                                matched_comm_type = ext_comm_info.get("communication_type", "")
+                                if not matched_comm_date:
+                                    matched_comm_date = ext_comm_info.get("comm_date", "")
+                            if not matched_pay_id:
+                                matched_pay_id = ref_num if ref_num else f"EXT-{apac}-{pay_date_str or month_label}"
+                        else:
+                            payment_flag = "NO_COMMUNICATION_PAYMENT"
+                            payment_multiplier = 1.0
+                            match_verdict = "UNCONTACTED_ACCOUNT_PAYMENT"
+                            matched_pay_id = ref_num if ref_num else f"NOC-{apac}-{pay_date_str or month_label}"
 
                     report_rows.append(
                         {
                             "apac_card_number": apac,
                             "payment_datetime": pay_dt_raw if pay_dt_raw else "",
                             "reference_number": ref_num,
-                            "payment_unique_id": matched_pay_id,  # Blank for external/uncontacted payments
+                            "created_by": created_by_val,
+                            "payment_unique_id": matched_pay_id,
                             "month": month_label,
                             "payment_flag": payment_flag,
                             "match_verdict": match_verdict,
@@ -279,6 +328,7 @@ def generate_consolidated_payment_report(
                 "apac_card_number",
                 "payment_datetime",
                 "reference_number",
+                "created_by",
                 "payment_unique_id",
                 "month",
                 "payment_flag",

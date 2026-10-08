@@ -40,7 +40,8 @@ def build_query(schema: str, table: str) -> sql.Composed:
             apac_card_number,
             amount,
             payment_datetime,
-            reference_number
+            reference_number,
+            created_by
         FROM {table_ref}
         WHERE (
             payment_datetime::text LIKE %(month_prefix)s
@@ -122,7 +123,7 @@ def main() -> None:
         import traceback
         print(f"Error in fetch_payments_from_postgres | schema={schema_str} table={table_str} source_month={source_month_str}: {e}")
         traceback.print_exc()
-        df = pd.DataFrame(columns=["apac_card_number", "amount", "payment_datetime", "reference_number"])
+        df = pd.DataFrame(columns=["apac_card_number", "amount", "payment_datetime", "reference_number", "created_by"])
 
     if output_file is None:
         output_file = PAYMENT_DATA_DIR / "payment_data_fallback.csv"

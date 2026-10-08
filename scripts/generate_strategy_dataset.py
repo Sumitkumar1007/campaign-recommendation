@@ -456,22 +456,9 @@ def process_chunk(
     )
     tot_pay_feats["feature"] = "TOTAL_PAYMENT_COUNT"
 
-    if link_pay_counts or ext_pay_counts or tot_pay_counts:
-        for idx, r in link_pay_feats.iterrows():
-            entity = str(r[key_col]).strip()
-            month = str(r["MONTH"]).strip().upper()
-            k = (entity, month)
-            link_pay_feats.at[idx, "count"] = float((link_pay_counts or {}).get(k, 0))
-        for idx, r in ext_pay_feats.iterrows():
-            entity = str(r[key_col]).strip()
-            month = str(r["MONTH"]).strip().upper()
-            k = (entity, month)
-            ext_pay_feats.at[idx, "count"] = float((ext_pay_counts or {}).get(k, 0))
-        for idx, r in tot_pay_feats.iterrows():
-            entity = str(r[key_col]).strip()
-            month = str(r["MONTH"]).strip().upper()
-            k = (entity, month)
-            tot_pay_feats.at[idx, "count"] = float((tot_pay_counts or {}).get(k, 0))
+    # (Removed) Do not overwrite daily counts with monthly totals.
+    # We want payment counts to strictly reflect the exact day they occurred.
+    pass
 
     failed = (
         df.loc[~df["IS_SUCCESS"]]
