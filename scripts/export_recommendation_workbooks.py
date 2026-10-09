@@ -82,7 +82,7 @@ def parse_args() -> ExportConfig:
     parser.add_argument("--source-month", required=True)
     parser.add_argument("--prediction-month", required=True)
     parser.add_argument("--model", default=os.getenv("MODEL_NAME", "catboost_3m"))
-    parser.add_argument("--output-dir", default=os.getenv("SFTP_EXPORT_PATH", str(DEFAULT_OUTPUT_DIR)))
+    parser.add_argument("--output-dir", default=os.getenv("EXPORT_PATH", os.getenv("LOCAL_EXPORT_PATH", os.getenv("SFTP_EXPORT_PATH", str(DEFAULT_OUTPUT_DIR)))))
     parser.add_argument("--write", action="store_true", help="Actually create XLSX files.")
     parser.add_argument("--sftp-upload", action="store_true", default=env_flag("SFTP_UPLOAD_ENABLED", False))
     parser.add_argument("--sftp-host", default=os.getenv("SFTP_HOST", ""))
