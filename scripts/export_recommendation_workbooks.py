@@ -64,6 +64,8 @@ class ExportConfig:
     prediction_month: str
     model: str
     output_dir: Path
+    dataset_output_dir: Path
+    scheduler_output_dir: Path
     write: bool
     sftp: SFTPConfig
 
@@ -83,6 +85,16 @@ def parse_args() -> ExportConfig:
     parser.add_argument("--prediction-month", required=True)
     parser.add_argument("--model", default=os.getenv("MODEL_NAME", "catboost_3m"))
     parser.add_argument("--output-dir", default=os.getenv("EXPORT_PATH", os.getenv("LOCAL_EXPORT_PATH", os.getenv("SFTP_EXPORT_PATH", str(DEFAULT_OUTPUT_DIR)))))
+    parser.add_argument(
+        "--dataset-output-dir",
+        default=os.getenv("LOCAL_EXPORT_DATASET_PATH", os.getenv("EXPORT_DATASET_PATH", os.getenv("EXPORT_PATH", os.getenv("LOCAL_EXPORT_PATH", os.getenv("SFTP_EXPORT_PATH", str(DEFAULT_OUTPUT_DIR)))))),
+        help="Target directory for dataset XLSX export.",
+    )
+    parser.add_argument(
+        "--scheduler-output-dir",
+        default=os.getenv("LOCAL_EXPORT_SCHEDULER_PATH", os.getenv("EXPORT_SCHEDULER_PATH", os.getenv("EXPORT_PATH", os.getenv("LOCAL_EXPORT_PATH", os.getenv("SFTP_EXPORT_PATH", str(DEFAULT_OUTPUT_DIR)))))),
+        help="Target directory for scheduler XLSX export.",
+    )
     parser.add_argument("--write", action="store_true", help="Actually create XLSX files.")
     parser.add_argument("--sftp-upload", action="store_true", default=env_flag("SFTP_UPLOAD_ENABLED", False))
     parser.add_argument("--sftp-host", default=os.getenv("SFTP_HOST", ""))
@@ -115,6 +127,8 @@ def parse_args() -> ExportConfig:
     source_month = normalize_month_label(args.source_month)
     prediction_month = normalize_month_label(args.prediction_month)
     output_dir = Path(args.output_dir)
+    dataset_output_dir = Path(args.dataset_output_dir)
+    scheduler_output_dir = Path(args.scheduler_output_dir)
     sftp = SFTPConfig(
         enabled=bool(args.sftp_upload),
         host=str(args.sftp_host).strip(),
@@ -147,6 +161,8 @@ def parse_args() -> ExportConfig:
         prediction_month=prediction_month,
         model=str(args.model),
         output_dir=output_dir,
+        dataset_output_dir=dataset_output_dir,
+        scheduler_output_dir=scheduler_output_dir,
         write=bool(args.write),
         sftp=sftp,
     )
@@ -378,8 +394,10 @@ def main() -> None:
 
     dataset_rows = build_dataset_rows(campaigns, schema=args.schema, campaign_table=args.campaign_table, mapping_table=args.mapping_table)
     scheduler_rows = build_scheduler_rows(campaigns, reasons)
-    dataset_path = next_output_path(args.output_dir, 'MD_UB_DATASET')
-    scheduler_path = next_output_path(args.output_dir, 'MD_UB_SCHEDULER')
+    args.dataset_output_dir.mkdir(parents=True, exist_ok=True)
+    args.scheduler_output_dir.mkdir(parents=True, exist_ok=True)
+    dataset_path = next_output_path(args.dataset_output_dir, 'MD_UB_DATASET')
+    scheduler_path = next_output_path(args.scheduler_output_dir, 'MD_UB_SCHEDULER')
 
     print(f'dataset_rows={len(dataset_rows)} path={dataset_path}')
     print(f'scheduler_rows={len(scheduler_rows)} path={scheduler_path}')
