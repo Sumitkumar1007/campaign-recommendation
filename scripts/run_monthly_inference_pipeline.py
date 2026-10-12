@@ -33,9 +33,15 @@ from pipeline_common import (
     PREDUE_DAY_COLUMNS,
     SCHEDULE_DAY_COLUMNS,
     build_feature_matrix,
+    get_configured_default_template,
+    get_first_valid_communication,
+    load_default_config,
+    offsets_to_day_columns,
     prepare_next_month_dataset,
+    snap_hour_to_window,
     split_by_source_month,
 )
+# pyrefly: ignore [missing-import]
 from postgres_utils import PostgresConfig, connect_db, qualified_identifier
 from predict_next_month_strategy_catboost import build_prediction_population, load_base_population
 from project_paths import (
@@ -47,6 +53,7 @@ from project_paths import (
     MODEL_DIR,
     PAYMENT_DATA_DIR,
     PREDICTIONS_DIR,
+    REPO_ROOT,
     SCHEDULE_DATA_DIR,
     SCRIPTS_DIR,
     TRAINING_DATA_DIR,
@@ -220,6 +227,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         default=True,
         help="Suppress recommendations on Sundays [default: True].",
+    )
+    parser.add_argument(
+        "--config-file",
+        default=os.getenv("CONFIG_FILE", str(REPO_ROOT / "config" / "default_config.json")),
+        help="Path to JSON configuration file (default: config/default_config.json).",
     )
     args = parser.parse_args()
     missing = [
@@ -910,7 +922,7 @@ def store_prediction_snapshots(
     return len(rows)
 
 
-def _format_scheduler_hour(hour_label: str) -> str:
+def _format_scheduler_hour(hour_label: str, send_hour_window: dict[str, int] | None = None) -> str:
     label = hour_label.upper().strip()
     slot_map = {
         "8-11": "9AM",
@@ -934,10 +946,13 @@ def _format_scheduler_hour(hour_label: str) -> str:
     parsed = pd.to_datetime(label, format="%I%p", errors="coerce")
     if pd.isna(parsed):
         raise ValueError(f"Invalid strategy hour label: {hour_label!r}")
-    return parsed.strftime("%H:00:00")
+    hour_val = parsed.hour
+    if send_hour_window is not None:
+        hour_val = snap_hour_to_window(hour_val, send_hour_window)
+    return f"{hour_val:02d}:00:00"
 
 
-def _parse_strategy(strategy: str) -> tuple[str, str, str] | None:
+def _parse_strategy(strategy: str, send_hour_window: dict[str, int] | None = None) -> tuple[str, str, str] | None:
     if not strategy or strategy == "-" or pd.isna(strategy):
         return None
     parts = [p.strip() for p in str(strategy).split("-") if p.strip()]
@@ -950,7 +965,7 @@ def _parse_strategy(strategy: str) -> tuple[str, str, str] | None:
     if mode is None:
         return None
     normalized_language = extract_base_language(language)
-    return mode, _format_scheduler_hour(hour_label), normalized_language
+    return mode, _format_scheduler_hour(hour_label, send_hour_window=send_hour_window), normalized_language
 
 
 def _due_bucket(day: str, *, configured_emi_dates: list[str] | None = None) -> tuple[str, str, str]:
@@ -1086,25 +1101,35 @@ def resolve_template_name(
     language: str,
     digital_rule_id_map: dict[tuple[str, str, str], str] | None = None,
     digital_rules_lookup: dict[tuple[str, str, str], str] | None = None,
+    default_templates: dict[str, object] | list | None = None,
 ) -> str:
     """
     Resolves template_name by looking up digital_rule_id for (loan_number, mode, language),
     and retrieving the iteration value from digital_rules.
-    Falls back to default formatted template name if missing/not found.
+    Falls back to configured default_templates if missing/not found,
+    and finally to default synthesized template name.
     """
-    default_name = _template_name(due_type=due_type, mode=mode, language=language)
-    if not digital_rule_id_map or not digital_rules_lookup:
-        return default_name
-
     mode_u = mode.strip().upper()
     lang_u = language.strip().upper()
 
-    rule_id = digital_rule_id_map.get((loan_number, mode_u, lang_u)) or digital_rule_id_map.get((loan_number, mode_u, ""))
-    if not rule_id:
-        return default_name
+    if digital_rule_id_map and digital_rules_lookup:
+        rule_id = digital_rule_id_map.get((loan_number, mode_u, lang_u)) or digital_rule_id_map.get((loan_number, mode_u, ""))
+        if rule_id:
+            template_name = digital_rules_lookup.get((rule_id, mode_u, lang_u)) or digital_rules_lookup.get((rule_id, mode_u, ""))
+            if template_name:
+                return template_name
 
-    template_name = digital_rules_lookup.get((rule_id, mode_u, lang_u)) or digital_rules_lookup.get((rule_id, mode_u, ""))
-    return template_name or default_name
+    configured_default = get_configured_default_template(
+        default_templates,
+        due_type=due_type,
+        mode=mode,
+        language=language,
+    )
+    if configured_default:
+        return configured_default
+
+    return _template_name(due_type=due_type, mode=mode, language=language)
+
 
 
 def _dataset_time_label(value: str) -> str:
@@ -1655,18 +1680,29 @@ def _build_campaign_assignment_groups(
     run_token: str,
     digital_rule_id_map: dict[tuple[str, str, str], str] | None = None,
     digital_rules_lookup: dict[tuple[str, str, str], str] | None = None,
+    campaign_days: list[str] | None = None,
+    send_hour_window: dict[str, int] | None = None,
+    single_communication_per_day: bool = False,
+    default_templates: dict[str, object] | list | None = None,
 ) -> pd.DataFrame:
     df = pd.read_csv(prediction_file, dtype=str).fillna("")
     df = df[df["MONTH"] == prediction_month_label].copy()
     rows: list[dict] = []
 
+    days_to_process = [d for d in (campaign_days or ALL_CAMPAIGN_DAYS) if d in df.columns]
     for _, row in df.iterrows():
         loan_number = str(row["Loan_number"])
         risk = str(row.get("SOURCE_RISK", row.get("RISK", "LOW"))).upper()
         risk_code = RISK_CODES.get(risk, "LR")
-        for day in ALL_CAMPAIGN_DAYS:
-            for strategy in str(row.get(day, "")).split("|"):
-                parsed = _parse_strategy(strategy.strip())
+        for day in days_to_process:
+            raw_val = str(row.get(day, ""))
+            if single_communication_per_day:
+                first_strat = get_first_valid_communication(raw_val)
+                strategies = [first_strat] if first_strat not in ("", "-") else []
+            else:
+                strategies = [s.strip() for s in raw_val.split("|") if s.strip() not in ("", "-")]
+            for strategy in strategies:
+                parsed = _parse_strategy(strategy, send_hour_window=send_hour_window)
                 if parsed is None:
                     continue
                 mode, send_time, language = parsed
@@ -1681,6 +1717,7 @@ def _build_campaign_assignment_groups(
                     language=language,
                     digital_rule_id_map=digital_rule_id_map,
                     digital_rules_lookup=digital_rules_lookup,
+                    default_templates=default_templates,
                 )
                 emi_cycle = _resolve_row_emi_cycle(row, emi_cycles)
                 dataset_name = f"{due_type}|{NAME_CHANNEL_BY_MODE[mode]}|{vertical_value}|{language}|{risk_code}|{emi_cycle}"
@@ -1772,7 +1809,14 @@ def _prepare_campaign_outputs(
     run_date: datetime | None = None,
     digital_rule_id_map: dict[tuple[str, str, str], str] | None = None,
     digital_rules_lookup: dict[tuple[str, str, str], str] | None = None,
+    campaign_days: list[str] | None = None,
+    allowed_day_offsets: list[int | str] | None = None,
+    send_hour_window: dict[str, int] | None = None,
+    single_communication_per_day: bool = False,
+    default_templates: dict[str, object] | list | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if allowed_day_offsets is not None and campaign_days is None:
+        campaign_days = offsets_to_day_columns(allowed_day_offsets)
     run_token = (run_date or datetime.now(timezone.utc)).strftime("%d%m%y")
     assignment_groups = _build_campaign_assignment_groups(
         prediction_file,
@@ -1787,6 +1831,10 @@ def _prepare_campaign_outputs(
         run_token=run_token,
         digital_rule_id_map=digital_rule_id_map,
         digital_rules_lookup=digital_rules_lookup,
+        campaign_days=campaign_days,
+        send_hour_window=send_hour_window,
+        single_communication_per_day=single_communication_per_day,
+        default_templates=default_templates,
     )
     if assignment_groups.empty:
         empty_campaigns = pd.DataFrame(
@@ -1931,6 +1979,11 @@ def build_campaign_recommendations(
     vertical: str,
     vendors: list[str],
     run_date: datetime | None = None,
+    campaign_days: list[str] | None = None,
+    allowed_day_offsets: list[int | str] | None = None,
+    send_hour_window: dict[str, int] | None = None,
+    single_communication_per_day: bool = False,
+    default_templates: dict[str, object] | list | None = None,
 ) -> pd.DataFrame:
     campaign_rows, _ = _prepare_campaign_outputs(
         prediction_file,
@@ -1941,6 +1994,11 @@ def build_campaign_recommendations(
         vertical=vertical,
         vendors=vendors,
         run_date=run_date,
+        campaign_days=campaign_days,
+        allowed_day_offsets=allowed_day_offsets,
+        send_hour_window=send_hour_window,
+        single_communication_per_day=single_communication_per_day,
+        default_templates=default_templates,
     )
     return campaign_rows
 
@@ -1955,6 +2013,11 @@ def build_campaign_mappings(
     vertical: str,
     vendors: list[str],
     run_date: datetime | None = None,
+    campaign_days: list[str] | None = None,
+    allowed_day_offsets: list[int | str] | None = None,
+    send_hour_window: dict[str, int] | None = None,
+    single_communication_per_day: bool = False,
+    default_templates: dict[str, object] | list | None = None,
 ) -> pd.DataFrame:
     _, mapping_rows = _prepare_campaign_outputs(
         prediction_file,
@@ -1965,6 +2028,11 @@ def build_campaign_mappings(
         vertical=vertical,
         vendors=vendors,
         run_date=run_date,
+        campaign_days=campaign_days,
+        allowed_day_offsets=allowed_day_offsets,
+        send_hour_window=send_hour_window,
+        single_communication_per_day=single_communication_per_day,
+        default_templates=default_templates,
     )
     return mapping_rows
 
@@ -3280,6 +3348,18 @@ def main() -> None:
                     )
                     digital_rules_lookup = fetch_digital_rules_lookup(conn, schema=args.source_schema or args.target_schema, logger=logger)
                     digital_rule_id_map = build_latest_digital_rule_map(history_files, logger=logger)
+                    app_config = load_default_config(args.config_file) if getattr(args, "config_file", None) else {}
+                    allowed_offsets = app_config.get("allowed_day_offsets")
+                    configured_campaign_days = offsets_to_day_columns(allowed_offsets) if allowed_offsets is not None else None
+                    configured_send_hour_window = app_config.get("send_hour_window")
+                    configured_default_templates = app_config.get("default_templates")
+                    if configured_campaign_days is not None:
+                        logger.info("Using configured campaign days from %s: %s", args.config_file, configured_campaign_days)
+                    if configured_send_hour_window is not None:
+                        logger.info("Using configured send hour window from %s: %s", args.config_file, configured_send_hour_window)
+                    if configured_default_templates is not None:
+                        logger.info("Using configured default templates from %s", args.config_file)
+
                     campaign_df, mapping_df = _prepare_campaign_outputs(
                         prediction_file,
                         source_month_label=source_month_label,
@@ -3292,6 +3372,10 @@ def main() -> None:
                         configured_emi_dates=configured_emi_dates or [],
                         digital_rule_id_map=digital_rule_id_map,
                         digital_rules_lookup=digital_rules_lookup,
+                        campaign_days=configured_campaign_days,
+                        send_hour_window=configured_send_hour_window,
+                        single_communication_per_day=True,
+                        default_templates=configured_default_templates,
                     )
                     campaign_rows = store_campaign_recommendations(
                         conn,
@@ -3318,6 +3402,11 @@ def main() -> None:
         else:
             campaign_vendors = []
             configured_emi_dates = []
+            app_config = load_default_config(args.config_file) if getattr(args, "config_file", None) else {}
+            allowed_offsets = app_config.get("allowed_day_offsets")
+            configured_campaign_days = offsets_to_day_columns(allowed_offsets) if allowed_offsets is not None else None
+            configured_send_hour_window = app_config.get("send_hour_window")
+            configured_default_templates = app_config.get("default_templates")
             campaign_df, mapping_df = _prepare_campaign_outputs(
                 prediction_file,
                 source_month_label=source_month_label,
@@ -3327,6 +3416,10 @@ def main() -> None:
                 vertical=args.campaign_vertical,
                 vendors=_extract_campaign_vendors(args.campaign_vendor) or [args.campaign_vendor],
                 configured_emi_dates=configured_emi_dates or [],
+                campaign_days=configured_campaign_days,
+                send_hour_window=configured_send_hour_window,
+                single_communication_per_day=True,
+                default_templates=configured_default_templates,
             )
 
         summary = build_prediction_summary(

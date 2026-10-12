@@ -13,6 +13,7 @@ from model_fallbacks import register_legacy_joblib_aliases
 from pipeline_common import (
     DAY_COLUMNS,
     SCHEDULE_DAY_COLUMNS,
+    apply_postdue_risk_rules,
     apply_predue_risk_rules,
     build_feature_matrix,
     month_to_period,
@@ -692,6 +693,7 @@ def main() -> None:
 
         with log_step(logger, "write_predictions", prediction_file=prediction_file):
             prediction_output = apply_predue_risk_rules(prediction_output)
+            prediction_output = apply_postdue_risk_rules(prediction_output)
             prediction_output = prediction_output.reindex(columns=output_cols).fillna("-")
             prediction_output.to_csv(prediction_file, index=False)
             logger.info("Saved predictions | rows=%s bytes=%s", len(prediction_output), prediction_file.stat().st_size)

@@ -19,6 +19,18 @@
     "end_hour": 18,
     "step_hours": 1
   },
+  "default_templates": {
+    "PREDUE": {
+      "WHATSAPP": "PREDUE WHATSAPP ENGLISH",
+      "SMS": "PREDUE_SMS"
+    },
+    "POSTDUE": {
+      "WHATSAPP": "POSTDUE-WHATSAPP",
+      "SMS": "POSTDUE-SMS",
+      "VOICE": "POSTDUE-VOICE"
+      // "VOICE_BOT": "POSTDUE-VOICE"
+    }
+  },
   "success_statuses": {
     "SMS": [
       "DELIVERED",

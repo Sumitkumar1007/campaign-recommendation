@@ -32,7 +32,7 @@
     "SMS": {
       "DELIVERED": 0.4,
       "READ": 0.8,
-      "CLICKED": 1.0
+      "CLICKED": 0.4
     },
     "WHATSAPP": {
       "DELIVERED": 0.4,
