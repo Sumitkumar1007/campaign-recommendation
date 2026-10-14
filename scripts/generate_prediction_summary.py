@@ -16,7 +16,7 @@ from typing import Any
 import pandas as pd
 
 from app_logging import setup_logging
-from pipeline_common import SCHEDULE_DAY_COLUMNS
+from pipeline_common import SCHEDULE_DAY_COLUMNS, load_default_config, offsets_to_day_columns
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,6 +26,11 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         default=None,
         help="Directory to save output Excel files (defaults to directory of input prediction file).",
+    )
+    parser.add_argument(
+        "--config-file",
+        default=None,
+        help="Path to optional JSON configuration file containing allowed_day_offsets.",
     )
     return parser.parse_args()
 
@@ -104,9 +109,27 @@ def count_touchpoints(strategy_cell: Any) -> int:
     return valid_count
 
 
-def generate_summary_workbooks(predictions_df: pd.DataFrame, output_dir: Path, stem: str) -> tuple[Path, Path]:
+def generate_summary_workbooks(
+    predictions_df: pd.DataFrame,
+    output_dir: Path,
+    stem: str,
+    day_columns: list[str] | None = None,
+    config_file: Path | str | None = None,
+) -> tuple[Path, Path]:
     """Generate counts and percentage Excel workbooks with separate sheets per Risk tier, day-wise Audit sheet, and Communication Intensity sheet."""
-    days_to_process = [d for d in SCHEDULE_DAY_COLUMNS if d in predictions_df.columns]
+    if day_columns is not None:
+        configured_days = day_columns
+    else:
+        cfg = load_default_config(config_file)
+        allowed_offsets = cfg.get("allowed_day_offsets")
+        if allowed_offsets is not None:
+            configured_days = offsets_to_day_columns(allowed_offsets)
+        else:
+            configured_days = SCHEDULE_DAY_COLUMNS
+
+    days_to_process = [d for d in configured_days if d in predictions_df.columns]
+    if not days_to_process:
+        days_to_process = [d for d in SCHEDULE_DAY_COLUMNS if d in predictions_df.columns]
 
     # Detect account identifier column
     apac_col = None
@@ -407,7 +430,12 @@ def main() -> None:
     out_dir = Path(args.output_dir) if args.output_dir else pred_path.parent
 
     predictions_df = pd.read_csv(pred_path, dtype=str).fillna("")
-    counts_file, pct_file = generate_summary_workbooks(predictions_df, out_dir, pred_path.stem)
+    counts_file, pct_file = generate_summary_workbooks(
+        predictions_df,
+        out_dir,
+        pred_path.stem,
+        config_file=args.config_file,
+    )
 
     print(f"Saved counts summary Excel file to: {counts_file}")
     print(f"Saved percentage summary Excel file to: {pct_file}")

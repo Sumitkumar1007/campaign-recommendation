@@ -95,6 +95,11 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("CONFIG_FILE", str(REPO_ROOT / "config" / "default_config.json")),
         help="Path to JSON configuration file containing allowed_day_offsets.",
     )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Application log file. Defaults to artifacts/logs/catboost_inference.log.",
+    )
     args = parser.parse_args()
     missing = [
         name
@@ -465,9 +470,11 @@ def build_prediction_reason(
     prediction_row: pd.Series,
     source_row: pd.Series | None,
     day_fallback_config: dict[str, dict[str, str]] | None = None,
+    target_days: list[str] | None = None,
 ) -> str:
     payload: dict[str, str] = {}
-    for day in SCHEDULE_DAY_COLUMNS:
+    days_to_check = target_days if target_days is not None else SCHEDULE_DAY_COLUMNS
+    for day in days_to_check:
         if day == "D":
             payload[day] = _no_campaign_reason(day)
             continue
@@ -500,7 +507,7 @@ def build_prediction_reason(
 def main() -> None:
     register_legacy_joblib_aliases()
     args = parse_args()
-    logger = setup_logging(args.log_file, "catboost_inference")
+    logger = setup_logging(getattr(args, "log_file", None), "catboost_inference")
     logger.info("CatBoost inference args: %s", vars(args))
 
     model_file = Path(args.model_file)
@@ -528,7 +535,10 @@ def main() -> None:
         allowed_offsets = app_config.get("allowed_day_offsets")
         allowed_day_labels = set(offsets_to_day_columns(allowed_offsets)) if allowed_offsets is not None else set(DAY_COLUMNS)
         if allowed_offsets is not None:
-            logger.info("Using configured allowed day offsets: %s -> %s", allowed_offsets, sorted(allowed_day_labels))
+            configured_day_cols = [d for d in SCHEDULE_DAY_COLUMNS if d in allowed_day_labels or (d == "D" and 0 in allowed_offsets)]
+            logger.info("Using configured allowed day offsets: %s -> %s (columns=%s)", allowed_offsets, sorted(allowed_day_labels), configured_day_cols)
+        else:
+            configured_day_cols = list(SCHEDULE_DAY_COLUMNS)
 
         with log_step(logger, "prepare_dataset", feature_file=args.feature_file, schedule_file=args.schedule_file):
             dataset = prepare_next_month_dataset(
@@ -626,6 +636,7 @@ def main() -> None:
                         prediction_row=prediction_output.iloc[row_idx],
                         source_row=prediction_rows.iloc[row_idx],
                         day_fallback_config=day_fallback_config,
+                        target_days=configured_day_cols,
                     )
                     for row_idx in range(len(prediction_output))
                 ]
@@ -655,34 +666,35 @@ def main() -> None:
             blank_output["MONTH"] = (
                 source_period + target_offset_months
             ).dt.to_timestamp().dt.strftime("%b-%Y").str.upper()
-            for day in DAY_COLUMNS:
+            for day in configured_day_cols:
                 blank_output[day] = "-"
             blank_output["PREDICTION_REASON"] = [
                 build_prediction_reason(
                     prediction_row=blank_output.iloc[row_idx],
                     source_row=None,
+                    target_days=configured_day_cols,
                 )
                 for row_idx in range(len(blank_output))
             ]
             blank_output["IS_NEW_CUSTOMER"] = "True"
             prediction_outputs.append(blank_output)
 
+        output_cols = [
+            "SOURCE_RISK",
+            "SOURCE_VERTICAL",
+            "EMI_DATE",
+            "Loan_number",
+            "SOURCE_MONTH_USED",
+            "MONTH",
+            *configured_day_cols,
+            "PREDICTION_REASON",
+            "IS_NEW_CUSTOMER",
+        ]
+
         if prediction_outputs:
             prediction_output = pd.concat(prediction_outputs, ignore_index=True)
         else:
-            prediction_output = pd.DataFrame(
-                columns=[
-                    "SOURCE_RISK",
-                    "SOURCE_VERTICAL",
-                    "EMI_DATE",
-                    "Loan_number",
-                    "SOURCE_MONTH_USED",
-                    "MONTH",
-                    *SCHEDULE_DAY_COLUMNS,
-                    "PREDICTION_REASON",
-                    "IS_NEW_CUSTOMER",
-                ]
-            )
+            prediction_output = pd.DataFrame(columns=output_cols)
 
         if "IS_NEW_CUSTOMER" not in prediction_output.columns:
             prediction_output["IS_NEW_CUSTOMER"] = "False"
@@ -690,37 +702,33 @@ def main() -> None:
             prediction_output["IS_NEW_CUSTOMER"] = prediction_output["IS_NEW_CUSTOMER"].fillna("False")
 
         with log_step(logger, "write_raw_predictions", prediction_file=prediction_file):
-            prediction_output["D"] = "-"
-            output_cols = [
-                "SOURCE_RISK",
-                "SOURCE_VERTICAL",
-                "EMI_DATE",
-                "Loan_number",
-                "SOURCE_MONTH_USED",
-                "MONTH",
-                *SCHEDULE_DAY_COLUMNS,
-                "PREDICTION_REASON",
-                "IS_NEW_CUSTOMER",
-            ]
+            if "D" in configured_day_cols:
+                prediction_output["D"] = "-"
             raw_prediction_file = prediction_file.parent / f"{prediction_file.stem}_raw.csv"
             raw_output = prediction_output.reindex(columns=output_cols).fillna("-")
             raw_output.to_csv(raw_prediction_file, index=False)
-            logger.info("Saved raw predictions CSV | file=%s rows=%s", raw_prediction_file, len(raw_output))
+            logger.info("Saved raw predictions CSV | file=%s rows=%s columns=%s", raw_prediction_file, len(raw_output), len(output_cols))
 
         with log_step(logger, "write_predictions", prediction_file=prediction_file):
             active_predue = [d for d in PREDUE_DAY_COLUMNS if d in allowed_day_labels]
             active_postdue = [d for d in POSTDUE_DAY_COLUMNS if d in allowed_day_labels]
             prediction_output = apply_predue_risk_rules(prediction_output, predue_days=active_predue)
             prediction_output = apply_postdue_risk_rules(prediction_output, postdue_days=active_postdue)
-            for day in DAY_COLUMNS:
-                if day not in allowed_day_labels:
+            for day in configured_day_cols:
+                if day in DAY_COLUMNS and day not in allowed_day_labels:
                     prediction_output[day] = "-"
             prediction_output = prediction_output.reindex(columns=output_cols).fillna("-")
             prediction_output.to_csv(prediction_file, index=False)
-            logger.info("Saved predictions | rows=%s bytes=%s", len(prediction_output), prediction_file.stat().st_size)
+            logger.info("Saved predictions | rows=%s columns=%s bytes=%s", len(prediction_output), len(output_cols), prediction_file.stat().st_size)
             try:
                 from generate_prediction_summary import generate_summary_workbooks
-                counts_f, pct_f = generate_summary_workbooks(prediction_output, prediction_file.parent, prediction_file.stem)
+                counts_f, pct_f = generate_summary_workbooks(
+                    prediction_output,
+                    prediction_file.parent,
+                    prediction_file.stem,
+                    day_columns=configured_day_cols,
+                    config_file=args.config_file,
+                )
                 logger.info("Saved executive summary Excel files | counts=%s percentage=%s", counts_f, pct_f)
             except Exception as e:
                 logger.warning("Could not generate summary Excel files: %s", e)

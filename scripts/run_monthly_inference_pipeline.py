@@ -558,9 +558,10 @@ def build_prediction_summary(
             from identify_new_customer_fallbacks import build_average_strategy_by_risk
             fallback_by_risk = build_average_strategy_by_risk(target_schedule)
             for risk_code, strat_map in fallback_by_risk.items():
-                fallback_strategy[f"{risk_code}_strategy"] = strat_map
-                fallback_strategy[f"{risk_code.capitalize()}_strategy"] = strat_map
-                fallback_strategy[risk_code] = strat_map
+                filtered_map = {k: v for k, v in strat_map.items() if k in day_columns} if day_columns else strat_map
+                fallback_strategy[f"{risk_code}_strategy"] = filtered_map
+                fallback_strategy[f"{risk_code.capitalize()}_strategy"] = filtered_map
+                fallback_strategy[risk_code] = filtered_map
         except Exception:
             pass
 
@@ -3263,9 +3264,11 @@ def main() -> None:
             run_python_script(
                 "build_strategy_schedule_dataset.py",
                 "--input-file",
-                str(TRAINING_DATA_DIR / "strategy_training_dataset_inference.csv"),  # <-- CHANGED
+                str(TRAINING_DATA_DIR / "strategy_training_dataset_inference.csv"),
                 "--output-file",
-                str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv"),  # <-- CHANGED
+                str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv"),
+                "--config-file",
+                str(args.config_file),
                 logger=logger,
             )
         # with log_step(logger, "build_monthly_features"):
@@ -3376,6 +3379,8 @@ def main() -> None:
                     str(prediction_file),
                     "--saturday-mode",
                     args.saturday_mode,
+                    "--config-file",
+                    str(args.config_file),
                     logger=logger,
                 )
             with log_step(

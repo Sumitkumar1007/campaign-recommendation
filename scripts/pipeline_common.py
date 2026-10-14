@@ -483,13 +483,15 @@ def prepare_next_month_dataset(
         if column not in schedule.columns:
             schedule[column] = 1.0
 
+    available_day_cols = [col for col in DAY_COLUMNS if col in schedule.columns]
+    available_weight_cols = [col for col in DAY_WEIGHT_COLUMNS if col in schedule.columns]
     schedule_cols = [
         key_column,
         "TARGET_MONTH",
         "TARGET_MONTH_PERIOD",
         "TARGET_RISK",
-        *DAY_COLUMNS,
-        *DAY_WEIGHT_COLUMNS,
+        *available_day_cols,
+        *available_weight_cols,
     ]
     for col in AUDIT_PAYMENT_COLUMNS:
         if col in schedule.columns and col not in schedule_cols:

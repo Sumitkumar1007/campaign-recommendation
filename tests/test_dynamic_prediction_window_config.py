@@ -539,4 +539,181 @@ def test_build_prediction_summary_dynamic_prediction_window(tmp_path: Path):
     assert summary_10["prediction_days"] == ten_days
 
 
+def test_predict_catboost_cli_log_file(monkeypatch):
+    import sys
+    from predict_next_month_strategy_catboost import parse_args
+
+    test_args = [
+        "predict_next_month_strategy_catboost.py",
+        "--feature-file", "features.csv",
+        "--schedule-file", "schedules.csv",
+        "--model-file", "model.joblib",
+        "--base-population-file", "cases.csv",
+        "--prediction-file", "preds.csv",
+    ]
+    monkeypatch.setattr(sys, "argv", test_args)
+    args = parse_args()
+    assert hasattr(args, "log_file")
+    assert args.log_file is None
+
+    test_args_with_log = test_args + ["--log-file", "/tmp/test.log"]
+    monkeypatch.setattr(sys, "argv", test_args_with_log)
+    args_with_log = parse_args()
+    assert args_with_log.log_file == "/tmp/test.log"
+
+
+def test_build_strategy_schedule_dataset_dynamic_columns_and_training_full_columns(tmp_path: Path, monkeypatch):
+    import sys
+    from build_strategy_schedule_dataset import main
+    from pipeline_common import SCHEDULE_DAY_COLUMNS
+
+    input_csv = tmp_path / "training_data.csv"
+    pd.DataFrame(
+        [
+            {
+                "ENTITY_KEY": "ACC_01",
+                "MONTH": "MAY-2026",
+                "DAY": "D-5",
+                "RISK": "LOW",
+                "PREDICTED_STRATEGY": "SMS-11AM-ENGLISH",
+            },
+            {
+                "ENTITY_KEY": "ACC_01",
+                "MONTH": "MAY-2026",
+                "DAY": "D+1",
+                "RISK": "LOW",
+                "PREDICTED_STRATEGY": "WH-2PM-ENGLISH",
+            },
+        ]
+    ).to_csv(input_csv, index=False)
+
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text('{"allowed_day_offsets": [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5]}')
+
+    # 1. With config-file (Inference mode): dynamic columns (only D-5..D+5)
+    out_inference = tmp_path / "schedule_inference.csv"
+    test_args_inf = [
+        "build_strategy_schedule_dataset.py",
+        "--input-file", str(input_csv),
+        "--output-file", str(out_inference),
+        "--config-file", str(cfg),
+    ]
+    monkeypatch.setattr(sys, "argv", test_args_inf)
+    main()
+
+    df_inf = pd.read_csv(out_inference)
+    assert "D-5" in df_inf.columns
+    assert "D+5" in df_inf.columns
+    assert "D+6" not in df_inf.columns
+    assert "D+20" not in df_inf.columns
+
+    # 2. Without config-file (Training mode): all 26 columns preserved
+    out_train = tmp_path / "schedule_train.csv"
+    test_args_train = [
+        "build_strategy_schedule_dataset.py",
+        "--input-file", str(input_csv),
+        "--output-file", str(out_train),
+    ]
+    monkeypatch.setattr(sys, "argv", test_args_train)
+    main()
+
+    df_train = pd.read_csv(out_train)
+    for day in SCHEDULE_DAY_COLUMNS:
+        assert day in df_train.columns
+
+
+def test_generate_summary_workbooks_dynamic_columns(tmp_path: Path):
+    from generate_prediction_summary import generate_summary_workbooks
+    from pipeline_common import DAY_COLUMNS
+
+    pred_data = {
+        "MONTH": ["OCT-2026"],
+        "APAC_NO": ["ACC_01"],
+        "SOURCE_RISK": ["LOW"],
+    }
+    for day in DAY_COLUMNS:
+        pred_data[day] = ["SMS-11AM-ENGLISH"]
+    pred_df = pd.DataFrame(pred_data)
+
+    cfg = tmp_path / "cfg.json"
+    cfg.write_text('{"allowed_day_offsets": [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5]}')
+
+    # Test with config_file (dynamic columns D-5..D+5)
+    counts_file, pct_file = generate_summary_workbooks(
+        pred_df,
+        tmp_path,
+        "test_dynamic",
+        config_file=cfg,
+    )
+
+    counts_xl = pd.read_excel(counts_file, sheet_name="Low Risk")
+    assert "D-5" in counts_xl.columns
+    assert "D+5" in counts_xl.columns
+    assert "D+6" not in counts_xl.columns
+    assert "D+20" not in counts_xl.columns
+
+    pct_xl = pd.read_excel(pct_file, sheet_name="Low Risk")
+    assert "D-5" in pct_xl.columns
+    assert "D+5" in pct_xl.columns
+    assert "D+6" not in pct_xl.columns
+    assert "D+20" not in pct_xl.columns
+
+    intensity_xl = pd.read_excel(counts_file, sheet_name="Communication Intensity", skiprows=1)
+    assert "D-5" in intensity_xl.columns
+    assert "D+5" in intensity_xl.columns
+    assert "D+6" not in intensity_xl.columns
+    assert "D+20" not in intensity_xl.columns
+
+
+def test_build_prediction_summary_fallback_strategy_filtered(tmp_path: Path):
+    from run_monthly_inference_pipeline import build_prediction_summary
+    from pipeline_common import DAY_COLUMNS
+
+    pred_file = tmp_path / "preds.csv"
+    pd.DataFrame(
+        [
+            {
+                "MONTH": "OCT-2026",
+                "SOURCE_RISK": "LOW",
+                "D-5": "SMS-11AM-ENGLISH",
+                "D-1": "SMS-11AM-ENGLISH",
+                "D+1": "SMS-11AM-ENGLISH",
+                "D+2": "SMS-11AM-ENGLISH",
+                "D+3": "SMS-11AM-ENGLISH",
+            }
+        ]
+    ).to_csv(pred_file, index=False)
+
+    sched_file = tmp_path / "sched.csv"
+    sched_data = {
+        "Loan_number": ["ACC_01"],
+        "RISK": ["LOW"],
+    }
+    for day in DAY_COLUMNS:
+        sched_data[day] = ["SMS-11AM-ENGLISH"]
+    pd.DataFrame(sched_data).to_csv(sched_file, index=False)
+
+    ten_days = ["D-5", "D-4", "D-3", "D-2", "D-1", "D+1", "D+2", "D+3", "D+4", "D+5"]
+    summary = build_prediction_summary(
+        prediction_file=pred_file,
+        source_month_label="SEP-2026",
+        prediction_month_label="OCT-2026",
+        model_name="catboost_3m",
+        campaign_df=pd.DataFrame(),
+        mapping_df=pd.DataFrame(),
+        schedule_file=sched_file,
+        campaign_days=ten_days,
+    )
+
+    fallback = summary["fallback_strategy"]
+    assert "LOW_strategy" in fallback
+    for day in ten_days:
+        assert day in fallback["LOW_strategy"]
+    assert "D+6" not in fallback["LOW_strategy"]
+    assert "D+20" not in fallback["LOW_strategy"]
+
+
+
+
+
 

@@ -144,8 +144,9 @@ def _prepare_probability_map(
     ranked_probability_map: dict[tuple[str, str], list[tuple[str, float]]] = {}
     if prediction_population.empty:
         return ranked_probability_map
-    X_pred = build_feature_matrix(prediction_population).reindex(columns=bundle["feature_columns"], fill_value=0)
-    for day in DAY_COLUMNS:
+    target_cols = [d for d in DAY_COLUMNS if d in prediction_rows.columns]
+    target_days = target_cols if target_cols else DAY_COLUMNS
+    for day in target_days:
         encoder = bundle["label_encoders"][day]
         model = bundle["models"][day]
         _day_predictions, ranked_probabilities = _top_k_labels_with_probabilities(
@@ -259,7 +260,9 @@ def build_prediction_evidence(
         loan_number = str(row["Loan_number"]).strip()
         entity_value = loan_to_entity.get(loan_number, loan_number)
 
-        for day in DAY_COLUMNS:
+        active_cols = [d for d in DAY_COLUMNS if d in prediction_rows.columns]
+        active_days = active_cols if active_cols else DAY_COLUMNS
+        for day in active_days:
             day_key = str(day).strip().upper()
             
             if (entity_value, day_key) in fused_indexed.index:

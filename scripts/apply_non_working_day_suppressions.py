@@ -51,6 +51,11 @@ def parse_args() -> argparse.Namespace:
         help="Do NOT suppress recommendations on Sundays.",
     )
     parser.add_argument(
+        "--config-file",
+        default=None,
+        help="Path to optional JSON configuration file containing allowed_day_offsets.",
+    )
+    parser.add_argument(
         "--log-file",
         default=None,
         help="Optional log file path.",
@@ -185,7 +190,12 @@ def main() -> None:
 
     try:
         from generate_prediction_summary import generate_summary_workbooks
-        generate_summary_workbooks(updated_df, output_file.parent, output_file.stem)
+        generate_summary_workbooks(
+            updated_df,
+            output_file.parent,
+            output_file.stem,
+            config_file=args.config_file,
+        )
         logger.info("Saved updated summary Excel files post non-working day suppression.")
     except Exception as e:
         logger.warning("Could not update summary Excel workbooks: %s", e)

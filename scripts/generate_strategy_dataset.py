@@ -207,6 +207,12 @@ def parse_args() -> argparse.Namespace:
         default=str(REPO_ROOT / "config" / "default_config.json"),
         help="JSON config file containing send_hour_window.",
     )
+    parser.add_argument(
+        "--filter-allowed-offsets",
+        action="store_true",
+        default=False,
+        help="If set, filters day offsets strictly by allowed_day_offsets in config-file. Defaults to False (keeps all D-5..D+20).",
+    )
     return parser.parse_args()
 
 
@@ -934,7 +940,7 @@ def main() -> None:
     load_dotenv(override=True)
     args = parse_args()
     send_hour_window = load_send_hour_window(args.config_file)
-    allowed_day_offsets = load_allowed_day_offsets(args.config_file)
+    allowed_day_offsets = load_allowed_day_offsets(args.config_file) if args.filter_allowed_offsets else None
     build_dataset(
         input_dir=Path(args.input_dir),
         output_file=Path(args.output_file),
