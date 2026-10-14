@@ -251,47 +251,51 @@ def test_get_configured_default_template_string_and_dict_formats():
 def test_resolve_template_name_priority():
     from run_monthly_inference_pipeline import resolve_template_name
 
-    default_templates = {
-        "PREDUE": {"SMS": "PREDUE_SMS", "WHATSAPP": "PREDUE WHATSAPP ENGLISH"},
-        "POSTDUE": {"SMS": "POSTDUE-SMS"},
+    digital_rules_lookup = {
+        ("PREDUE", "SMS", "ENGLISH"): "PREDUE_SMS",
+        ("PREDUE", "SMS", "DEFAULT"): "PREDUE_SMS",
+        ("POSTDUE", "SMS", "ENGLISH"): "POSTDUE-SMS",
+        ("POSTDUE", "SMS", "DEFAULT"): "POSTDUE-SMS",
+        ("RULE_99", "SMS", "ENGLISH"): "MCOLLECT_EXISTING_ITERATION_1",
     }
 
-    # 1. Fallback to default_templates when no history map
+    # 1. Exact cohort match from digital_rules_lookup
     res = resolve_template_name(
         loan_number="ACC_01",
         due_type="PREDUE",
         mode="SMS",
         language="ENGLISH",
-        default_templates=default_templates,
+        digital_rules_lookup=digital_rules_lookup,
     )
     assert res == "PREDUE_SMS"
 
-    # 2. History map present and matching digital_rules_lookup takes precedence
+    # 2. Account-specific rule ID lookup (e.g. for a custom rule without cohort key)
+    digital_rules_custom = {
+        ("RULE_99", "SMS", "ENGLISH"): "MCOLLECT_EXISTING_ITERATION_1",
+    }
     digital_rule_id_map = {("ACC_01", "SMS", "ENGLISH"): "RULE_99"}
-    digital_rules_lookup = {("RULE_99", "SMS", "ENGLISH"): "MCOLLECT_EXISTING_ITERATION_1"}
     res_history = resolve_template_name(
         loan_number="ACC_01",
         due_type="PREDUE",
         mode="SMS",
         language="ENGLISH",
         digital_rule_id_map=digital_rule_id_map,
-        digital_rules_lookup=digital_rules_lookup,
-        default_templates=default_templates,
+        digital_rules_lookup=digital_rules_custom,
     )
     assert res_history == "MCOLLECT_EXISTING_ITERATION_1"
 
-    # 3. Neither history nor default_templates -> synthesized fallback
-    res_synthesized = resolve_template_name(
+    # 3. Mode not in digital_rules_lookup -> commented out fallbacks return ""
+    res_none = resolve_template_name(
         loan_number="ACC_01",
         due_type="POSTDUE",
         mode="VOICE",
         language="ENGLISH",
-        default_templates=default_templates,
+        digital_rules_lookup=digital_rules_lookup,
     )
-    assert res_synthesized == "POSTDUE_AIML_VOICE_ENGLISH"
+    assert res_none == ""
 
 
-def test_build_campaign_recommendations_uses_default_templates(tmp_path: Path):
+def test_build_campaign_recommendations_uses_digital_rules(tmp_path: Path):
     prediction_file = tmp_path / "pred_templates.csv"
     pd.DataFrame(
         {
@@ -305,14 +309,9 @@ def test_build_campaign_recommendations_uses_default_templates(tmp_path: Path):
         }
     ).to_csv(prediction_file, index=False)
 
-    default_templates = {
-        "PREDUE": {
-            "WHATSAPP": "PREDUE WHATSAPP ENGLISH",
-            "SMS": "PREDUE_SMS",
-        },
-        "POSTDUE": {
-            "SMS": "POSTDUE-SMS",
-        },
+    digital_rules_lookup = {
+        ("PREDUE", "WHATSAPP", "ENGLISH"): "PREDUE WHATSAPP ENGLISH",
+        ("POSTDUE", "SMS", "ENGLISH"): "POSTDUE-SMS",
     }
 
     output = build_campaign_recommendations(
@@ -324,12 +323,220 @@ def test_build_campaign_recommendations_uses_default_templates(tmp_path: Path):
         vertical="LAP",
         vendors=["prutech"],
         run_date=pd.Timestamp("2026-04-08").to_pydatetime(),
-        default_templates=default_templates,
+        default_templates=None,
     )
 
-    predue_row = output[output["date"] == "D-1"].iloc[0]
-    postdue_row = output[output["date"] == "D+1"].iloc[0]
+    # With digital_rules_lookup passed into build_campaign_assignment_groups
+    from run_monthly_inference_pipeline import _build_campaign_assignment_groups
+
+    assignment_groups = _build_campaign_assignment_groups(
+        prediction_file,
+        source_month_label="APR-2026",
+        prediction_month_label="MAY-2026",
+        model_name="catboost_3m",
+        emi_cycles=[5],
+        vertical="LAP",
+        vendors=["prutech"],
+        run_token="080426",
+        digital_rules_lookup=digital_rules_lookup,
+    )
+
+    predue_row = assignment_groups[assignment_groups["date"] == "D-1"].iloc[0]
+    postdue_row = assignment_groups[assignment_groups["date"] == "D+1"].iloc[0]
 
     assert predue_row["template_name"] == "PREDUE WHATSAPP ENGLISH"
     assert postdue_row["template_name"] == "POSTDUE-SMS"
+
+
+def test_default_config_json_is_valid_and_loadable():
+    import json
+    from generate_strategy_dataset import load_send_hour_window
+    from pipeline_common import load_default_config
+
+    repo_root = Path(__file__).resolve().parent.parent
+    config_file = repo_root / "config" / "default_config.json"
+    assert config_file.exists(), "config/default_config.json should exist"
+
+    # Strict JSON validation
+    with config_file.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert "send_hour_window" in data
+    assert "default_templates" in data
+    assert "POSTDUE" in data["default_templates"]
+
+    # Verify script loaders work cleanly with it
+    window = load_send_hour_window(config_file)
+    assert window["start_hour"] == 9
+    assert window["end_hour"] == 18
+
+    app_cfg = load_default_config(config_file)
+    assert app_cfg["default_templates"]["POSTDUE"]["VOICE"] == "POSTDUE-VOICE"
+
+
+def test_config_loaders_handle_commented_json(tmp_path: Path):
+    from generate_strategy_dataset import load_send_hour_window
+    from pipeline_common import load_default_config
+
+    commented_json = tmp_path / "commented_config.json"
+    commented_json.write_text(
+        """{
+        "send_hour_window": {
+            "start_hour": 10,
+            "end_hour": 17,
+            "step_hours": 2
+        },
+        "default_templates": {
+            "POSTDUE": {
+                "SMS": "POSTDUE-SMS"
+                // "VOICE": "COMMENTED-OUT"
+            }
+        }
+    }""",
+        encoding="utf-8",
+    )
+
+    window = load_send_hour_window(commented_json)
+    assert window["start_hour"] == 10
+    assert window["end_hour"] == 17
+    assert window["step_hours"] == 2
+
+    app_cfg = load_default_config(commented_json)
+    assert app_cfg["default_templates"]["POSTDUE"]["SMS"] == "POSTDUE-SMS"
+
+
+def test_load_allowed_day_offsets(tmp_path: Path):
+    from generate_strategy_dataset import load_allowed_day_offsets
+
+    cfg = tmp_path / "offsets.json"
+    cfg.write_text('{"allowed_day_offsets": [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5]}')
+    offsets = load_allowed_day_offsets(cfg)
+    assert offsets == [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5]
+
+
+def test_generate_strategy_dataset_filters_by_allowed_day_offsets():
+    from generate_strategy_dataset import process_chunk
+
+    raw_chunk = pd.DataFrame(
+        {
+            "apac_card_number": ["123", "123", "123"],
+            "party_id": ["P1", "P1", "P1"],
+            "risk": ["LOW", "LOW", "LOW"],
+            "communication_type": ["SMS", "SMS", "SMS"],
+            "comm_status": ["DELIVERED", "DELIVERED", "DELIVERED"],
+            "emi_date": ["2026-05-05", "2026-05-05", "2026-05-05"],
+            "date": ["2026-05-06", "2026-05-10", "2026-05-15"],  # offsets: +1, +5, +10
+            "created_date": ["2026-05-06 10:00:00", "2026-05-10 10:00:00", "2026-05-15 10:00:00"],
+            "vertical": ["LAP", "LAP", "LAP"],
+            "verbiage_language": ["ENGLISH", "ENGLISH", "ENGLISH"],
+        }
+    )
+
+    allowed = [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5]
+    _, strat, _ = process_chunk(
+        raw_chunk,
+        allowed_day_offsets=allowed,
+    )
+
+    days_in_dataset = set(strat["DAY"].tolist())
+    assert "D+1" in days_in_dataset
+    assert "D+5" in days_in_dataset
+    assert "D+10" not in days_in_dataset, "D+10 must be excluded when allowed_day_offsets max is 5"
+
+
+def test_identify_new_customer_fallbacks_respects_allowed_day_labels(tmp_path: Path):
+    from identify_new_customer_fallbacks import apply_fallbacks_to_prediction_file, build_fallback_rows
+    from pipeline_common import DAY_COLUMNS, SCHEDULE_DAY_COLUMNS
+
+    new_cases = pd.DataFrame(
+        [
+            {
+                "apacCardNumber": "NEW_01",
+                "originalRisk": "LOW",
+                "vertical": "LAP",
+            }
+        ]
+    )
+    fallback_by_risk = {
+        "LOW": {day: "SMS-11AM-ENGLISH" for day in DAY_COLUMNS}
+    }
+    allowed_labels = {"D-5", "D-1", "D+1", "D+5"}
+
+    fallback_rows = build_fallback_rows(new_cases, fallback_by_risk, allowed_day_labels=allowed_labels)
+    # Check that rows for disallowed days have "-"
+    disallowed_row = fallback_rows[fallback_rows["day"] == "D+10"].iloc[0]
+    assert disallowed_row["recommendedStrategy"] == "-"
+    allowed_row = fallback_rows[fallback_rows["day"] == "D+1"].iloc[0]
+    assert allowed_row["recommendedStrategy"] == "SMS-11AM-ENGLISH"
+
+    pred_file = tmp_path / "pred.csv"
+    initial_pred = pd.DataFrame(
+        [
+            {
+                "Loan_number": "NEW_01",
+                "SOURCE_MONTH_USED": "APR-2026",
+                "MONTH": "MAY-2026",
+                **{d: "-" for d in SCHEDULE_DAY_COLUMNS},
+            }
+        ]
+    )
+    initial_pred.to_csv(pred_file, index=False)
+
+    apply_fallbacks_to_prediction_file(pred_file, fallback_rows, allowed_day_labels=allowed_labels)
+    updated_pred = pd.read_csv(pred_file)
+    assert updated_pred.iloc[0]["D+1"] == "SMS-11AM-ENGLISH"
+    assert updated_pred.iloc[0]["D+10"] == "-"
+    assert updated_pred.iloc[0]["D+20"] == "-"
+
+
+def test_build_prediction_summary_dynamic_prediction_window(tmp_path: Path):
+    from run_monthly_inference_pipeline import build_prediction_summary
+
+    pred_file = tmp_path / "predictions.csv"
+    pd.DataFrame(
+        [
+            {
+                "MONTH": "MAY-2026",
+                "SOURCE_RISK": "LOW",
+                "D-5": "SMS-11AM-ENGLISH",
+                "D-1": "SMS-11AM-ENGLISH",
+                "D+1": "SMS-11AM-ENGLISH",
+                "D+2": "SMS-11AM-ENGLISH",
+                "D+3": "SMS-11AM-ENGLISH",
+            }
+        ]
+    ).to_csv(pred_file, index=False)
+
+    # 1. With explicit configured campaign_days (e.g. 5 days)
+    configured_days = ["D-5", "D-1", "D+1", "D+2", "D+3"]
+    summary = build_prediction_summary(
+        prediction_file=pred_file,
+        source_month_label="APR-2026",
+        prediction_month_label="MAY-2026",
+        model_name="catboost_3m",
+        campaign_df=pd.DataFrame(),
+        mapping_df=pd.DataFrame(),
+        campaign_days=configured_days,
+    )
+
+    assert summary["prediction_days_count"] == 5
+    assert summary["prediction_window"] == "5 days"
+    assert summary["prediction_days"] == configured_days
+
+    # 2. With 10 days
+    ten_days = ["D-5", "D-4", "D-3", "D-2", "D-1", "D+1", "D+2", "D+3", "D+4", "D+5"]
+    summary_10 = build_prediction_summary(
+        prediction_file=pred_file,
+        source_month_label="APR-2026",
+        prediction_month_label="MAY-2026",
+        model_name="catboost_3m",
+        campaign_df=pd.DataFrame(),
+        mapping_df=pd.DataFrame(),
+        campaign_days=ten_days,
+    )
+
+    assert summary_10["prediction_days_count"] == 10
+    assert summary_10["prediction_window"] == "10 days"
+    assert summary_10["prediction_days"] == ten_days
+
+
 

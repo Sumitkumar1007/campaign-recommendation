@@ -499,10 +499,11 @@ def build_prediction_summary(
     campaign_df: pd.DataFrame,
     mapping_df: pd.DataFrame,
     schedule_file: Path | None = None,
+    campaign_days: list[str] | None = None,
 ) -> dict[str, object]:
     predictions = pd.read_csv(prediction_file)
     predictions = predictions[predictions["MONTH"] == prediction_month_label].copy()
-    day_columns = DAY_COLUMNS
+    day_columns = campaign_days if campaign_days is not None else DAY_COLUMNS
 
     source_risk_counts = (
         predictions["SOURCE_RISK"].fillna("UNKNOWN").astype(str).value_counts().sort_index().to_dict()
@@ -563,6 +564,17 @@ def build_prediction_summary(
         except Exception:
             pass
 
+    active_prediction_days = [
+        col for col in day_columns
+        if col in predictions.columns and (
+            predictions[col].fillna("-").astype(str).str.strip().ne("-")
+            & predictions[col].fillna("-").astype(str).str.strip().ne("")
+        ).any()
+    ]
+    effective_days = campaign_days if campaign_days is not None else (active_prediction_days if active_prediction_days else day_columns)
+    prediction_days_count = len(effective_days)
+    prediction_window = f"{prediction_days_count} days"
+
     return {
         "source_month": source_month_label,
         "prediction_month": prediction_month_label,
@@ -581,6 +593,9 @@ def build_prediction_summary(
         "campaign_vendor_counts": campaign_vendor_counts,
         "campaign_vertical_counts": campaign_vertical_counts,
         "top_campaign_mapping_counts": mapping_counts_by_campaign,
+        "prediction_days": effective_days,
+        "prediction_days_count": prediction_days_count,
+        "prediction_window": prediction_window,
     }
 
 
@@ -854,6 +869,7 @@ def store_prediction_snapshots(
     prediction_file: Path,
     prediction_month_label: str,
     model_name: str,
+    campaign_days: list[str] | None = None,
 ) -> int:
     df = pd.read_csv(prediction_file)
     df = df[df["MONTH"] == prediction_month_label].copy()
@@ -870,7 +886,9 @@ def store_prediction_snapshots(
         for day in ALL_CAMPAIGN_DAYS:
             if day in row.index:
                 val = row[day]
-                if pd.isna(val) or val is None or str(val).strip().lower() in ("nan", "none", "<na>", "null", ""):
+                if campaign_days is not None and day not in campaign_days:
+                    payload[day] = "-"
+                elif pd.isna(val) or val is None or str(val).strip().lower() in ("nan", "none", "<na>", "null", ""):
                     payload[day] = "-"
                 else:
                     payload[day] = str(val).strip()
@@ -1004,44 +1022,150 @@ def _template_name(*, due_type: str, mode: str, language: str) -> str:
     return f"{due_type}_AIML_{NAME_CHANNEL_BY_MODE[mode]}_{language}"
 
 
-def fetch_digital_rules_lookup(conn, schema: str, logger: logging.Logger | None = None) -> dict[tuple[str, str, str], str]:
+def extract_active_digital_rule_ids(
+    history_files: list[Path] | Path,
+    logger: logging.Logger | None = None,
+) -> list[str]:
     """
-    Fetches digital_rules table from Postgres and builds lookup map:
-    (digital_rule_id_str, mode_upper, language_upper) -> iteration (template_name)
+    Extracts distinct active digital_rule_ids across all communication history files
+    in the training and inference window.
+    """
+    log = logger or logging.getLogger("monthly_inference_pipeline")
+    files = [history_files] if isinstance(history_files, Path) else list(history_files)
+    rule_ids: set[str] = set()
+    for csv_file in files:
+        if not csv_file or not Path(csv_file).exists():
+            continue
+        try:
+            df = pd.read_csv(csv_file, dtype=str)
+            if "digital_rule_id" not in df.columns:
+                continue
+            valid_ids = df["digital_rule_id"].dropna().astype(str).str.strip()
+            new_ids = {r for r in valid_ids if r and r not in ("-", "None", "nan", "0")}
+            rule_ids.update(new_ids)
+        except Exception as e:
+            log.warning("Error reading digital_rule_id from %s: %s", csv_file, e)
+    return sorted(rule_ids, key=lambda x: int(x) if x.isdigit() else str(x))
+
+
+def _normalize_campaign_identifier_due_type(campaign_identifier: str | None, iteration: str = "") -> str:
+    """
+    Normalizes campaign_identifier into canonical due_type ('PREDUE', 'POSTDUE', 'DUEDATE').
+    Falls back to inspecting iteration name if campaign_identifier is ambiguous or missing.
+    """
+    cid_u = str(campaign_identifier or "").strip().upper()
+    if "PRE" in cid_u:
+        return "PREDUE"
+    if "POST" in cid_u:
+        return "POSTDUE"
+    if "DUE" in cid_u:
+        return "DUEDATE"
+
+    iter_u = str(iteration or "").strip().upper()
+    if "PRE" in iter_u:
+        return "PREDUE"
+    if "POST" in iter_u:
+        return "POSTDUE"
+    if "DUE" in iter_u:
+        return "DUEDATE"
+    return "POSTDUE"
+
+
+def fetch_digital_rules_lookup(
+    conn,
+    schema: str,
+    active_rule_ids: list[str] | set[str] | None = None,
+    logger: logging.Logger | None = None,
+) -> dict[tuple[str, str, str], str]:
+    """
+    Fetches digital_rules table from Postgres for only the digital_rule_ids found
+    in latest month communications.
+    Builds cohort-level lookup map:
+      (due_type, mode_upper, language_upper) -> iteration (template_name)
+      (due_type, mode_upper, 'DEFAULT') -> iteration
+      (digital_rule_id_str, mode_upper, language_upper) -> iteration
     """
     log = logger or logging.getLogger("monthly_inference_pipeline")
     lookup: dict[tuple[str, str, str], str] = {}
     if not conn:
         return lookup
 
-    # Try mode_ column first (as in Postgres schema), fallback to mode if missing
+    table_ref = qualified_identifier(schema, "digital_rules")
     columns_to_try = ["mode_", "mode"]
     rows = None
-    table_ref = qualified_identifier(schema, "digital_rules")
+
+    id_filter_sql = sql.SQL("")
+    params: list[object] = []
+    if active_rule_ids:
+        numeric_ids = []
+        for r in active_rule_ids:
+            try:
+                numeric_ids.append(int(r))
+            except ValueError:
+                pass
+        if numeric_ids:
+            id_filter_sql = sql.SQL("AND id = ANY(%s)")
+            params.append(numeric_ids)
 
     for col in columns_to_try:
         try:
             query = sql.SQL(
                 """
-                SELECT id, {mode_col} AS mode, language, iteration
+                SELECT id, {mode_col} AS mode, language, campaign_identifier, iteration
                 FROM {table_ref}
                 WHERE iteration IS NOT NULL AND iteration <> ''
+                {id_filter}
+                ORDER BY id ASC
                 """
-            ).format(mode_col=sql.Identifier(col), table_ref=table_ref)
+            ).format(
+                mode_col=sql.Identifier(col),
+                table_ref=table_ref,
+                id_filter=id_filter_sql,
+            )
             with conn.cursor() as cur:
-                cur.execute(query)
+                cur.execute(query, params)
                 rows = cur.fetchall()
                 break
         except Exception:
-            continue
+            try:
+                query_fallback = sql.SQL(
+                    """
+                    SELECT id, {mode_col} AS mode, language, NULL AS campaign_identifier, iteration
+                    FROM {table_ref}
+                    WHERE iteration IS NOT NULL AND iteration <> ''
+                    {id_filter}
+                    ORDER BY id ASC
+                    """
+                ).format(
+                    mode_col=sql.Identifier(col),
+                    table_ref=table_ref,
+                    id_filter=id_filter_sql,
+                )
+                with conn.cursor() as cur:
+                    cur.execute(query_fallback, params)
+                    rows = cur.fetchall()
+                    break
+            except Exception:
+                continue
 
     if rows is not None:
-        for rule_id, mode, language, iteration in rows:
-            if rule_id is not None and mode and language and iteration:
+        for rule_id, mode, language, campaign_identifier, iteration in rows:
+            if rule_id is not None and mode and iteration:
                 rule_id_str = str(rule_id).strip()
                 mode_u = str(mode).strip().upper()
-                lang_u = str(language).strip().upper()
+                lang_u = str(language).strip().upper() if language else ""
                 iter_val = str(iteration).strip()
+                due_type_norm = _normalize_campaign_identifier_due_type(campaign_identifier, iter_val)
+
+                # 1. Map by cohort (due_type, mode, language)
+                if lang_u:
+                    lookup[(due_type_norm, mode_u, lang_u)] = iter_val
+                lookup.setdefault((due_type_norm, mode_u, "DEFAULT"), iter_val)
+                lookup.setdefault((due_type_norm, mode_u, ""), iter_val)
+                if lang_u == "ENGLISH":
+                    lookup[(due_type_norm, mode_u, "DEFAULT")] = iter_val
+
+                # 2. Also map by (rule_id, mode, language)
                 lookup[(rule_id_str, mode_u, lang_u)] = iter_val
                 lookup.setdefault((rule_id_str, mode_u, ""), iter_val)
     else:
@@ -1095,7 +1219,7 @@ def build_latest_digital_rule_map(history_files: list[Path], logger: logging.Log
 
 def resolve_template_name(
     *,
-    loan_number: str,
+    loan_number: str = "",
     due_type: str,
     mode: str,
     language: str,
@@ -1104,30 +1228,56 @@ def resolve_template_name(
     default_templates: dict[str, object] | list | None = None,
 ) -> str:
     """
-    Resolves template_name by looking up digital_rule_id for (loan_number, mode, language),
-    and retrieving the iteration value from digital_rules.
-    Falls back to configured default_templates if missing/not found,
-    and finally to default synthesized template name.
+    Resolves template_name directly from digital_rules_lookup for the scheduler cohort (due_type, mode, language).
+    Falls back gracefully to DEFAULT/ENGLISH within digital_rules.
+    Config file logic and synthesized fallback strings are commented out.
     """
     mode_u = mode.strip().upper()
     lang_u = language.strip().upper()
+    due_u = due_type.strip().upper()
 
-    if digital_rule_id_map and digital_rules_lookup:
-        rule_id = digital_rule_id_map.get((loan_number, mode_u, lang_u)) or digital_rule_id_map.get((loan_number, mode_u, ""))
-        if rule_id:
-            template_name = digital_rules_lookup.get((rule_id, mode_u, lang_u)) or digital_rules_lookup.get((rule_id, mode_u, ""))
-            if template_name:
-                return template_name
+    if digital_rules_lookup is not None:
+        # 1. Exact match from active digital_rules: (due_type, mode, language)
+        exact_template = digital_rules_lookup.get((due_u, mode_u, lang_u))
+        if exact_template:
+            return exact_template
 
-    configured_default = get_configured_default_template(
-        default_templates,
-        due_type=due_type,
-        mode=mode,
-        language=language,
-    )
-    if configured_default:
-        return configured_default
+        # 2. Account rule match if loan history rule ID is present
+        if digital_rule_id_map and loan_number:
+            rule_id = digital_rule_id_map.get((loan_number, mode_u, lang_u)) or digital_rule_id_map.get((loan_number, mode_u, ""))
+            if rule_id:
+                template_name = digital_rules_lookup.get((rule_id, mode_u, lang_u)) or digital_rules_lookup.get((rule_id, mode_u, ""))
+                if template_name:
+                    return template_name
 
+        # 3. Database language fallback: check DEFAULT / ENGLISH / generic for this (due_type, mode)
+        for fallback_lang in ("DEFAULT", "ENGLISH", ""):
+            lang_fallback = digital_rules_lookup.get((due_u, mode_u, fallback_lang))
+            if lang_fallback:
+                return lang_fallback
+
+        # 4. Database mode fallback: check any active template for this mode
+        for (d, m, l), iter_val in digital_rules_lookup.items():
+            if m == mode_u and iter_val:
+                return iter_val
+
+        # =========================================================================
+        # COMMENTED OUT: Config file logic and synthesized string fallback in DB mode
+        # =========================================================================
+        # configured_default = get_configured_default_template(
+        #     default_templates,
+        #     due_type=due_type,
+        #     mode=mode,
+        #     language=language,
+        # )
+        # if configured_default:
+        #     return configured_default
+        #
+        # return _template_name(due_type=due_type, mode=mode, language=language)
+
+        return ""
+
+    # Purely offline/test fallback when no database lookup is provided at all
     return _template_name(due_type=due_type, mode=mode, language=language)
 
 
@@ -3092,6 +3242,8 @@ def main() -> None:
                 str(TRAINING_DATA_DIR / "strategy_training_dataset_inference.csv"),
                 "--month-source",
                 args.feature_month_source,
+                "--config-file",
+                str(args.config_file),
                 "--input-files",
                 *[str(path) for path in history_files],
                 "--payment-files",
@@ -3181,6 +3333,8 @@ def main() -> None:
                     str(FEATURE_DATA_DIR / "strategy_monthly_features_inference.csv"),
                     "--schedule-file",
                     str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv"),
+                    "--config-file",
+                    str(args.config_file),
                     logger=logger,
                 )
             cold_start_output_file = CASE_DATA_DIR / f"new_customer_fallbacks_{args.predict_month.replace('-', '_')}.csv"
@@ -3205,6 +3359,8 @@ def main() -> None:
                     str(cold_start_output_file),
                     "--prediction-file",
                     str(prediction_file),
+                    "--config-file",
+                    str(args.config_file),
                     logger=logger,
                 )
             with log_step(
@@ -3338,17 +3494,7 @@ def main() -> None:
                         target_schema=args.target_schema,
                         logger=logger,
                     )
-                    prediction_rows = store_prediction_snapshots(
-                        conn,
-                        args.target_schema,
-                        args.prediction_table,
-                        prediction_file,
-                        prediction_month_label,
-                        args.model,
-                    )
-                    digital_rules_lookup = fetch_digital_rules_lookup(conn, schema=args.source_schema or args.target_schema, logger=logger)
-                    digital_rule_id_map = build_latest_digital_rule_map(history_files, logger=logger)
-                    app_config = load_default_config(args.config_file) if getattr(args, "config_file", None) else {}
+                    app_config = load_default_config(getattr(args, "config_file", None))
                     allowed_offsets = app_config.get("allowed_day_offsets")
                     configured_campaign_days = offsets_to_day_columns(allowed_offsets) if allowed_offsets is not None else None
                     configured_send_hour_window = app_config.get("send_hour_window")
@@ -3359,6 +3505,24 @@ def main() -> None:
                         logger.info("Using configured send hour window from %s: %s", args.config_file, configured_send_hour_window)
                     if configured_default_templates is not None:
                         logger.info("Using configured default templates from %s", args.config_file)
+
+                    prediction_rows = store_prediction_snapshots(
+                        conn,
+                        args.target_schema,
+                        args.prediction_table,
+                        prediction_file,
+                        prediction_month_label,
+                        args.model,
+                        campaign_days=configured_campaign_days,
+                    )
+                    active_rule_ids = extract_active_digital_rule_ids(history_files, logger=logger)
+                    digital_rules_lookup = fetch_digital_rules_lookup(
+                        conn,
+                        schema=args.source_schema or args.target_schema,
+                        active_rule_ids=active_rule_ids,
+                        logger=logger,
+                    )
+                    digital_rule_id_map = build_latest_digital_rule_map(history_files, logger=logger)
 
                     campaign_df, mapping_df = _prepare_campaign_outputs(
                         prediction_file,
@@ -3402,7 +3566,7 @@ def main() -> None:
         else:
             campaign_vendors = []
             configured_emi_dates = []
-            app_config = load_default_config(args.config_file) if getattr(args, "config_file", None) else {}
+            app_config = load_default_config(getattr(args, "config_file", None))
             allowed_offsets = app_config.get("allowed_day_offsets")
             configured_campaign_days = offsets_to_day_columns(allowed_offsets) if allowed_offsets is not None else None
             configured_send_hour_window = app_config.get("send_hour_window")
@@ -3430,6 +3594,7 @@ def main() -> None:
             campaign_df=campaign_df,
             mapping_df=mapping_df,
             schedule_file=fallback_schedule_file,
+            campaign_days=configured_campaign_days,
         )
         if drift_report is not None:
             # --- CHANGED: Save the full drift report including feature_metrics ---

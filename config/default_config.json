@@ -2,7 +2,7 @@
   "training_data_path": "training-data/mfl_last_6_months_communication_data.csv",
   "model_output_dir": "outputs/model",
   "recommendation_output_path": "outputs/recommendations.csv",
-  "allowed_day_offsets": [-5,-4,-3,-2,-1,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20],
+  "allowed_day_offsets": [-5,-4,-3,-2,-1,1,2,3,4,5],
   "risk_quota": {
     "low": 1,
     "medium": 2,
@@ -28,7 +28,6 @@
       "WHATSAPP": "POSTDUE-WHATSAPP",
       "SMS": "POSTDUE-SMS",
       "VOICE": "POSTDUE-VOICE"
-      // "VOICE_BOT": "POSTDUE-VOICE"
     }
   },
   "success_statuses": {

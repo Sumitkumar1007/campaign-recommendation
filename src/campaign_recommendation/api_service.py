@@ -28,6 +28,15 @@ from psycopg import sql
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_VENV_PYTHON = REPO_ROOT / "venv" / "bin" / "python"
 SCRIPTS_DIR = REPO_ROOT / "scripts"
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+
+try:
+    from pipeline_common import load_default_config, offsets_to_day_columns
+except ImportError:
+    load_default_config = None  # type: ignore[assignment]
+    offsets_to_day_columns = None  # type: ignore[assignment]
+
 LOG_DIR = REPO_ROOT / "artifacts" / "logs"
 MODEL_DIR = REPO_ROOT / "artifacts" / "models"
 METRICS_DIR = REPO_ROOT / "artifacts" / "metrics"
@@ -91,6 +100,7 @@ class ApiConfig:
     api_audit_table: str = "api_audit_log"
     api_model_base_version: str = "v1.1.0"
     sftp_export_path: Path = DEFAULT_SFTP_EXPORT_PATH
+    config_file: Path | None = None
 
     @classmethod
     def from_env(cls) -> "ApiConfig":
@@ -121,6 +131,7 @@ class ApiConfig:
             api_audit_table=os.getenv("API_AUDIT_TABLE", "api_audit_log"),
             api_model_base_version=os.getenv("API_MODEL_BASE_VERSION", "v1.1.0"),
             sftp_export_path=Path(os.getenv("SFTP_EXPORT_PATH", str(DEFAULT_SFTP_EXPORT_PATH))),
+            config_file=Path(os.getenv("CONFIG_FILE")) if os.getenv("CONFIG_FILE") else None,
         )
 
 
@@ -1498,6 +1509,34 @@ class AIMLApiService:
                 processing_time_ms=duration_ms,
             )
 
+    def _resolve_inference_training_window(self, summary: dict[str, Any] | None = None) -> str:
+        if summary:
+            if summary.get("prediction_window"):
+                return str(summary["prediction_window"])
+            if summary.get("prediction_days_count") is not None:
+                try:
+                    count = int(summary["prediction_days_count"])
+                    return f"{count} days"
+                except (ValueError, TypeError):
+                    pass
+            day_counts = summary.get("predicted_label_counts_by_day")
+            if isinstance(day_counts, dict) and day_counts:
+                return f"{len(day_counts)} days"
+
+        if load_default_config is not None:
+            try:
+                cfg = load_default_config(self.config.config_file)
+                allowed_offsets = cfg.get("allowed_day_offsets")
+                if isinstance(allowed_offsets, list) and allowed_offsets:
+                    if offsets_to_day_columns is not None:
+                        day_cols = offsets_to_day_columns(allowed_offsets)
+                        return f"{len(day_cols)} days"
+                    return f"{len(allowed_offsets)} days"
+            except Exception:
+                pass
+
+        return "10 days"
+
     def _run_inference_job(self, *, transaction_id: str, payload: dict[str, Any]) -> None:
         started_at = time.perf_counter()
         request_url = "/api/v1/inference"
@@ -1525,6 +1564,7 @@ class AIMLApiService:
             self.config.export_after_inference,
             self.config.export_write,
         )
+        training_window = self._resolve_inference_training_window()
         try:
             accepted_response_body = json_dumps_compact({"transactionId": transaction_id, "status": "ACCEPTED", "driftPercentage": read_metrics_snapshot(model_name, latest_training_version).get("driftPercentage"), "currentAccuracy": read_metrics_snapshot(model_name, latest_training_version).get("currentAccuracy"), "modelVersion": model_version, "message": "Request accepted for processing."})
             self._update_ai_configuration_entry(
@@ -1534,7 +1574,7 @@ class AIMLApiService:
                 status="ACCEPTED",
                 message=accepted_response_body,
                 model_version=model_version,
-                training_window="10 days",
+                training_window=training_window,
             )
             self._safe_update_api_audit_entry(
                 log_context="inference_accepted",
@@ -1568,6 +1608,7 @@ class AIMLApiService:
                 )
             snapshot = read_metrics_snapshot(model_name, latest_training_version)
             summary = read_prediction_summary(predict_month)
+            training_window = self._resolve_inference_training_window(summary)
             drift_summary = summary.get("drift") if isinstance(summary.get("drift"), dict) else {}
             response_body = {
                 "transactionId": transaction_id,
@@ -1593,7 +1634,7 @@ class AIMLApiService:
                 accuracy=response_body.get("currentAccuracy"),
                 drift=response_body.get("driftPercentage"),
                 entry_type="INFERENCE",
-                training_window="10 days",
+                training_window=training_window,
             )
             self._safe_update_api_audit_entry(
                 log_context="inference_completed",
@@ -1623,7 +1664,7 @@ class AIMLApiService:
                 message=json_dumps_compact({"transactionId": transaction_id, "status": "FAILED", "message": error_message, "modelVersion": model_version}),
                 model_version=model_version,
                 entry_type="INFERENCE",
-                training_window="10 days",
+                training_window=training_window,
             )
             self._safe_update_api_audit_entry(
                 log_context="inference_failed",
@@ -1728,7 +1769,7 @@ class AIMLApiService:
         model_file: Path,
         metrics_file: Path,
     ) -> list[str]:
-        return [
+        command = [
             str(resolve_venv_python()),
             str(SCRIPTS_DIR / "run_monthly_inference_pipeline.py"),
             "--source-month",
@@ -1750,6 +1791,9 @@ class AIMLApiService:
             # "--campaign-vendor",
             # self.config.campaign_vendor,
         ]
+        if self.config.config_file is not None:
+            command.extend(["--config-file", str(self.config.config_file)])
+        return command
 
     def _build_export_command(self, *, source_month: str, predict_month: str, model_name: str) -> list[str]:
         command = [
@@ -1892,6 +1936,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run AIML integration API service.")
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--config-file", default=None, help="Path to config JSON file")
     return parser.parse_args()
 
 
@@ -1902,6 +1947,8 @@ def main() -> None:
         config = ApiConfig(**{**config.__dict__, "host": args.host})
     if args.port:
         config = ApiConfig(**{**config.__dict__, "port": args.port})
+    if args.config_file:
+        config = ApiConfig(**{**config.__dict__, "config_file": Path(args.config_file)})
     app = build_app(config)
     with make_server(config.host, config.port, app, server_class=ThreadingWSGIServer) as server:
         server.request_queue_size = config.request_queue_size

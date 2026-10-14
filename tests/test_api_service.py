@@ -926,3 +926,117 @@ def test_dummy_api_audit_repo_updates_gateway_accepted_entry_in_place() -> None:
     assert stored_entry["status"] == "COMPLETED"
     assert stored_entry["message"] == "Metrics generated successfully"
     assert stored_entry["request_url"] == "/api/v1/inference"
+
+
+def test_inference_training_window_reflects_custom_configured_offsets(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    custom_config = tmp_path / "custom_config.json"
+    custom_config.write_text(json.dumps({"allowed_day_offsets": [-5, -4, -3, -2, -1]}), encoding="utf-8")
+
+    config = ApiConfig(**{**build_config().__dict__, "config_file": custom_config})
+    runner = ImmediateJobRunner()
+    service = AIMLApiService(
+        config=config,
+        auth_manager=AuthManager("aiml", "secret", "top-secret", 60),
+        job_runner=runner,
+        logger=logging.getLogger("test_aiml_api"),
+        ai_config_repo=DummyAIConfigRepo(),
+        api_audit_repo=DummyApiAuditRepo(),
+    )
+    service.ai_config_repo.entries["TRN_CUSTOM"] = {
+        "transaction_id": "TRN_CUSTOM",
+        "type": "INFERENCE",
+        "status": "ACCEPTED",
+    }
+
+    monkeypatch.setattr(
+        api_service_module.subprocess,
+        "run",
+        lambda *args, **kwargs: api_service_module.subprocess.CompletedProcess(args[0], 0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(api_service_module, "read_metrics_snapshot", lambda model_name, model_version=None: {"modelVersion": "v1.1.0", "currentAccuracy": 80.0, "driftPercentage": 2.0})
+    monkeypatch.setattr(api_service_module, "read_prediction_summary", lambda predict_month: {"prediction_rows": 100})
+
+    service._run_inference_job(
+        transaction_id="TRN_CUSTOM",
+        payload={"sourceMonth": "2026-06", "predictMonth": "2026-07", "model": "catboost_3m"},
+    )
+
+    accepted_update = service.ai_config_repo.updated[0]
+    assert accepted_update["training_window"] == "5 days"
+
+    completed_update = service.ai_config_repo.updated[-1]
+    assert completed_update["training_window"] == "5 days"
+
+
+def test_inference_training_window_reflects_summary_prediction_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = build_config()
+    runner = ImmediateJobRunner()
+    service = AIMLApiService(
+        config=config,
+        auth_manager=AuthManager("aiml", "secret", "top-secret", 60),
+        job_runner=runner,
+        logger=logging.getLogger("test_aiml_api"),
+        ai_config_repo=DummyAIConfigRepo(),
+        api_audit_repo=DummyApiAuditRepo(),
+    )
+    service.ai_config_repo.entries["TRN_SUMM"] = {
+        "transaction_id": "TRN_SUMM",
+        "type": "INFERENCE",
+        "status": "ACCEPTED",
+    }
+
+    monkeypatch.setattr(
+        api_service_module.subprocess,
+        "run",
+        lambda *args, **kwargs: api_service_module.subprocess.CompletedProcess(args[0], 0, stdout="", stderr=""),
+    )
+    monkeypatch.setattr(api_service_module, "read_metrics_snapshot", lambda model_name, model_version=None: {"modelVersion": "v1.1.0", "currentAccuracy": 80.0, "driftPercentage": 2.0})
+    monkeypatch.setattr(api_service_module, "read_prediction_summary", lambda predict_month: {
+        "prediction_rows": 100,
+        "prediction_days_count": 8,
+        "prediction_window": "8 days",
+    })
+
+    service._run_inference_job(
+        transaction_id="TRN_SUMM",
+        payload={"sourceMonth": "2026-06", "predictMonth": "2026-07", "model": "catboost_3m"},
+    )
+
+    completed_update = service.ai_config_repo.updated[-1]
+    assert completed_update["training_window"] == "8 days"
+
+
+def test_inference_failure_preserves_dynamic_training_window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    custom_config = tmp_path / "custom_config.json"
+    custom_config.write_text(json.dumps({"allowed_day_offsets": [-5, -1, 1, 2, 3]}), encoding="utf-8")
+
+    config = ApiConfig(**{**build_config().__dict__, "config_file": custom_config})
+    runner = ImmediateJobRunner()
+    service = AIMLApiService(
+        config=config,
+        auth_manager=AuthManager("aiml", "secret", "top-secret", 60),
+        job_runner=runner,
+        logger=logging.getLogger("test_aiml_api"),
+        ai_config_repo=DummyAIConfigRepo(),
+        api_audit_repo=DummyApiAuditRepo(),
+    )
+    service.ai_config_repo.entries["TRN_FAIL"] = {
+        "transaction_id": "TRN_FAIL",
+        "type": "INFERENCE",
+        "status": "ACCEPTED",
+    }
+
+    def _failing_run(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, ["cmd"], output="", stderr="pipeline failed")
+
+    monkeypatch.setattr(api_service_module.subprocess, "run", _failing_run)
+    monkeypatch.setattr(api_service_module, "read_metrics_snapshot", lambda model_name, model_version=None: {"modelVersion": "v1.1.0", "currentAccuracy": 80.0, "driftPercentage": 2.0})
+
+    service._run_inference_job(
+        transaction_id="TRN_FAIL",
+        payload={"sourceMonth": "2026-06", "predictMonth": "2026-07", "model": "catboost_3m"},
+    )
+
+    failed_update = service.ai_config_repo.updated[-1]
+    assert failed_update["status"] == "FAILED"
+    assert failed_update["training_window"] == "5 days"

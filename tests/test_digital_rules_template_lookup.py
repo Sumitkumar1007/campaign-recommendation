@@ -13,15 +13,21 @@ if str(SCRIPTS_DIR) not in sys.path:
 
 from export_mcollect_scheduler import dataset_query_for
 from run_monthly_inference_pipeline import (
-    _template_name,
+    _normalize_campaign_identifier_due_type,
     build_latest_digital_rule_map,
+    extract_active_digital_rule_ids,
+    fetch_digital_rules_lookup,
     resolve_template_name,
 )
 
 
 def test_resolve_template_name_with_digital_rules():
-    # Setup digital_rules lookup: (digital_rule_id, mode, language) -> iteration
+    # Setup digital_rules lookup with cohort-level and rule-id mappings
     digital_rules_lookup = {
+        ("PREDUE", "SMS", "ENGLISH"): "CUSTOM_SMS_RULE_101_ENG",
+        ("PREDUE", "SMS", "DEFAULT"): "CUSTOM_SMS_RULE_101_ENG",
+        ("PREDUE", "WHATSAPP", "HINDI"): "CUSTOM_WHATSAPP_RULE_102_HIN",
+        ("PREDUE", "WHATSAPP", "DEFAULT"): "CUSTOM_WHATSAPP_RULE_102_HIN",
         ("101", "SMS", "ENGLISH"): "CUSTOM_SMS_RULE_101_ENG",
         ("102", "WHATSAPP", "HINDI"): "CUSTOM_WHATSAPP_RULE_102_HIN",
     }
@@ -43,8 +49,8 @@ def test_resolve_template_name_with_digital_rules():
     )
     assert name1 == "CUSTOM_SMS_RULE_101_ENG"
 
-    # Test resolution for unknown loan -> fallback to standard _template_name
-    name_fallback = resolve_template_name(
+    # Test resolution for unknown loan -> cohort lookup from digital_rules_lookup
+    name_cohort = resolve_template_name(
         loan_number="ACC_UNKNOWN",
         due_type="PREDUE",
         mode="SMS",
@@ -52,7 +58,102 @@ def test_resolve_template_name_with_digital_rules():
         digital_rule_id_map=digital_rule_id_map,
         digital_rules_lookup=digital_rules_lookup,
     )
-    assert name_fallback == _template_name(due_type="PREDUE", mode="SMS", language="ENGLISH")
+    assert name_cohort == "CUSTOM_SMS_RULE_101_ENG"
+
+    # Test language fallback in digital_rules_lookup (e.g. TELUGU falls back to DEFAULT)
+    name_lang_fallback = resolve_template_name(
+        loan_number="ACC_UNKNOWN",
+        due_type="PREDUE",
+        mode="WHATSAPP",
+        language="TELUGU",
+        digital_rules_lookup=digital_rules_lookup,
+    )
+    assert name_lang_fallback == "CUSTOM_WHATSAPP_RULE_102_HIN"
+
+    # When no rule exists in digital_rules_lookup, synthesized fallback is commented out -> returns ""
+    name_empty = resolve_template_name(
+        loan_number="ACC_UNKNOWN",
+        due_type="POSTDUE",
+        mode="VOICE",
+        language="ENGLISH",
+        digital_rules_lookup=digital_rules_lookup,
+    )
+    assert name_empty == ""
+
+
+def test_normalize_campaign_identifier_due_type():
+    assert _normalize_campaign_identifier_due_type("PRE_DUE_CAMPAIGN") == "PREDUE"
+    assert _normalize_campaign_identifier_due_type("PREDUE") == "PREDUE"
+    assert _normalize_campaign_identifier_due_type("POST_DUE_CAMPAIGN") == "POSTDUE"
+    assert _normalize_campaign_identifier_due_type("POSTDUE") == "POSTDUE"
+    assert _normalize_campaign_identifier_due_type("DUE_DATE") == "DUEDATE"
+    # Fallback to inspecting iteration
+    assert _normalize_campaign_identifier_due_type(None, iteration="PREDUE_SMS") == "PREDUE"
+    assert _normalize_campaign_identifier_due_type(None, iteration="POSTDUE-VOICE") == "POSTDUE"
+
+
+def test_extract_active_digital_rule_ids(tmp_path: Path):
+    file1 = tmp_path / "comm_old.csv"
+    pd.DataFrame({
+        "apac_card_number": ["1", "2"],
+        "digital_rule_id": ["10", "20"],
+    }).to_csv(file1, index=False)
+
+    file2 = tmp_path / "comm_latest.csv"
+    pd.DataFrame({
+        "apac_card_number": ["3", "4", "5"],
+        "digital_rule_id": ["101", "102", "101"],
+    }).to_csv(file2, index=False)
+
+    # Full scan extracts rule IDs across all historical communication files
+    rule_ids = extract_active_digital_rule_ids([file1, file2])
+    assert rule_ids == ["10", "20", "101", "102"]
+
+
+def test_fetch_digital_rules_lookup_with_active_rule_ids():
+    class DummyCursor:
+        def __init__(self):
+            self.last_query = None
+            self.last_params = None
+
+        def execute(self, query, params=None):
+            self.last_query = str(query)
+            self.last_params = params
+
+        def fetchall(self):
+            return [
+                (50, "SMS", "ENGLISH", "PREDUE", "OLD_PREDUE_SMS_V1"),
+                (101, "SMS", "ENGLISH", "PREDUE", "PREDUE_SMS"),
+                (102, "WHATSAPP", "ENGLISH", "POSTDUE", "POSTDUE-WHATSAPP"),
+            ]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    class DummyConn:
+        def __init__(self):
+            self.cursor_obj = DummyCursor()
+
+        def cursor(self):
+            return self.cursor_obj
+
+    conn = DummyConn()
+    active_ids = ["50", "101", "102"]
+    lookup = fetch_digital_rules_lookup(conn, schema="digital_collections", active_rule_ids=active_ids)
+
+    # Verified query contains AND id = ANY(%s) and ORDER BY id ASC
+    assert "AND id = ANY" in conn.cursor_obj.last_query
+    assert "ORDER BY id ASC" in conn.cursor_obj.last_query
+    assert conn.cursor_obj.last_params == [[50, 101, 102]]
+
+    # Verified newer rule 101 took precedence over older rule 50 for (PREDUE, SMS, ENGLISH)
+    assert lookup.get(("PREDUE", "SMS", "ENGLISH")) == "PREDUE_SMS"
+    assert lookup.get(("PREDUE", "SMS", "DEFAULT")) == "PREDUE_SMS"
+    assert lookup.get(("POSTDUE", "WHATSAPP", "ENGLISH")) == "POSTDUE-WHATSAPP"
+
 
 
 def test_build_latest_digital_rule_map(tmp_path):

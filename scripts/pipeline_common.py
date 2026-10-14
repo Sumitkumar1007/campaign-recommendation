@@ -42,7 +42,15 @@ def load_default_config(config_path: Path | str | None = None) -> dict[str, obje
     if not path.exists():
         return {}
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            f.seek(0)
+            cleaned = "\n".join(
+                line for line in f
+                if not line.strip().startswith("//") and not line.strip().startswith("#")
+            )
+            return json.loads(cleaned)
 
 
 def offset_to_day_label(offset: int | str) -> str:

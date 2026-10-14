@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import joblib
@@ -12,11 +13,15 @@ from entity_keys import annotate_entity_key, entity_key_column_name
 from model_fallbacks import register_legacy_joblib_aliases
 from pipeline_common import (
     DAY_COLUMNS,
+    POSTDUE_DAY_COLUMNS,
+    PREDUE_DAY_COLUMNS,
     SCHEDULE_DAY_COLUMNS,
     apply_postdue_risk_rules,
     apply_predue_risk_rules,
     build_feature_matrix,
+    load_default_config,
     month_to_period,
+    offsets_to_day_columns,
     predict_top_k_by_risk,
     prepare_next_month_dataset,
 )
@@ -25,6 +30,7 @@ from project_paths import (
     FEATURE_DATA_DIR,
     MODEL_DIR,
     PREDICTIONS_DIR,
+    REPO_ROOT,
     SCHEDULE_DATA_DIR,
     ensure_parent_dir,
 )
@@ -85,9 +91,9 @@ def parse_args() -> argparse.Namespace:
         help="Number of base rows to expand in day-wise model-input audit files. Use 0 for all rows.",
     )
     parser.add_argument(
-        "--log-file",
-        default=None,
-        help="Application log file. Defaults to artifacts/logs/catboost_inference.log.",
+        "--config-file",
+        default=os.getenv("CONFIG_FILE", str(REPO_ROOT / "config" / "default_config.json")),
+        help="Path to JSON configuration file containing allowed_day_offsets.",
     )
     args = parser.parse_args()
     missing = [
@@ -518,6 +524,12 @@ def main() -> None:
                 len(bundle["feature_columns"]),
             )
 
+        app_config = load_default_config(args.config_file) if getattr(args, "config_file", None) else {}
+        allowed_offsets = app_config.get("allowed_day_offsets")
+        allowed_day_labels = set(offsets_to_day_columns(allowed_offsets)) if allowed_offsets is not None else set(DAY_COLUMNS)
+        if allowed_offsets is not None:
+            logger.info("Using configured allowed day offsets: %s -> %s", allowed_offsets, sorted(allowed_day_labels))
+
         with log_step(logger, "prepare_dataset", feature_file=args.feature_file, schedule_file=args.schedule_file):
             dataset = prepare_next_month_dataset(
                 feature_file=Path(args.feature_file),
@@ -596,15 +608,19 @@ def main() -> None:
                 ).dt.to_timestamp().dt.strftime("%b-%Y").str.upper()
 
                 for day in DAY_COLUMNS:
-                    logger.info("Predicting day column | day=%s", day)
-                    encoder = bundle["label_encoders"][day]
-                    model = bundle["models"][day]
-                    prediction_output[day] = predict_top_k_by_risk(
-                        model,
-                        encoder,
-                        X_pred,
-                        prediction_rows["RISK"],
-                    )
+                    if day in allowed_day_labels:
+                        logger.info("Predicting day column | day=%s", day)
+                        encoder = bundle["label_encoders"][day]
+                        model = bundle["models"][day]
+                        prediction_output[day] = predict_top_k_by_risk(
+                            model,
+                            encoder,
+                            X_pred,
+                            prediction_rows["RISK"],
+                        )
+                    else:
+                        logger.info("Day column outside allowed_day_offsets, skipping prediction | day=%s", day)
+                        prediction_output[day] = "-"
                 prediction_output["PREDICTION_REASON"] = [
                     build_prediction_reason(
                         prediction_row=prediction_output.iloc[row_idx],
@@ -692,8 +708,13 @@ def main() -> None:
             logger.info("Saved raw predictions CSV | file=%s rows=%s", raw_prediction_file, len(raw_output))
 
         with log_step(logger, "write_predictions", prediction_file=prediction_file):
-            prediction_output = apply_predue_risk_rules(prediction_output)
-            prediction_output = apply_postdue_risk_rules(prediction_output)
+            active_predue = [d for d in PREDUE_DAY_COLUMNS if d in allowed_day_labels]
+            active_postdue = [d for d in POSTDUE_DAY_COLUMNS if d in allowed_day_labels]
+            prediction_output = apply_predue_risk_rules(prediction_output, predue_days=active_predue)
+            prediction_output = apply_postdue_risk_rules(prediction_output, postdue_days=active_postdue)
+            for day in DAY_COLUMNS:
+                if day not in allowed_day_labels:
+                    prediction_output[day] = "-"
             prediction_output = prediction_output.reindex(columns=output_cols).fillna("-")
             prediction_output.to_csv(prediction_file, index=False)
             logger.info("Saved predictions | rows=%s bytes=%s", len(prediction_output), prediction_file.stat().st_size)

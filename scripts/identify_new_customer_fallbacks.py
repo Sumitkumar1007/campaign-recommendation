@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import pandas as pd
 
-from pipeline_common import DAY_COLUMNS
-from project_paths import CASE_DATA_DIR, COMMUNICATION_DATA_DIR, SCHEDULE_DATA_DIR, ensure_parent_dir
+from pipeline_common import DAY_COLUMNS, load_default_config, offsets_to_day_columns
+from project_paths import CASE_DATA_DIR, COMMUNICATION_DATA_DIR, REPO_ROOT, SCHEDULE_DATA_DIR, ensure_parent_dir
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,6 +42,11 @@ def parse_args() -> argparse.Namespace:
         "--prediction-file",
         default="",
         help="Optional prediction CSV to update in-place for new APACs.",
+    )
+    parser.add_argument(
+        "--config-file",
+        default=os.getenv("CONFIG_FILE", str(REPO_ROOT / "config" / "default_config.json")),
+        help="Path to JSON configuration file containing allowed_day_offsets.",
     )
     return parser.parse_args()
 
@@ -174,13 +180,17 @@ def build_average_strategy_by_risk(schedule_file: Path) -> dict[str, dict[str, s
     return average_by_risk
 
 
-def build_fallback_rows(new_cases: pd.DataFrame, fallback_by_risk: dict[str, dict[str, str]]) -> pd.DataFrame:
+def build_fallback_rows(
+    new_cases: pd.DataFrame,
+    fallback_by_risk: dict[str, dict[str, str]],
+    allowed_day_labels: set[str] | None = None,
+) -> pd.DataFrame:
     records: list[dict[str, str]] = []
     for case in new_cases.to_dict("records"):
         risk = str(case.get("originalRisk", "")).strip().upper() or "LOW"
         fallback_by_day = fallback_by_risk.get(risk) or fallback_by_risk.get("LOW", {})
         for day in DAY_COLUMNS:
-            strategy = fallback_by_day.get(day, "-")
+            strategy = fallback_by_day.get(day, "-") if (allowed_day_labels is None or day in allowed_day_labels) else "-"
             records.append(
                 {
                     "apacCardNumber": case["apacCardNumber"],
@@ -199,7 +209,11 @@ def build_fallback_rows(new_cases: pd.DataFrame, fallback_by_risk: dict[str, dic
     return pd.DataFrame(records)
 
 
-def apply_fallbacks_to_prediction_file(prediction_file: Path, fallback_rows: pd.DataFrame) -> int:
+def apply_fallbacks_to_prediction_file(
+    prediction_file: Path,
+    fallback_rows: pd.DataFrame,
+    allowed_day_labels: set[str] | None = None,
+) -> int:
     if not prediction_file.exists() or fallback_rows.empty:
         return 0
     predictions = pd.read_csv(prediction_file, dtype=str).fillna("")
@@ -246,7 +260,10 @@ def apply_fallbacks_to_prediction_file(prediction_file: Path, fallback_rows: pd.
             predictions.at[idx, "SOURCE_RISK"] = risk_map[matched_key]
         for day in DAY_COLUMNS:
             if day in predictions.columns:
-                predictions.at[idx, day] = fallback_map.get((matched_key, day), "-")
+                if allowed_day_labels is not None and day not in allowed_day_labels:
+                    predictions.at[idx, day] = "-"
+                else:
+                    predictions.at[idx, day] = fallback_map.get((matched_key, day), "-")
         if "D" in predictions.columns:
             predictions.at[idx, "D"] = "-"
         if "PREDICTION_REASON" in predictions.columns:
@@ -281,7 +298,10 @@ def apply_fallbacks_to_prediction_file(prediction_file: Path, fallback_rows: pd.
                 "IS_NEW_CUSTOMER": "True",
             }
             for day in DAY_COLUMNS:
-                row_dict[day] = fallback_map.get((loan, day), "-")
+                if allowed_day_labels is not None and day not in allowed_day_labels:
+                    row_dict[day] = "-"
+                else:
+                    row_dict[day] = fallback_map.get((loan, day), "-")
             if "D" in row_dict:
                 row_dict["D"] = "-"
             new_rows.append(row_dict)
@@ -301,6 +321,10 @@ def main() -> None:
     output_file = ensure_parent_dir(args.output_file)
     communication_files = [Path(path) for path in args.communication_files] or sorted(COMMUNICATION_DATA_DIR.glob("*.csv"))
 
+    app_config = load_default_config(args.config_file) if getattr(args, "config_file", None) else {}
+    allowed_offsets = app_config.get("allowed_day_offsets")
+    allowed_day_labels = set(offsets_to_day_columns(allowed_offsets)) if allowed_offsets is not None else None
+
     case_apacs = load_case_apacs(cases_file)
     history_apacs = load_history_apacs(communication_files)
     is_in_history = (
@@ -309,9 +333,9 @@ def main() -> None:
     )
     new_cases = case_apacs[~is_in_history].copy()
     fallback_by_risk = build_average_strategy_by_risk(Path(args.schedule_file))
-    output = build_fallback_rows(new_cases, fallback_by_risk)
+    output = build_fallback_rows(new_cases, fallback_by_risk, allowed_day_labels=allowed_day_labels)
     output.to_csv(output_file, index=False)
-    updated_predictions = apply_fallbacks_to_prediction_file(Path(args.prediction_file), output) if args.prediction_file else 0
+    updated_predictions = apply_fallbacks_to_prediction_file(Path(args.prediction_file), output, allowed_day_labels=allowed_day_labels) if args.prediction_file else 0
 
     print(
         "New customer fallback summary | "

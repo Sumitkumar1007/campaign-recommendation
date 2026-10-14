@@ -263,7 +263,15 @@ def normalize_vertical(series: pd.Series) -> pd.Series:
 
 def load_send_hour_window(config_file: str | Path) -> dict[str, int]:
     with Path(config_file).open("r", encoding="utf-8") as handle:
-        raw_window = json.load(handle).get("send_hour_window", {})
+        try:
+            raw_window = json.load(handle).get("send_hour_window", {})
+        except json.JSONDecodeError:
+            handle.seek(0)
+            cleaned = "\n".join(
+                line for line in handle
+                if not line.strip().startswith("//") and not line.strip().startswith("#")
+            )
+            raw_window = json.loads(cleaned).get("send_hour_window", {})
     return {
         "start_hour": int(raw_window.get("start_hour", 9)),
         "end_hour": int(raw_window.get("end_hour", 18)),
@@ -286,11 +294,54 @@ def bucket_send_hour(hour: object, send_hour_window: dict[str, int] | None = Non
     return max(allowed_hour for allowed_hour in allowed_hours if allowed_hour <= hour_int)
 
 
+def load_allowed_day_offsets(config_file: str | Path | None) -> list[int] | None:
+    if not config_file:
+        return None
+    config_path = Path(config_file)
+    if not config_path.exists():
+        return None
+    raw = None
+    try:
+        with config_path.open("r", encoding="utf-8") as handle:
+            raw = json.load(handle).get("allowed_day_offsets")
+    except json.JSONDecodeError:
+        try:
+            with config_path.open("r", encoding="utf-8") as handle:
+                cleaned = "\n".join(
+                    line for line in handle
+                    if not line.strip().startswith("//") and not line.strip().startswith("#")
+                )
+                raw = json.loads(cleaned).get("allowed_day_offsets")
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+    if raw is None:
+        return None
+    result: list[int] = []
+    for item in raw:
+        if isinstance(item, int):
+            result.append(item)
+        elif isinstance(item, str) and item.strip():
+            val = item.strip()
+            if val.startswith("D-"):
+                result.append(-int(val[2:]))
+            elif val.startswith("D+"):
+                result.append(int(val[2:]))
+            elif val == "D":
+                result.append(0)
+            elif val.lstrip("-").isdigit():
+                result.append(int(val))
+    return result
+
+
 def process_chunk(
     chunk: pd.DataFrame,
     sample_cards: set[str] | None = None,
     month_source: str = "emi_date",
     send_hour_window: dict[str, int] | None = None,
+    allowed_day_offsets: list[int] | None = None,
     weighting_enabled: bool = False,
     success_statuses: dict[str, set[str]] | None = None,
     success_scores: dict[str, dict[str, float]] | None = None,
@@ -338,7 +389,11 @@ def process_chunk(
     ].copy()
 
     df["offset"] = (df["date"] - df["emi_date"]).dt.days
-    df = df[df["offset"].between(-5, 20) & df["offset"].ne(0)].copy()
+    if allowed_day_offsets is not None:
+        allowed_set = {int(o) for o in allowed_day_offsets if int(o) != 0}
+        df = df[df["offset"].isin(allowed_set)].copy()
+    else:
+        df = df[df["offset"].between(-5, 20) & df["offset"].ne(0)].copy()
     if df.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
@@ -539,6 +594,7 @@ def process_chunk(
 def summarize_chunk_audit(
     chunk: pd.DataFrame,
     sample_cards: set[str] | None = None,
+    allowed_day_offsets: list[int] | None = None,
 ) -> dict[str, object]:
     df = chunk.copy()
     df = annotate_entity_key(df, loan_column="apac_card_number", party_column="party_id", output_column=entity_key_column_name())
@@ -563,7 +619,11 @@ def summarize_chunk_audit(
         & created_ts.notna()
     )
     offsets = (event_date - emi_date).dt.days
-    within_window = offsets.between(-5, 5, inclusive="both")
+    if allowed_day_offsets is not None:
+        allowed_set = {int(o) for o in allowed_day_offsets if int(o) != 0}
+        within_window = offsets.isin(allowed_set)
+    else:
+        within_window = offsets.between(-5, 20, inclusive="both")
     day_zero = offsets.eq(0)
     kept_mask = required_mask & within_window & ~day_zero
 
@@ -645,6 +705,7 @@ def build_dataset(
     month_source: str = "emi_date",
     send_hour_window: dict[str, int] | None = None,
     payment_files: list[Path] | None = None,
+    allowed_day_offsets: list[int] | None = None,
 ) -> None:
     (
         weighting_enabled,
@@ -699,12 +760,13 @@ def build_dataset(
             for column in USECOLS:
                 if column not in chunk.columns:
                     chunk[column] = ""
-            merge_audit_counts(audit_counts, summarize_chunk_audit(chunk, sample_cards=sample_cards))
+            merge_audit_counts(audit_counts, summarize_chunk_audit(chunk, sample_cards=sample_cards, allowed_day_offsets=allowed_day_offsets))
             feature_counts, strategy_counts, risk_counts = process_chunk(
                 chunk,
                 sample_cards=sample_cards,
                 month_source=month_source,
                 send_hour_window=send_hour_window,
+                allowed_day_offsets=allowed_day_offsets,
                 weighting_enabled=weighting_enabled,
                 success_statuses=success_statuses,
                 success_scores=success_scores,
@@ -726,7 +788,8 @@ def build_dataset(
                 risk_parts.append(risk_counts)
 
     if not feature_parts:
-        raise ValueError("No rows matched the D-5 to D+20 window.")
+        window_desc = f"{sorted(allowed_day_offsets)}" if allowed_day_offsets is not None else "D-5 to D+20"
+        raise ValueError(f"No rows matched the {window_desc} window.")
     if not risk_parts:
         raise ValueError("No risk rows found in communication data.")
 
@@ -871,6 +934,7 @@ def main() -> None:
     load_dotenv(override=True)
     args = parse_args()
     send_hour_window = load_send_hour_window(args.config_file)
+    allowed_day_offsets = load_allowed_day_offsets(args.config_file)
     build_dataset(
         input_dir=Path(args.input_dir),
         output_file=Path(args.output_file),
@@ -881,6 +945,7 @@ def main() -> None:
         month_source=args.month_source,
         send_hour_window=send_hour_window,
         payment_files=[Path(path) for path in args.payment_files],
+        allowed_day_offsets=allowed_day_offsets,
     )
 
 
