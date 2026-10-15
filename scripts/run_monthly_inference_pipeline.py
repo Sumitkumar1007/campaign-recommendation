@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import json
 import logging
 import os
@@ -49,6 +50,7 @@ from project_paths import (
     COMMUNICATION_DATA_DIR,
     FEATURE_DATA_DIR,
     LOG_DIR,
+    ensure_parent_dir,
     METRICS_DIR,
     MODEL_DIR,
     PAYMENT_DATA_DIR,
@@ -500,6 +502,7 @@ def build_prediction_summary(
     mapping_df: pd.DataFrame,
     schedule_file: Path | None = None,
     campaign_days: list[str] | None = None,
+    template_summary: dict[str, object] | None = None,
 ) -> dict[str, object]:
     predictions = pd.read_csv(prediction_file)
     predictions = predictions[predictions["MONTH"] == prediction_month_label].copy()
@@ -576,7 +579,7 @@ def build_prediction_summary(
     prediction_days_count = len(effective_days)
     prediction_window = f"{prediction_days_count} days"
 
-    return {
+    res: dict[str, object] = {
         "source_month": source_month_label,
         "prediction_month": prediction_month_label,
         "model_name": model_name,
@@ -598,6 +601,41 @@ def build_prediction_summary(
         "prediction_days_count": prediction_days_count,
         "prediction_window": prediction_window,
     }
+
+    if template_summary:
+        failures_list = []
+        for k, v in template_summary.get("failures", {}).items():
+            if isinstance(k, tuple) and len(k) >= 4:
+                failures_list.append({
+                    "due_type": str(k[0]),
+                    "mode": str(k[1]),
+                    "language": str(k[2]),
+                    "reason": str(k[3]),
+                    "count": int(v),
+                })
+        fallbacks_list = []
+        for k, v in template_summary.get("fallbacks", {}).items():
+            if isinstance(k, tuple) and len(k) >= 5:
+                fallbacks_list.append({
+                    "due_type": str(k[0]),
+                    "mode": str(k[1]),
+                    "language": str(k[2]),
+                    "resolved_template": str(k[3]),
+                    "reason": str(k[4]),
+                    "count": int(v),
+                })
+        res["template_summary"] = {
+            "total_touchpoints": int(template_summary.get("total_touchpoints", 0)),
+            "resolved_count": int(template_summary.get("resolved_count", 0)),
+            "failed_count": int(template_summary.get("failed_count", 0)),
+            "status_counts": {str(k): int(v) for k, v in template_summary.get("status_counts", {}).items()},
+            "templates_used": {str(k): int(v) for k, v in template_summary.get("templates_used", {}).items()},
+            "failures": failures_list,
+            "fallbacks": fallbacks_list,
+            "standalone_log_file": str(LOG_DIR / "template_resolution.log"),
+        }
+
+    return res
 
 
 def write_prediction_summary(
@@ -1166,22 +1204,92 @@ def fetch_digital_rules_lookup(
                 if lang_u == "ENGLISH":
                     lookup[(due_type_norm, mode_u, "DEFAULT")] = iter_val
 
-                # 2. Also map by (rule_id, mode, language)
+                # 2. Also map by (rule_id, mode, language) and with strict due_type metadata
                 lookup[(rule_id_str, mode_u, lang_u)] = iter_val
                 lookup.setdefault((rule_id_str, mode_u, ""), iter_val)
+                lookup[(rule_id_str, due_type_norm, mode_u, lang_u)] = iter_val
+                lookup.setdefault((rule_id_str, due_type_norm, mode_u, ""), iter_val)
+                lookup[("RULE_META", rule_id_str)] = {
+                    "due_type": due_type_norm,
+                    "mode": mode_u,
+                    "language": lang_u,
+                    "iteration": iter_val,
+                }
     else:
         log.warning("Could not pre-fetch digital_rules lookup table from schema=%s", schema)
 
     return lookup
 
 
-def build_latest_digital_rule_map(history_files: list[Path], logger: logging.Logger | None = None) -> dict[tuple[str, str, str], str]:
+def get_template_logger(log_file: str | Path | None = None) -> logging.Logger:
     """
-    Reads historical communication CSVs and maps:
-    (apac_card_number, mode_upper, language_upper) -> latest digital_rule_id (str)
+    Sets up a dedicated standalone logger for template resolution and audits.
+    Writes strictly to artifacts/logs/template_resolution.log (or custom path)
+    WITHOUT propagating to root or polluting inference logs.
     """
-    log = logger or logging.getLogger("monthly_inference_pipeline")
-    latest_map: dict[tuple[str, str, str], str] = {}
+    log_path = Path(log_file) if log_file else (LOG_DIR / "template_resolution.log")
+    logger = logging.getLogger("template_resolution")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.propagate = False
+
+    formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    try:
+        ensure_parent_dir(log_path)
+        file_handler = logging.FileHandler(log_path, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    except (PermissionError, OSError):
+        logger.addHandler(logging.NullHandler())
+
+    return logger
+
+
+def validate_template_due_type_consistency(template_name: str, due_type: str) -> bool:
+    """
+    Defense-in-depth safety validation.
+    Guarantees no pre-due campaign receives a post-due template, and vice-versa.
+    """
+    if not template_name:
+        return True
+    t_u = str(template_name).strip().upper()
+    d_u = str(due_type).strip().upper()
+    if d_u == "PREDUE" and "POST" in t_u and "PRE" not in t_u:
+        return False
+    if d_u == "POSTDUE" and "PRE" in t_u and "POST" not in t_u:
+        return False
+    return True
+
+
+def build_latest_digital_rule_map(
+    history_files: list[Path],
+    digital_rules_lookup: dict | None = None,
+    logger: logging.Logger | None = None,
+) -> dict[object, object]:
+    """
+    Reads historical communication CSVs and builds:
+    1. (apac, comm_due_type, mode, language) -> (rule_id, template_name)
+    2. ('COMM_COHORT', comm_due_type, mode, language) -> latest template used in comms
+    3. (apac, mode, language) -> rule_id (for backward compatibility)
+
+    Enriches and validates against digital_rules_lookup metadata to verify due_type
+    and channel consistency. Inconsistent rules (e.g. test post-due rule on pre-due comm)
+    are rejected with warning logs written to standalone template logger.
+    """
+    log = logger or get_template_logger()
+    latest_map: dict[object, object] = {}
+    rule_meta_map: dict[str, dict] = {}
+    if digital_rules_lookup:
+        rule_meta_map = {
+            str(k[1]): v
+            for k, v in digital_rules_lookup.items()
+            if isinstance(k, tuple) and len(k) == 2 and k[0] == "RULE_META" and isinstance(v, dict)
+        }
+
     for csv_file in history_files:
         if not csv_file or not Path(csv_file).exists():
             continue
@@ -1205,17 +1313,214 @@ def build_latest_digital_rule_map(history_files: list[Path], logger: logging.Log
                 df_valid["_created_ts"] = pd.to_datetime(df_valid["created_date"], errors="coerce")
                 df_valid = df_valid.sort_values("_created_ts", ascending=True)
 
+            has_date = "date" in df_valid.columns or "created_date" in df_valid.columns
+            has_emi = "emi_date" in df_valid.columns
+            date_col = "date" if "date" in df_valid.columns else "created_date"
+
             for _, row in df_valid.iterrows():
                 apac = str(row[apac_col]).strip() if apac_col in row and pd.notna(row[apac_col]) else ""
                 mode = str(row[mode_col]).strip().upper() if mode_col in row and pd.notna(row[mode_col]) else ""
                 lang = str(row[lang_col]).strip().upper() if lang_col in row and pd.notna(row[lang_col]) else ""
                 rule_id = str(row["digital_rule_id"]).strip()
-                if apac and mode and rule_id:
-                    latest_map[(apac, mode, lang)] = rule_id
-                    latest_map[(apac, mode, "")] = rule_id
+
+                if not (apac and mode and rule_id):
+                    continue
+
+                # Determine comm_due_type from date and emi_date if available
+                comm_due_type = ""
+                if has_date and has_emi and pd.notna(row.get(date_col)) and pd.notna(row.get("emi_date")):
+                    try:
+                        d_ts = pd.to_datetime(row[date_col]).normalize()
+                        emi_ts = pd.to_datetime(row["emi_date"]).normalize()
+                        diff_days = (d_ts - emi_ts).days
+                        if diff_days < 0:
+                            comm_due_type = "PREDUE"
+                        elif diff_days == 0:
+                            comm_due_type = "DUEDATE"
+                        else:
+                            comm_due_type = "POSTDUE"
+                    except Exception:
+                        pass
+
+                # Enrich & Validate against digital_rules metadata
+                template_name = ""
+                meta = rule_meta_map.get(rule_id)
+                if meta:
+                    meta_due = meta.get("due_type", "")
+                    meta_mode = meta.get("mode", "")
+                    meta_template = meta.get("iteration", "")
+
+                    # Check for inconsistency between comm_due_type and rule metadata
+                    if comm_due_type and meta_due and comm_due_type != meta_due:
+                        log.warning(
+                            "Inconsistent historical rule rejected: apac=%s rule_id=%s comm_due=%s rule_due=%s mode=%s template=%s",
+                            apac, rule_id, comm_due_type, meta_due, mode, meta_template,
+                        )
+                        # Do not record inconsistent rule for this communication due_type
+                        continue
+                    if meta_mode and meta_mode != mode:
+                        log.warning(
+                            "Historical rule mode mismatch rejected: apac=%s rule_id=%s comm_mode=%s rule_mode=%s",
+                            apac, rule_id, mode, meta_mode,
+                        )
+                        continue
+
+                    effective_due = comm_due_type or meta_due
+                    template_name = meta_template
+                else:
+                    effective_due = comm_due_type
+
+                # 1. Record account history rule
+                if effective_due:
+                    latest_map[(apac, effective_due, mode, lang)] = (rule_id, template_name) if template_name else rule_id
+                    latest_map[(apac, effective_due, mode, "")] = (rule_id, template_name) if template_name else rule_id
+
+                # 2. Record latest communication cohort template
+                if effective_due and template_name:
+                    latest_map[("COMM_COHORT", effective_due, mode, lang)] = template_name
+                    latest_map[("COMM_COHORT", effective_due, mode, "DEFAULT")] = template_name
+                    if lang == "ENGLISH":
+                        latest_map[("COMM_COHORT", effective_due, mode, "DEFAULT")] = template_name
+
+                # 3. Backward-compatible mapping
+                latest_map[(apac, mode, lang)] = rule_id
+                latest_map[(apac, mode, "")] = rule_id
+
         except Exception as e:
             log.warning("Error loading digital_rule_id from %s: %s", csv_file, e)
+
     return latest_map
+
+
+def resolve_template_name_with_status(
+    *,
+    loan_number: str = "",
+    due_type: str,
+    mode: str,
+    language: str,
+    digital_rule_id_map: dict | None = None,
+    digital_rules_lookup: dict | None = None,
+    default_templates: dict[str, object] | list | None = None,
+    comm_cohort_templates: dict | None = None,
+) -> tuple[str, str, str]:
+    """
+    Priority resolution:
+      1. Existing APAC historical rule matching (due_type, mode)
+      2. Latest communication cohort template actually used in comm_data for (due_type, mode, language)
+      3. Communication language fallback (DEFAULT / ENGLISH)
+      4. Database digital_rules cohort template
+      5. Config default_templates
+      6. Failure (returns '', 'FAILED', reason)
+    """
+    mode_u = mode.strip().upper()
+    lang_u = language.strip().upper()
+    due_u = due_type.strip().upper()
+
+    # Step 1: Existing APAC historical rule matching (due_type, mode)
+    if digital_rule_id_map and loan_number:
+        # Check due_type-qualified match first: (loan_number, due_u, mode_u, lang_u)
+        hist_entry = (
+            digital_rule_id_map.get((loan_number, due_u, mode_u, lang_u))
+            or digital_rule_id_map.get((loan_number, due_u, mode_u, ""))
+        )
+        if hist_entry:
+            if isinstance(hist_entry, tuple):
+                rule_id, template_candidate = hist_entry[0], hist_entry[1]
+            else:
+                rule_id = str(hist_entry)
+                template_candidate = ""
+                if digital_rules_lookup:
+                    template_candidate = (
+                        digital_rules_lookup.get((rule_id, mode_u, lang_u))
+                        or digital_rules_lookup.get((rule_id, mode_u, ""))
+                        or ""
+                    )
+            if template_candidate and validate_template_due_type_consistency(template_candidate, due_u):
+                return template_candidate, "ACCOUNT_RULE_MATCH", f"Matched account historical rule ID {rule_id}"
+
+        # Check fallback to non-due-qualified match, but ONLY if rule metadata matches due_type!
+        hist_unqualified = (
+            digital_rule_id_map.get((loan_number, mode_u, lang_u))
+            or digital_rule_id_map.get((loan_number, mode_u, ""))
+        )
+        if hist_unqualified:
+            rule_id = str(hist_unqualified)
+            rule_meta = digital_rules_lookup.get(("RULE_META", rule_id)) if digital_rules_lookup else None
+            rule_due = rule_meta.get("due_type") if rule_meta else None
+            rule_mode = rule_meta.get("mode") if rule_meta else None
+
+            if (rule_due is None or rule_due == due_u) and (rule_mode is None or rule_mode == mode_u):
+                template_candidate = (
+                    rule_meta.get("iteration") if rule_meta else ""
+                ) or (
+                    digital_rules_lookup.get((rule_id, mode_u, lang_u))
+                    or digital_rules_lookup.get((rule_id, mode_u, ""))
+                    if digital_rules_lookup else ""
+                )
+                if template_candidate and validate_template_due_type_consistency(template_candidate, due_u):
+                    return template_candidate, "ACCOUNT_RULE_MATCH", f"Matched account historical rule ID {rule_id}"
+
+    # Step 2: For new accounts / unmatched IDs -> Resolve against latest communication cohort template
+    cohort_dict = comm_cohort_templates
+    if cohort_dict is None and digital_rule_id_map:
+        cohort_dict = {
+            (k[1], k[2], k[3]): v
+            for k, v in digital_rule_id_map.items()
+            if isinstance(k, tuple) and len(k) == 4 and k[0] == "COMM_COHORT"
+        }
+
+    if cohort_dict:
+        comm_template = cohort_dict.get((due_u, mode_u, lang_u))
+        if comm_template and validate_template_due_type_consistency(comm_template, due_u):
+            return comm_template, "COMM_COHORT_MATCH", f"Matched latest communication template for ({due_u}, {mode_u}, {lang_u})"
+
+        # Step 3: Communication Language Fallback (DEFAULT / ENGLISH)
+        for fallback_lang in ("DEFAULT", "ENGLISH", ""):
+            comm_lang_fallback = cohort_dict.get((due_u, mode_u, fallback_lang))
+            if comm_lang_fallback and validate_template_due_type_consistency(comm_lang_fallback, due_u):
+                return comm_lang_fallback, "COMM_LANG_FALLBACK", f"Language '{lang_u}' fell back to communication default '{comm_lang_fallback}'"
+
+    # Step 4: Fallback to digital_rules database cohort template
+    if digital_rules_lookup is not None:
+        db_exact = digital_rules_lookup.get((due_u, mode_u, lang_u))
+        if db_exact and validate_template_due_type_consistency(db_exact, due_u):
+            return db_exact, "DB_COHORT_MATCH", f"Matched digital_rules table for ({due_u}, {mode_u}, {lang_u})"
+
+        for fallback_lang in ("DEFAULT", "ENGLISH", ""):
+            db_fallback = digital_rules_lookup.get((due_u, mode_u, fallback_lang))
+            if db_fallback and validate_template_due_type_consistency(db_fallback, due_u):
+                return db_fallback, "DB_LANG_FALLBACK", f"Language '{lang_u}' fell back to digital_rules default '{db_fallback}'"
+
+        # Mode fallback strictly within SAME due_type (NEVER cross due_types)
+        for k, iter_val in digital_rules_lookup.items():
+            if isinstance(k, tuple) and len(k) == 3 and not str(k[0]).startswith("RULE_"):
+                d, m, l = k
+                if d == due_u and m == mode_u and iter_val:
+                    if validate_template_due_type_consistency(iter_val, due_u):
+                        return iter_val, "DB_MODE_FALLBACK", f"Fell back to active {due_u} {mode_u} rule '{iter_val}'"
+
+    # Step 5: Fallback to config default_templates
+    if default_templates:
+        cfg_default = get_configured_default_template(default_templates, due_type=due_type, mode=mode, language=language)
+        if cfg_default and validate_template_due_type_consistency(cfg_default, due_u):
+            return cfg_default, "CONFIG_FALLBACK", f"Fell back to configured default '{cfg_default}'"
+
+    # Step 6: Failure diagnostics
+    if digital_rules_lookup is not None or cohort_dict:
+        available_modes = set()
+        if cohort_dict:
+            available_modes.update(m for (d, m, l) in cohort_dict.keys() if d == due_u)
+        if digital_rules_lookup:
+            available_modes.update(m for (d, m, l) in digital_rules_lookup.keys() if d == due_u and not str(d).startswith("RULE_"))
+
+        if mode_u not in available_modes:
+            reason = f"No communication template or digital rule found for mode '{mode_u}' under due_type '{due_u}' (modes with templates in {due_u}: {sorted(available_modes) or 'none'})"
+        else:
+            reason = f"No matching template for ({due_u}, {mode_u}, {lang_u}) and no default in communications or digital_rules"
+        return "", "FAILED", reason
+
+    # Offline pure fallback
+    return _template_name(due_type=due_type, mode=mode, language=language), "SYNTHESIZED", "Offline synthesized fallback"
 
 
 def resolve_template_name(
@@ -1224,62 +1529,80 @@ def resolve_template_name(
     due_type: str,
     mode: str,
     language: str,
-    digital_rule_id_map: dict[tuple[str, str, str], str] | None = None,
-    digital_rules_lookup: dict[tuple[str, str, str], str] | None = None,
+    digital_rule_id_map: dict | None = None,
+    digital_rules_lookup: dict | None = None,
     default_templates: dict[str, object] | list | None = None,
+    comm_cohort_templates: dict | None = None,
 ) -> str:
+    template_name, _, _ = resolve_template_name_with_status(
+        loan_number=loan_number,
+        due_type=due_type,
+        mode=mode,
+        language=language,
+        digital_rule_id_map=digital_rule_id_map,
+        digital_rules_lookup=digital_rules_lookup,
+        default_templates=default_templates,
+        comm_cohort_templates=comm_cohort_templates,
+    )
+    return template_name
+
+
+def emit_template_resolution_audit(
+    audit: dict[str, object],
+    logger: logging.Logger | None = None,
+) -> None:
     """
-    Resolves template_name directly from digital_rules_lookup for the scheduler cohort (due_type, mode, language).
-    Falls back gracefully to DEFAULT/ENGLISH within digital_rules.
-    Config file logic and synthesized fallback strings are commented out.
+    Formats and logs the complete Template Resolution Audit Report to standalone template_resolution.log.
     """
-    mode_u = mode.strip().upper()
-    lang_u = language.strip().upper()
-    due_u = due_type.strip().upper()
+    log = logger or get_template_logger()
+    total = int(audit.get("total_touchpoints", 0))
+    resolved = int(audit.get("resolved_count", 0))
+    failed = int(audit.get("failed_count", 0))
+    pct = (resolved / total * 100.0) if total > 0 else 100.0
+    status_counts = audit.get("status_counts", {})
+    templates_used = audit.get("templates_used", {})
+    fallbacks = audit.get("fallbacks", {})
+    failures = audit.get("failures", {})
 
-    if digital_rules_lookup is not None:
-        # 1. Exact match from active digital_rules: (due_type, mode, language)
-        exact_template = digital_rules_lookup.get((due_u, mode_u, lang_u))
-        if exact_template:
-            return exact_template
+    lines = [
+        "",
+        "=" * 80,
+        "                    AIML TEMPLATE RESOLUTION AUDIT REPORT",
+        "=" * 80,
+        f"Total Communication Touchpoints : {total:,}",
+        f"Resolved Successfully           : {resolved:,} ({pct:.1f}%)",
+        f"  - Account History Matches     : {status_counts.get('ACCOUNT_RULE_MATCH', 0):,}",
+        f"  - Communication Cohort Matches: {status_counts.get('COMM_COHORT_MATCH', 0):,}",
+        f"  - Communication Lang Fallbacks: {status_counts.get('COMM_LANG_FALLBACK', 0):,}",
+        f"  - Database Cohort Fallbacks   : {status_counts.get('DB_COHORT_MATCH', 0) + status_counts.get('DB_COHORT_FALLBACK', 0) + status_counts.get('DB_LANG_FALLBACK', 0) + status_counts.get('DB_MODE_FALLBACK', 0):,}",
+        f"  - Config Default Fallbacks    : {status_counts.get('CONFIG_FALLBACK', 0):,}",
+        f"Failed / Unresolved (EMPTY)     : {failed:,} ({100.0 - pct:.1f}%)" + ("  <-- [ACTION REQUIRED]" if failed > 0 else ""),
+        "-" * 80,
+        "ACTIVE TEMPLATES IN USE:",
+    ]
+    if templates_used:
+        for idx, (t_name, count) in enumerate(sorted(templates_used.items(), key=lambda x: x[1], reverse=True), 1):
+            lines.append(f"  {idx:2d}. {t_name:<30} : {count:,} touchpoints")
+    else:
+        lines.append("  (None)")
 
-        # 2. Account rule match if loan history rule ID is present
-        if digital_rule_id_map and loan_number:
-            rule_id = digital_rule_id_map.get((loan_number, mode_u, lang_u)) or digital_rule_id_map.get((loan_number, mode_u, ""))
-            if rule_id:
-                template_name = digital_rules_lookup.get((rule_id, mode_u, lang_u)) or digital_rules_lookup.get((rule_id, mode_u, ""))
-                if template_name:
-                    return template_name
+    if fallbacks:
+        lines.append("-" * 80)
+        lines.append("LANGUAGE & DEFAULT FALLBACKS APPLIED:")
+        for (d, m, l, res_t, r_reason), count in sorted(fallbacks.items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"  - ({d}, {m}, {l}) -> '{res_t}' [Count: {count:,}]")
+            lines.append(f"    Reason: {r_reason}")
 
-        # 3. Database language fallback: check DEFAULT / ENGLISH / generic for this (due_type, mode)
-        for fallback_lang in ("DEFAULT", "ENGLISH", ""):
-            lang_fallback = digital_rules_lookup.get((due_u, mode_u, fallback_lang))
-            if lang_fallback:
-                return lang_fallback
+    if failures:
+        lines.append("-" * 80)
+        lines.append("FAILED RESOLUTIONS (EMPTY TEMPLATE):")
+        for (d, m, l, f_reason), count in sorted(failures.items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"  - [FAILED] ({d}, {m}, {l}) -> Count: {count:,}")
+            lines.append(f"    Reason: {f_reason}")
 
-        # 4. Database mode fallback: check any active template for this mode
-        for (d, m, l), iter_val in digital_rules_lookup.items():
-            if m == mode_u and iter_val:
-                return iter_val
-
-        # =========================================================================
-        # COMMENTED OUT: Config file logic and synthesized string fallback in DB mode
-        # =========================================================================
-        # configured_default = get_configured_default_template(
-        #     default_templates,
-        #     due_type=due_type,
-        #     mode=mode,
-        #     language=language,
-        # )
-        # if configured_default:
-        #     return configured_default
-        #
-        # return _template_name(due_type=due_type, mode=mode, language=language)
-
-        return ""
-
-    # Purely offline/test fallback when no database lookup is provided at all
-    return _template_name(due_type=due_type, mode=mode, language=language)
+    lines.append("=" * 80)
+    report_text = "\n".join(lines)
+    log.info("%s", report_text)
 
 
 
@@ -1835,10 +2158,22 @@ def _build_campaign_assignment_groups(
     send_hour_window: dict[str, int] | None = None,
     single_communication_per_day: bool = False,
     default_templates: dict[str, object] | list | None = None,
+    audit_collector: dict[str, object] | None = None,
+    template_logger: logging.Logger | None = None,
 ) -> pd.DataFrame:
     df = pd.read_csv(prediction_file, dtype=str).fillna("")
     df = df[df["MONTH"] == prediction_month_label].copy()
     rows: list[dict] = []
+    t_logger = template_logger or get_template_logger()
+    audit_data: dict[str, object] = {
+        "total_touchpoints": 0,
+        "resolved_count": 0,
+        "failed_count": 0,
+        "status_counts": collections.Counter(),
+        "templates_used": collections.Counter(),
+        "fallbacks": collections.Counter(),
+        "failures": collections.Counter(),
+    }
 
     days_to_process = [d for d in (campaign_days or ALL_CAMPAIGN_DAYS) if d in df.columns]
     for _, row in df.iterrows():
@@ -1861,7 +2196,7 @@ def _build_campaign_assignment_groups(
                 vertical_value = str(row.get("SOURCE_VERTICAL", row.get("VERTICAL", vertical))).strip().upper()
                 if not vertical_value or vertical_value == "UNKNOWN":
                     vertical_value = vertical.upper()
-                template_name = resolve_template_name(
+                template_name, status, reason = resolve_template_name_with_status(
                     loan_number=loan_number,
                     due_type=due_type,
                     mode=mode,
@@ -1870,6 +2205,18 @@ def _build_campaign_assignment_groups(
                     digital_rules_lookup=digital_rules_lookup,
                     default_templates=default_templates,
                 )
+                audit_data["total_touchpoints"] = int(audit_data["total_touchpoints"]) + 1
+                if template_name:
+                    audit_data["resolved_count"] = int(audit_data["resolved_count"]) + 1
+                    audit_data["templates_used"][template_name] += 1
+                else:
+                    audit_data["failed_count"] = int(audit_data["failed_count"]) + 1
+                audit_data["status_counts"][status] += 1
+                if status == "FAILED":
+                    audit_data["failures"][(due_type, mode, language, reason)] += 1
+                elif "FALLBACK" in status:
+                    audit_data["fallbacks"][(due_type, mode, language, template_name, reason)] += 1
+
                 emi_cycle = _resolve_row_emi_cycle(row, emi_cycles)
                 dataset_name = f"{due_type}|{NAME_CHANNEL_BY_MODE[mode]}|{vertical_value}|{language}|{risk_code}|{emi_cycle}"
                 mode_vendors = (vendor_map[mode] if vendor_map is not None and mode in vendor_map else (vendors or []))
@@ -1906,6 +2253,10 @@ def _build_campaign_assignment_groups(
                             "due_type": due_type,
                         }
                     )
+
+    emit_template_resolution_audit(audit_data, t_logger)
+    if audit_collector is not None:
+        audit_collector.update(audit_data)
 
     if not rows:
         return pd.DataFrame(
@@ -1965,6 +2316,8 @@ def _prepare_campaign_outputs(
     send_hour_window: dict[str, int] | None = None,
     single_communication_per_day: bool = False,
     default_templates: dict[str, object] | list | None = None,
+    audit_collector: dict[str, object] | None = None,
+    template_logger: logging.Logger | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     if allowed_day_offsets is not None and campaign_days is None:
         campaign_days = offsets_to_day_columns(allowed_day_offsets)
@@ -1986,6 +2339,8 @@ def _prepare_campaign_outputs(
         send_hour_window=send_hour_window,
         single_communication_per_day=single_communication_per_day,
         default_templates=default_templates,
+        audit_collector=audit_collector,
+        template_logger=template_logger,
     )
     if assignment_groups.empty:
         empty_campaigns = pd.DataFrame(
@@ -3527,8 +3882,14 @@ def main() -> None:
                         active_rule_ids=active_rule_ids,
                         logger=logger,
                     )
-                    digital_rule_id_map = build_latest_digital_rule_map(history_files, logger=logger)
+                    template_logger = get_template_logger()
+                    digital_rule_id_map = build_latest_digital_rule_map(
+                        history_files,
+                        digital_rules_lookup=digital_rules_lookup,
+                        logger=template_logger,
+                    )
 
+                    template_audit: dict[str, object] = {}
                     campaign_df, mapping_df = _prepare_campaign_outputs(
                         prediction_file,
                         source_month_label=source_month_label,
@@ -3545,6 +3906,8 @@ def main() -> None:
                         send_hour_window=configured_send_hour_window,
                         single_communication_per_day=True,
                         default_templates=configured_default_templates,
+                        audit_collector=template_audit,
+                        template_logger=template_logger,
                     )
                     campaign_rows = store_campaign_recommendations(
                         conn,
@@ -3565,6 +3928,19 @@ def main() -> None:
                         model_name=args.model,
                     )
                     conn.commit()
+
+                    total_tp = int(template_audit.get("total_touchpoints", 0))
+                    res_tp = int(template_audit.get("resolved_count", 0))
+                    failed_tp = int(template_audit.get("failed_count", 0))
+                    logger.info(
+                        "Template resolution completed | touchpoints=%d resolved=%d failed=%d template_log=%s",
+                        total_tp, res_tp, failed_tp, LOG_DIR / "template_resolution.log",
+                    )
+                    if failed_tp > 0:
+                        logger.warning(
+                            "Template resolution encountered %d failed touchpoint(s) with empty template. See %s for details.",
+                            failed_tp, LOG_DIR / "template_resolution.log",
+                        )
                 print(f"Stored {prediction_rows:,} prediction snapshots in Postgres")
                 print(f"Stored {campaign_rows:,} campaign recommendation snapshots in Postgres")
                 print(f"Stored {mapping_rows:,} campaign mapping snapshots in Postgres")
@@ -3576,6 +3952,8 @@ def main() -> None:
             configured_campaign_days = offsets_to_day_columns(allowed_offsets) if allowed_offsets is not None else None
             configured_send_hour_window = app_config.get("send_hour_window")
             configured_default_templates = app_config.get("default_templates")
+            template_logger = get_template_logger()
+            template_audit = {}
             campaign_df, mapping_df = _prepare_campaign_outputs(
                 prediction_file,
                 source_month_label=source_month_label,
@@ -3589,6 +3967,8 @@ def main() -> None:
                 send_hour_window=configured_send_hour_window,
                 single_communication_per_day=True,
                 default_templates=configured_default_templates,
+                audit_collector=template_audit,
+                template_logger=template_logger,
             )
 
         summary = build_prediction_summary(
@@ -3600,6 +3980,7 @@ def main() -> None:
             mapping_df=mapping_df,
             schedule_file=fallback_schedule_file,
             campaign_days=configured_campaign_days,
+            template_summary=template_audit,
         )
         if drift_report is not None:
             # --- CHANGED: Save the full drift report including feature_metrics ---

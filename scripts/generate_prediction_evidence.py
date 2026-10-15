@@ -6,6 +6,7 @@ from pathlib import Path
 import joblib
 import pandas as pd
 
+from model_fallbacks import register_legacy_joblib_aliases
 from pipeline_common import DAY_COLUMNS, build_feature_matrix, month_to_period, prepare_next_month_dataset
 from predict_next_month_strategy_catboost import build_prediction_population, load_base_population
 from project_paths import CASE_DATA_DIR, FEATURE_DATA_DIR, MODEL_DIR, SCHEDULE_DATA_DIR, TRAINING_DATA_DIR, ensure_parent_dir
@@ -122,11 +123,13 @@ def _prepare_probability_map(
     base_population_file: Path,
     prediction_source_month: str,
 ) -> dict[tuple[str, str], list[tuple[str, float]]]:
+    register_legacy_joblib_aliases()
+    bundle = joblib.load(model_file)
     dataset = prepare_next_month_dataset(
         feature_file=feature_file,
         schedule_file=schedule_file,
         target_offset_months=1,
-        history_window_months=int(joblib.load(model_file).get("history_window_months", 1)),
+        history_window_months=int(bundle.get("history_window_months", 1)),
     )
     selected_loans = set(prediction_rows["Loan_number"].astype(str).str.strip())
     base_population = load_base_population(base_population_file, prediction_source_month)
@@ -140,10 +143,13 @@ def _prepare_probability_map(
         base_population=base_population,
         prediction_source_month=prediction_source_month,
     )
-    bundle = joblib.load(model_file)
     ranked_probability_map: dict[tuple[str, str], list[tuple[str, float]]] = {}
     if prediction_population.empty:
         return ranked_probability_map
+    X_pred = build_feature_matrix(prediction_population).reindex(
+        columns=bundle["feature_columns"],
+        fill_value=0,
+    )
     target_cols = [d for d in DAY_COLUMNS if d in prediction_rows.columns]
     target_days = target_cols if target_cols else DAY_COLUMNS
     for day in target_days:
@@ -379,7 +385,7 @@ def main() -> None:
         raise FileNotFoundError(f"Training dataset not found at {training_file}")
     
     print(f"Loading training dataset from {training_file} ...")
-    training_df = pd.read_csv(training_file)
+    training_df = pd.read_csv(training_file, low_memory=False)
     training_key = "ENTITY_KEY" if "ENTITY_KEY" in training_df.columns else "APAC_CARD_NUMBER"
     training_df[training_key] = training_df[training_key].fillna("").astype(str).str.strip()
     training_df["MONTH"] = training_df["MONTH"].fillna("").astype(str).str.strip().str.upper()

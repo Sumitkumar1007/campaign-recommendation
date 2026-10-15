@@ -46,6 +46,7 @@ artifacts/catboost_info/
 artifacts/models/
 artifacts/checkpoints/
 artifacts/logs/
+artifacts/logs_old/
 artifacts/predictions/
 artifacts/metrics/
 artifacts/explanations/*

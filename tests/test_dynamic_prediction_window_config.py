@@ -713,6 +713,97 @@ def test_build_prediction_summary_fallback_strategy_filtered(tmp_path: Path):
     assert "D+20" not in fallback["LOW_strategy"]
 
 
+def test_prepare_probability_map_builds_x_pred_without_name_error(tmp_path: Path):
+    from generate_prediction_evidence import _prepare_probability_map
+    from sklearn.preprocessing import LabelEncoder
+    from model_fallbacks import ConstantDayModel
+    import joblib
+
+    pred_rows = pd.DataFrame(
+        [
+            {
+                "Loan_number": "ACC_001",
+                "MONTH": "OCT-2026",
+                "SOURCE_RISK": "LOW",
+                "D-5": "SMS-11AM-ENGLISH",
+                "D+1": "SMS-11AM-ENGLISH",
+            }
+        ]
+    )
+
+    feat_file = tmp_path / "features.csv"
+    pd.DataFrame(
+        [
+            {
+                "ENTITY_KEY": "ACC_001",
+                "MONTH": "SEP-2026",
+                "RISK": "LOW",
+                "SMS_TOTAL_INTENSITY": 1.0,
+            }
+        ]
+    ).to_csv(feat_file, index=False)
+
+    sched_file = tmp_path / "schedules.csv"
+    pd.DataFrame(
+        [
+            {
+                "ENTITY_KEY": "ACC_001",
+                "MONTH": "OCT-2026",
+                "TARGET_MONTH": "OCT-2026",
+                "TARGET_MONTH_PERIOD": "2026-10",
+                "RISK": "LOW",
+                "D-5": "SMS-11AM-ENGLISH",
+                "D+1": "SMS-11AM-ENGLISH",
+            }
+        ]
+    ).to_csv(sched_file, index=False)
+
+    base_cases = tmp_path / "cases.csv"
+    pd.DataFrame(
+        [
+            {
+                "apac_card_number": "ACC_001",
+                "risk": "LOW",
+                "vertical": "LAP",
+                "collectable_amount": "1000",
+                "emi_date": "10/09/2026",
+            }
+        ]
+    ).to_csv(base_cases, index=False)
+
+    le = LabelEncoder()
+    le.fit(["SMS-11AM-ENGLISH"])
+    models = {
+        "D-5": ConstantDayModel(0, 1),
+        "D+1": ConstantDayModel(0, 1),
+    }
+    label_encoders = {
+        "D-5": le,
+        "D+1": le,
+    }
+    bundle = {
+        "models": models,
+        "label_encoders": label_encoders,
+        "feature_columns": ["SMS_TOTAL_INTENSITY", "RISK_LOW"],
+        "history_window_months": 1,
+    }
+    model_file = tmp_path / "model.joblib"
+    joblib.dump(bundle, model_file)
+
+    prob_map = _prepare_probability_map(
+        prediction_rows=pred_rows,
+        feature_file=feat_file,
+        schedule_file=sched_file,
+        model_file=model_file,
+        base_population_file=base_cases,
+        prediction_source_month="SEP-2026",
+    )
+    assert isinstance(prob_map, dict)
+    assert ("ACC_001", "D-5") in prob_map
+    assert ("ACC_001", "D+1") in prob_map
+
+
+
 
 
 
