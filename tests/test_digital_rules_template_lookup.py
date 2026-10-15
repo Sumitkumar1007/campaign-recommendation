@@ -22,6 +22,7 @@ from run_monthly_inference_pipeline import (
     resolve_template_name,
     resolve_template_name_with_status,
     validate_template_due_type_consistency,
+    validate_template_language_consistency,
 )
 
 
@@ -431,4 +432,114 @@ def test_template_standalone_logger_isolation(tmp_path: Path):
     assert log_file.exists()
     content = log_file.read_text(encoding="utf-8")
     assert test_msg in content
+
+
+def test_validate_template_language_consistency():
+    # English prediction rejects regional template names
+    assert validate_template_language_consistency("Marathi_Backup_Field_agency_WA_Template", "ENGLISH") is False
+    assert validate_template_language_consistency("Malayalam_Backup_Field_agency_Template", "ENGLISH") is False
+    assert validate_template_language_consistency("PREDUE_AIML_SMS_HINDI", "ENGLISH") is False
+
+    # English prediction accepts valid English / neutral templates
+    assert validate_template_language_consistency("English-Pre Due Date Reminder", "ENGLISH") is True
+    assert validate_template_language_consistency("ENGLISH TEST WHATSAPP", "ENGLISH") is True
+    assert validate_template_language_consistency("PAYMENT_LINK_SMS", "ENGLISH") is True
+
+    # Regional language accepts its own template
+    assert validate_template_language_consistency("Marathi_Backup_Field_agency_WA_Template", "MARATHI") is True
+    assert validate_template_language_consistency("Malayalam_Backup_Field_agency_Template", "MALAYALAM") is True
+
+    # Regional language rejects conflicting regional template
+    assert validate_template_language_consistency("Marathi_Backup_Field_agency_WA_Template", "HINDI") is False
+    assert validate_template_language_consistency("PREDUE_AIML_SMS_HINDI", "MARATHI") is False
+
+
+def test_resolve_template_name_rejects_incompatible_rule_language():
+    """
+    UAT Scenario:
+    Account has historical rule 171 which in digital_rules is defined as MARATHI.
+    The prediction strategy is English (WH-14-ENGLISH).
+    Resolution must reject rule 171 and resolve the valid English cohort template.
+    """
+    digital_rule_id_map = {
+        ("MOB-TEST-Aryan_AIML", "PREDUE", "WHATSAPP", "MARATHI"): ("171", "Marathi_Backup_Field_agency_WA_Template"),
+        ("MOB-TEST-Aryan_AIML", "PREDUE", "WHATSAPP", ""): ("171", "Marathi_Backup_Field_agency_WA_Template"),
+        ("COMM_COHORT", "PREDUE", "WHATSAPP", "ENGLISH"): "ENGLISH TEST WHATSAPP",
+        ("COMM_COHORT", "PREDUE", "WHATSAPP", "DEFAULT"): "ENGLISH TEST WHATSAPP",
+    }
+
+    digital_rules_lookup = {
+        ("PREDUE", "WHATSAPP", "ENGLISH"): "ENGLISH TEST WHATSAPP",
+        ("PREDUE", "WHATSAPP", "DEFAULT"): "ENGLISH TEST WHATSAPP",
+        ("PREDUE", "WHATSAPP", "MARATHI"): "Marathi_Backup_Field_agency_WA_Template",
+        ("171", "WHATSAPP", "MARATHI"): "Marathi_Backup_Field_agency_WA_Template",
+        ("171", "WHATSAPP", ""): "Marathi_Backup_Field_agency_WA_Template",
+        ("RULE_META", "171"): {
+            "due_type": "PREDUE",
+            "mode": "WHATSAPP",
+            "language": "MARATHI",
+            "iteration": "Marathi_Backup_Field_agency_WA_Template",
+        },
+    }
+
+    # When prediction is ENGLISH, rule 171 (Marathi) MUST be rejected and resolve to English cohort template!
+    template_name, status, reason = resolve_template_name_with_status(
+        loan_number="MOB-TEST-Aryan_AIML",
+        due_type="PREDUE",
+        mode="WHATSAPP",
+        language="ENGLISH",
+        digital_rule_id_map=digital_rule_id_map,
+        digital_rules_lookup=digital_rules_lookup,
+    )
+    assert template_name == "ENGLISH TEST WHATSAPP"
+    assert status == "COMM_COHORT_MATCH"
+    assert "Marathi" not in template_name
+
+    # Conversely, when prediction is MARATHI, rule 171 (Marathi) matches successfully!
+    template_name_mar, status_mar, _ = resolve_template_name_with_status(
+        loan_number="MOB-TEST-Aryan_AIML",
+        due_type="PREDUE",
+        mode="WHATSAPP",
+        language="MARATHI",
+        digital_rule_id_map=digital_rule_id_map,
+        digital_rules_lookup=digital_rules_lookup,
+    )
+    assert template_name_mar == "Marathi_Backup_Field_agency_WA_Template"
+    assert status_mar == "ACCOUNT_RULE_MATCH"
+
+
+def test_build_latest_digital_rule_map_rejects_language_mismatch(tmp_path: Path):
+    """
+    Verify that if comm_data has verbiage_language = ENGLISH, but the digital_rule_id
+    is defined as MARATHI in digital_rules metadata, it is rejected as a mismatch.
+    """
+    comm_file = tmp_path / "comm_lang_test.csv"
+    df = pd.DataFrame([
+        {
+            "apac_card_number": "MOB-TEST-Aryan_AIML",
+            "communication_type": "WHATSAPP",
+            "verbiage_language": "ENGLISH",
+            "digital_rule_id": "171",
+            "date": "2026-09-01",
+            "emi_date": "2026-09-05",
+            "created_date": "2026-09-01 10:00:00",
+        }
+    ])
+    df.to_csv(comm_file, index=False)
+
+    rules_lookup = {
+        ("RULE_META", "171"): {
+            "due_type": "PREDUE",
+            "mode": "WHATSAPP",
+            "language": "MARATHI",
+            "iteration": "Marathi_Backup_Field_agency_WA_Template",
+        },
+    }
+
+    rule_map = build_latest_digital_rule_map([comm_file], digital_rules_lookup=rules_lookup)
+
+    # Inconsistent language: comm said ENGLISH, rule 171 in digital_rules is MARATHI
+    # It must NOT be registered under ("MOB-TEST-Aryan_AIML", "PREDUE", "WHATSAPP", "ENGLISH")
+    assert ("MOB-TEST-Aryan_AIML", "PREDUE", "WHATSAPP", "ENGLISH") not in rule_map
+    assert ("COMM_COHORT", "PREDUE", "WHATSAPP", "ENGLISH") not in rule_map
 
