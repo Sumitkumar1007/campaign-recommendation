@@ -1230,21 +1230,29 @@ def get_template_logger(log_file: str | Path | None = None) -> logging.Logger:
     log_path = Path(log_file) if log_file else (LOG_DIR / "template_resolution.log")
     logger = logging.getLogger("template_resolution")
     logger.setLevel(logging.INFO)
-    logger.handlers.clear()
     logger.propagate = False
 
-    formatter = logging.Formatter(
-        fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    needs_handler = not logger.handlers
+    if log_file and logger.handlers:
+        current_paths = [getattr(h, "baseFilename", None) for h in logger.handlers if isinstance(h, logging.FileHandler)]
+        if str(log_path.resolve()) not in current_paths:
+            for h in list(logger.handlers):
+                h.close()
+                logger.removeHandler(h)
+            needs_handler = True
 
-    try:
-        ensure_parent_dir(log_path)
-        file_handler = logging.FileHandler(log_path, encoding="utf-8")
-        file_handler.setFormatter(formatter)
-        logger.addHandler(file_handler)
-    except (PermissionError, OSError):
-        logger.addHandler(logging.NullHandler())
+    if needs_handler:
+        formatter = logging.Formatter(
+            fmt="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+        try:
+            ensure_parent_dir(log_path)
+            file_handler = logging.FileHandler(log_path, encoding="utf-8")
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+        except (PermissionError, OSError):
+            logger.addHandler(logging.NullHandler())
 
     return logger
 
@@ -1369,6 +1377,20 @@ def build_latest_digital_rule_map(
                     template_name = meta_template
                 else:
                     effective_due = comm_due_type
+                    if digital_rules_lookup:
+                        candidate = (
+                            digital_rules_lookup.get((rule_id, mode, lang))
+                            or digital_rules_lookup.get((rule_id, mode, ""))
+                            or ""
+                        )
+                        if candidate:
+                            if comm_due_type and not validate_template_due_type_consistency(candidate, comm_due_type):
+                                log.warning(
+                                    "Inconsistent historical template candidate rejected: apac=%s rule_id=%s comm_due=%s template=%s",
+                                    apac, rule_id, comm_due_type, candidate,
+                                )
+                                continue
+                            template_name = candidate
 
                 # 1. Record account history rule
                 if effective_due:
@@ -1378,9 +1400,14 @@ def build_latest_digital_rule_map(
                 # 2. Record latest communication cohort template
                 if effective_due and template_name:
                     latest_map[("COMM_COHORT", effective_due, mode, lang)] = template_name
-                    latest_map[("COMM_COHORT", effective_due, mode, "DEFAULT")] = template_name
+                    default_key = ("COMM_COHORT", effective_due, mode, "DEFAULT")
+                    empty_key = ("COMM_COHORT", effective_due, mode, "")
                     if lang == "ENGLISH":
-                        latest_map[("COMM_COHORT", effective_due, mode, "DEFAULT")] = template_name
+                        latest_map[default_key] = template_name
+                        latest_map[empty_key] = template_name
+                    elif default_key not in latest_map:
+                        latest_map[default_key] = template_name
+                        latest_map[empty_key] = template_name
 
                 # 3. Backward-compatible mapping
                 latest_map[(apac, mode, lang)] = rule_id
@@ -3875,14 +3902,14 @@ def main() -> None:
                         args.model,
                         campaign_days=configured_campaign_days,
                     )
-                    active_rule_ids = extract_active_digital_rule_ids(history_files, logger=logger)
+                    template_logger = get_template_logger()
+                    active_rule_ids = extract_active_digital_rule_ids(history_files, logger=template_logger)
                     digital_rules_lookup = fetch_digital_rules_lookup(
                         conn,
                         schema=args.source_schema or args.target_schema,
                         active_rule_ids=active_rule_ids,
-                        logger=logger,
+                        logger=template_logger,
                     )
-                    template_logger = get_template_logger()
                     digital_rule_id_map = build_latest_digital_rule_map(
                         history_files,
                         digital_rules_lookup=digital_rules_lookup,

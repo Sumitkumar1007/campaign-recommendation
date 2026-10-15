@@ -15,9 +15,13 @@ from export_mcollect_scheduler import dataset_query_for
 from run_monthly_inference_pipeline import (
     _normalize_campaign_identifier_due_type,
     build_latest_digital_rule_map,
+    emit_template_resolution_audit,
     extract_active_digital_rule_ids,
     fetch_digital_rules_lookup,
+    get_template_logger,
     resolve_template_name,
+    resolve_template_name_with_status,
+    validate_template_due_type_consistency,
 )
 
 
@@ -235,4 +239,196 @@ def test_dataset_query_strips_template_name_noise():
     assert "amcm.language = 'ENGLISH'" in query
     assert "ENGLISH-PRE DUE DATE REMINDER" not in query
     assert "English-Pre Due Date Reminder" not in query
+
+
+def test_validate_template_due_type_consistency():
+    # Pre-due should reject pure post-due templates
+    assert validate_template_due_type_consistency("ENGLISH POST TEST WHATSAPP", "PREDUE") is False
+    assert validate_template_due_type_consistency("POSTDUE_REMINDER_SMS", "PREDUE") is False
+    assert validate_template_due_type_consistency("ENGLISH PRE TEST WHATSAPP", "PREDUE") is True
+    assert validate_template_due_type_consistency("PREDUE_SMS", "PREDUE") is True
+
+    # Post-due should reject pure pre-due templates
+    assert validate_template_due_type_consistency("ENGLISH PRE TEST WHATSAPP", "POSTDUE") is False
+    assert validate_template_due_type_consistency("PREDUE_REMINDER_SMS", "POSTDUE") is False
+    assert validate_template_due_type_consistency("ENGLISH POST TEST WHATSAPP", "POSTDUE") is True
+    assert validate_template_due_type_consistency("POSTDUE_SMS", "POSTDUE") is True
+
+    # Empty / neutral templates
+    assert validate_template_due_type_consistency("", "PREDUE") is True
+    assert validate_template_due_type_consistency("PAYMENT_LINK_SMS", "PREDUE") is True
+    assert validate_template_due_type_consistency("PAYMENT_LINK_SMS", "POSTDUE") is True
+
+
+def test_build_latest_digital_rule_map_rejects_inconsistent_due_type(tmp_path: Path):
+    comm_file = tmp_path / "comm_test.csv"
+    # Row 1: date < emi_date -> PREDUE, but digital_rule_id=200 has POSTDUE metadata
+    # Row 2: date < emi_date -> PREDUE, digital_rule_id=201 has PREDUE metadata
+    df = pd.DataFrame([
+        {
+            "apac_card_number": "ACC_BAD",
+            "communication_type": "WHATSAPP",
+            "verbiage_language": "ENGLISH",
+            "digital_rule_id": "200",
+            "date": "2026-09-01",
+            "emi_date": "2026-09-05",
+            "created_date": "2026-09-01 10:00:00",
+        },
+        {
+            "apac_card_number": "ACC_GOOD",
+            "communication_type": "WHATSAPP",
+            "verbiage_language": "ENGLISH",
+            "digital_rule_id": "201",
+            "date": "2026-09-01",
+            "emi_date": "2026-09-05",
+            "created_date": "2026-09-01 11:00:00",
+        },
+    ])
+    df.to_csv(comm_file, index=False)
+
+    rules_lookup = {
+        ("RULE_META", "200"): {
+            "due_type": "POSTDUE",
+            "mode": "WHATSAPP",
+            "language": "ENGLISH",
+            "iteration": "ENGLISH POST TEST WHATSAPP",
+        },
+        ("RULE_META", "201"): {
+            "due_type": "PREDUE",
+            "mode": "WHATSAPP",
+            "language": "ENGLISH",
+            "iteration": "ENGLISH PRE TEST WHATSAPP",
+        },
+    }
+
+    rule_map = build_latest_digital_rule_map([comm_file], digital_rules_lookup=rules_lookup)
+
+    # ACC_BAD inconsistent rule should NOT be registered for PREDUE
+    assert ("ACC_BAD", "PREDUE", "WHATSAPP", "ENGLISH") not in rule_map
+
+    # ACC_GOOD consistent rule SHOULD be registered
+    assert rule_map.get(("ACC_GOOD", "PREDUE", "WHATSAPP", "ENGLISH")) == ("201", "ENGLISH PRE TEST WHATSAPP")
+
+    # COMM_COHORT should have the consistent pre-due template
+    assert rule_map.get(("COMM_COHORT", "PREDUE", "WHATSAPP", "ENGLISH")) == "ENGLISH PRE TEST WHATSAPP"
+    assert rule_map.get(("COMM_COHORT", "PREDUE", "WHATSAPP", "DEFAULT")) == "ENGLISH PRE TEST WHATSAPP"
+
+
+def test_resolve_template_name_priority_order():
+    # Setup digital_rule_id_map with:
+    # 1. Historical account rule for ACC_HIST
+    # 2. COMM_COHORT latest communication templates
+    digital_rule_id_map = {
+        ("ACC_HIST", "PREDUE", "WHATSAPP", "ENGLISH"): ("100", "HIST_PREDUE_WHATSAPP_ENG"),
+        ("COMM_COHORT", "PREDUE", "WHATSAPP", "ENGLISH"): "COMM_PREDUE_WHATSAPP_ENG",
+        ("COMM_COHORT", "PREDUE", "WHATSAPP", "DEFAULT"): "COMM_PREDUE_WHATSAPP_ENG",
+        ("COMM_COHORT", "PREDUE", "SMS", "ENGLISH"): "COMM_PREDUE_SMS_ENG",
+        ("COMM_COHORT", "PREDUE", "SMS", "DEFAULT"): "COMM_PREDUE_SMS_ENG",
+    }
+
+    digital_rules_lookup = {
+        ("PREDUE", "VOICE", "ENGLISH"): "DB_PREDUE_VOICE_ENG",
+        ("PREDUE", "VOICE", "DEFAULT"): "DB_PREDUE_VOICE_ENG",
+    }
+
+    config_defaults = {
+        "POSTDUE": {
+            "SMS": {
+                "DEFAULT": "CONFIG_POSTDUE_SMS_DEF",
+            }
+        }
+    }
+
+    # Priority 1: Existing account historical rule match
+    t1, s1, _ = resolve_template_name_with_status(
+        loan_number="ACC_HIST",
+        due_type="PREDUE",
+        mode="WHATSAPP",
+        language="ENGLISH",
+        digital_rule_id_map=digital_rule_id_map,
+        digital_rules_lookup=digital_rules_lookup,
+    )
+    assert t1 == "HIST_PREDUE_WHATSAPP_ENG"
+    assert s1 == "ACCOUNT_RULE_MATCH"
+
+    # Priority 2: New account (no historical rule) resolves against latest COMM_COHORT
+    t2, s2, _ = resolve_template_name_with_status(
+        loan_number="ACC_NEW",
+        due_type="PREDUE",
+        mode="WHATSAPP",
+        language="ENGLISH",
+        digital_rule_id_map=digital_rule_id_map,
+        digital_rules_lookup=digital_rules_lookup,
+    )
+    assert t2 == "COMM_PREDUE_WHATSAPP_ENG"
+    assert s2 == "COMM_COHORT_MATCH"
+
+    # Priority 3: Language fallback in COMM_COHORT (TELUGU -> DEFAULT)
+    t3, s3, _ = resolve_template_name_with_status(
+        loan_number="ACC_NEW",
+        due_type="PREDUE",
+        mode="WHATSAPP",
+        language="TELUGU",
+        digital_rule_id_map=digital_rule_id_map,
+        digital_rules_lookup=digital_rules_lookup,
+    )
+    assert t3 == "COMM_PREDUE_WHATSAPP_ENG"
+    assert s3 == "COMM_LANG_FALLBACK"
+
+    # Priority 4: Database digital_rules cohort fallback (mode not in comms)
+    t4, s4, _ = resolve_template_name_with_status(
+        loan_number="ACC_NEW",
+        due_type="PREDUE",
+        mode="VOICE",
+        language="ENGLISH",
+        digital_rule_id_map=digital_rule_id_map,
+        digital_rules_lookup=digital_rules_lookup,
+    )
+    assert t4 == "DB_PREDUE_VOICE_ENG"
+    assert s4 == "DB_COHORT_MATCH"
+
+    # Priority 5: Config defaults fallback
+    t5, s5, _ = resolve_template_name_with_status(
+        loan_number="ACC_NEW",
+        due_type="POSTDUE",
+        mode="SMS",
+        language="ENGLISH",
+        digital_rule_id_map=digital_rule_id_map,
+        digital_rules_lookup=digital_rules_lookup,
+        default_templates=config_defaults,
+    )
+    assert t5 == "CONFIG_POSTDUE_SMS_DEF"
+    assert s5 == "CONFIG_FALLBACK"
+
+    # Priority 6: Unmatched / Missing -> Return empty string and FAILED status
+    t6, s6, reason6 = resolve_template_name_with_status(
+        loan_number="ACC_NEW",
+        due_type="POSTDUE",
+        mode="TELECALLING",
+        language="ENGLISH",
+        digital_rule_id_map=digital_rule_id_map,
+        digital_rules_lookup=digital_rules_lookup,
+    )
+    assert t6 == ""
+    assert s6 == "FAILED"
+    assert "No communication template or digital rule found for mode 'TELECALLING'" in reason6
+
+
+def test_template_standalone_logger_isolation(tmp_path: Path):
+    log_file = tmp_path / "test_template_resolution.log"
+    logger = get_template_logger(log_file=log_file)
+
+    assert logger.name == "template_resolution"
+    assert logger.propagate is False
+
+    test_msg = "STANDALONE_TEMPLATE_AUDIT_LOG_CHECK"
+    logger.info(test_msg)
+
+    # Flush handlers
+    for h in logger.handlers:
+        h.flush()
+
+    assert log_file.exists()
+    content = log_file.read_text(encoding="utf-8")
+    assert test_msg in content
 
