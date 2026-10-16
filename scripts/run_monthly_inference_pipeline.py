@@ -1276,12 +1276,47 @@ def validate_template_due_type_consistency(template_name: str, due_type: str) ->
     return True
 
 
+def validate_template_mode_consistency(template_name: str, mode: str) -> bool:
+    """
+    Defense-in-depth safety validation.
+    Guarantees that a WhatsApp prediction does not receive an SMS or Voice template,
+    an SMS prediction does not receive a WhatsApp or Voice template,
+    and a Voice prediction does not receive an SMS or WhatsApp template.
+    """
+    if not template_name or not mode:
+        return True
+    t_u = str(template_name).strip().upper()
+    m_u = str(mode).strip().upper()
+
+    wa_keywords = ["WHATSAPP", "_WA_", "_WA", "-WA-", "-WA", " WA "]
+    sms_keywords = ["_SMS_", "_SMS", "-SMS-", "-SMS", " SMS "]
+    voice_keywords = ["_VOICE_", "_VOICE", "-VOICE-", "-VOICE", " VOICE ", "OBD", "IVR"]
+
+    is_wa_tpl = any(kw in t_u for kw in wa_keywords)
+    is_sms_tpl = any(kw in t_u for kw in sms_keywords)
+    is_voice_tpl = any(kw in t_u for kw in voice_keywords)
+
+    if m_u == "WHATSAPP":
+        if (is_sms_tpl or is_voice_tpl) and not is_wa_tpl:
+            return False
+    elif m_u == "SMS":
+        if (is_wa_tpl or is_voice_tpl) and not is_sms_tpl:
+            return False
+    elif m_u == "VOICE":
+        if (is_wa_tpl or is_sms_tpl) and not is_voice_tpl:
+            return False
+
+    return True
+
+
 def validate_template_language_consistency(template_name: str, language: str) -> bool:
     """
     Defense-in-depth safety validation.
-    Guarantees no English prediction receives a template designated for a regional language
-    (e.g., Marathi, Hindi, Malayalam, Tamil, etc.) and no regional prediction receives a
-    conflicting regional template.
+    Guarantees:
+    1. No English prediction receives a template designated for a regional language
+       (e.g., Marathi, Hindi, Malayalam, Tamil, etc.) unless English is explicitly supported.
+    2. No regional prediction receives a conflicting regional template (e.g. Marathi prediction
+       receiving a Hindi or Telugu template).
     """
     if not template_name or not language:
         return True
@@ -1427,6 +1462,25 @@ def build_latest_digital_rule_map(
 
                     effective_due = comm_due_type or meta_due
                     effective_lang = meta_lang or lang
+                    if meta_template:
+                        if effective_due and not validate_template_due_type_consistency(meta_template, effective_due):
+                            log.warning(
+                                "Inconsistent historical template due_type rejected: apac=%s rule_id=%s due=%s template=%s",
+                                apac, rule_id, effective_due, meta_template,
+                            )
+                            continue
+                        if not validate_template_mode_consistency(meta_template, mode):
+                            log.warning(
+                                "Inconsistent historical template mode rejected: apac=%s rule_id=%s mode=%s template=%s",
+                                apac, rule_id, mode, meta_template,
+                            )
+                            continue
+                        if effective_lang and not validate_template_language_consistency(meta_template, effective_lang):
+                            log.warning(
+                                "Inconsistent historical template language rejected: apac=%s rule_id=%s lang=%s template=%s",
+                                apac, rule_id, effective_lang, meta_template,
+                            )
+                            continue
                     template_name = meta_template
                 else:
                     effective_due = comm_due_type
@@ -1442,6 +1496,12 @@ def build_latest_digital_rule_map(
                                 log.warning(
                                     "Inconsistent historical template candidate rejected: apac=%s rule_id=%s comm_due=%s template=%s",
                                     apac, rule_id, comm_due_type, candidate,
+                                )
+                                continue
+                            if not validate_template_mode_consistency(candidate, mode):
+                                log.warning(
+                                    "Inconsistent historical template mode rejected: apac=%s rule_id=%s comm_mode=%s template=%s",
+                                    apac, rule_id, mode, candidate,
                                 )
                                 continue
                             if lang and not validate_template_language_consistency(candidate, lang):
@@ -1510,12 +1570,12 @@ def resolve_template_name_with_status(
     lang_u = language.strip().upper()
     due_u = due_type.strip().upper()
 
-    # Step 1: Existing APAC historical rule matching (due_type, mode)
+    # Step 1: Existing APAC historical rule matching (due_type, mode, language)
     if digital_rule_id_map and loan_number:
         # Check due_type-qualified match first: (loan_number, due_u, mode_u, lang_u)
         hist_entry = (
             digital_rule_id_map.get((loan_number, due_u, mode_u, lang_u))
-            or digital_rule_id_map.get((loan_number, due_u, mode_u, ""))
+            or (digital_rule_id_map.get((loan_number, due_u, mode_u, "")) if lang_u == "ENGLISH" else None)
         )
         if hist_entry:
             if isinstance(hist_entry, tuple):
@@ -1526,7 +1586,7 @@ def resolve_template_name_with_status(
                 if digital_rules_lookup:
                     template_candidate = (
                         digital_rules_lookup.get((rule_id, mode_u, lang_u))
-                        or digital_rules_lookup.get((rule_id, mode_u, ""))
+                        or (digital_rules_lookup.get((rule_id, mode_u, "")) if lang_u == "ENGLISH" else "")
                         or ""
                     )
             rule_meta = digital_rules_lookup.get(("RULE_META", str(rule_id))) if digital_rules_lookup else None
@@ -1534,17 +1594,20 @@ def resolve_template_name_with_status(
             rule_mode = rule_meta.get("mode") if rule_meta else None
             rule_lang = str(rule_meta.get("language") or "").strip().upper() if rule_meta else ""
 
+            # Check that due_type, mode, and language of rule and candidate template match prediction
             due_ok = (rule_due is None or rule_due == due_u) and validate_template_due_type_consistency(template_candidate, due_u)
-            mode_ok = (rule_mode is None or rule_mode == mode_u)
-            lang_ok = (not rule_lang or rule_lang == lang_u or (lang_u == "ENGLISH" and rule_lang in ("DEFAULT", ""))) and validate_template_language_consistency(template_candidate, lang_u)
+            mode_ok = (rule_mode is None or rule_mode == mode_u) and validate_template_mode_consistency(template_candidate, mode_u)
+            lang_ok = (
+                (rule_lang == lang_u) or (lang_u == "ENGLISH" and rule_lang in ("DEFAULT", "", None))
+            ) and validate_template_language_consistency(template_candidate, lang_u)
 
             if template_candidate and due_ok and mode_ok and lang_ok:
                 return template_candidate, "ACCOUNT_RULE_MATCH", f"Matched account historical rule ID {rule_id}"
 
-        # Check fallback to non-due-qualified match, but ONLY if rule metadata matches due_type, mode, and language!
+        # Check fallback to non-due-qualified match, but ONLY if rule metadata strictly matches due_type, mode, and language!
         hist_unqualified = (
             digital_rule_id_map.get((loan_number, mode_u, lang_u))
-            or digital_rule_id_map.get((loan_number, mode_u, ""))
+            or (digital_rule_id_map.get((loan_number, mode_u, "")) if lang_u == "ENGLISH" else None)
         )
         if hist_unqualified:
             rule_id = str(hist_unqualified)
@@ -1555,19 +1618,20 @@ def resolve_template_name_with_status(
 
             due_ok = (rule_due is None or rule_due == due_u)
             mode_ok = (rule_mode is None or rule_mode == mode_u)
-            lang_ok = (not rule_lang or rule_lang == lang_u or (lang_u == "ENGLISH" and rule_lang in ("DEFAULT", "")))
+            lang_ok = (not rule_lang or rule_lang == lang_u or (lang_u == "ENGLISH" and rule_lang in ("DEFAULT", "", None)))
 
             if due_ok and mode_ok and lang_ok:
                 template_candidate = (
                     rule_meta.get("iteration") if rule_meta else ""
                 ) or (
                     digital_rules_lookup.get((rule_id, mode_u, lang_u))
-                    or digital_rules_lookup.get((rule_id, mode_u, ""))
+                    or (digital_rules_lookup.get((rule_id, mode_u, "")) if lang_u == "ENGLISH" else "")
                     if digital_rules_lookup else ""
                 )
                 if (
                     template_candidate
                     and validate_template_due_type_consistency(template_candidate, due_u)
+                    and validate_template_mode_consistency(template_candidate, mode_u)
                     and validate_template_language_consistency(template_candidate, lang_u)
                 ):
                     return template_candidate, "ACCOUNT_RULE_MATCH", f"Matched account historical rule ID {rule_id}"
@@ -1586,6 +1650,7 @@ def resolve_template_name_with_status(
         if (
             comm_template
             and validate_template_due_type_consistency(comm_template, due_u)
+            and validate_template_mode_consistency(comm_template, mode_u)
             and validate_template_language_consistency(comm_template, lang_u)
         ):
             return comm_template, "COMM_COHORT_MATCH", f"Matched latest communication template for ({due_u}, {mode_u}, {lang_u})"
@@ -1596,6 +1661,7 @@ def resolve_template_name_with_status(
             if (
                 comm_lang_fallback
                 and validate_template_due_type_consistency(comm_lang_fallback, due_u)
+                and validate_template_mode_consistency(comm_lang_fallback, mode_u)
                 and validate_template_language_consistency(comm_lang_fallback, lang_u)
             ):
                 return comm_lang_fallback, "COMM_LANG_FALLBACK", f"Language '{lang_u}' fell back to communication default '{comm_lang_fallback}'"
@@ -1606,6 +1672,7 @@ def resolve_template_name_with_status(
         if (
             db_exact
             and validate_template_due_type_consistency(db_exact, due_u)
+            and validate_template_mode_consistency(db_exact, mode_u)
             and validate_template_language_consistency(db_exact, lang_u)
         ):
             return db_exact, "DB_COHORT_MATCH", f"Matched digital_rules table for ({due_u}, {mode_u}, {lang_u})"
@@ -1615,6 +1682,7 @@ def resolve_template_name_with_status(
             if (
                 db_fallback
                 and validate_template_due_type_consistency(db_fallback, due_u)
+                and validate_template_mode_consistency(db_fallback, mode_u)
                 and validate_template_language_consistency(db_fallback, lang_u)
             ):
                 return db_fallback, "DB_LANG_FALLBACK", f"Language '{lang_u}' fell back to digital_rules default '{db_fallback}'"
@@ -1626,6 +1694,7 @@ def resolve_template_name_with_status(
                 if d == due_u and m == mode_u and (l == lang_u or l in ("DEFAULT", "")) and iter_val:
                     if (
                         validate_template_due_type_consistency(iter_val, due_u)
+                        and validate_template_mode_consistency(iter_val, mode_u)
                         and validate_template_language_consistency(iter_val, lang_u)
                     ):
                         return iter_val, "DB_MODE_FALLBACK", f"Fell back to active {due_u} {mode_u} rule '{iter_val}'"
@@ -1636,6 +1705,7 @@ def resolve_template_name_with_status(
         if (
             cfg_default
             and validate_template_due_type_consistency(cfg_default, due_u)
+            and validate_template_mode_consistency(cfg_default, mode_u)
             and validate_template_language_consistency(cfg_default, lang_u)
         ):
             return cfg_default, "CONFIG_FALLBACK", f"Fell back to configured default '{cfg_default}'"

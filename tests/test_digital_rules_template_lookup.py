@@ -23,6 +23,7 @@ from run_monthly_inference_pipeline import (
     resolve_template_name_with_status,
     validate_template_due_type_consistency,
     validate_template_language_consistency,
+    validate_template_mode_consistency,
 )
 
 
@@ -589,5 +590,123 @@ def test_db_mode_fallback_rejects_incompatible_language():
     # Generic template without MARATHI in name must still not be matched because cohort is MARATHI
     assert template == ""
     assert status == "FAILED"
+
+
+def test_validate_template_mode_consistency():
+    # WhatsApp rejects SMS or Voice templates
+    assert validate_template_mode_consistency("English_Reminder_SMS", "WHATSAPP") is False
+    assert validate_template_mode_consistency("POSTDUE_SMS_CAMPAIGN", "WHATSAPP") is False
+    assert validate_template_mode_consistency("VOICE_OBD_TEMPLATE", "WHATSAPP") is False
+    assert validate_template_mode_consistency("Marathi_Backup_Field_agency_WA_Template", "WHATSAPP") is True
+    assert validate_template_mode_consistency("ENGLISH TEST WHATSAPP", "WHATSAPP") is True
+
+    # SMS rejects WhatsApp or Voice templates
+    assert validate_template_mode_consistency("Marathi_Backup_Field_agency_WA_Template", "SMS") is False
+    assert validate_template_mode_consistency("ENGLISH TEST WHATSAPP", "SMS") is False
+    assert validate_template_mode_consistency("VOICE_OBD_TEMPLATE", "SMS") is False
+    assert validate_template_mode_consistency("English_Reminder_SMS", "SMS") is True
+    assert validate_template_mode_consistency("English-Pre Due Date Reminder", "SMS") is True
+
+    # Voice rejects WhatsApp or SMS templates
+    assert validate_template_mode_consistency("Marathi_Backup_Field_agency_WA_Template", "VOICE") is False
+    assert validate_template_mode_consistency("English_Reminder_SMS", "VOICE") is False
+    assert validate_template_mode_consistency("VOICE_OBD_TEMPLATE", "VOICE") is True
+
+
+def test_resolve_template_name_rejects_historical_rule_mode_mismatch():
+    """
+    If account has rule 48 in past communication history with mode=SMS,
+    and this month's prediction is mode=WHATSAPP, the historical rule must NOT match.
+    """
+    digital_rules_lookup = {
+        ("RULE_META", "48"): {
+            "due_type": "PREDUE",
+            "mode": "SMS",
+            "language": "ENGLISH",
+            "iteration": "English-Pre Due Date Reminder",
+        },
+        ("PREDUE", "WHATSAPP", "ENGLISH"): "ENGLISH TEST WHATSAPP",
+    }
+    digital_rule_id_map = {
+        ("ACC_TEST", "PREDUE", "SMS", "ENGLISH"): ("48", "English-Pre Due Date Reminder"),
+        ("ACC_TEST", "SMS", "ENGLISH"): "48",
+    }
+
+    template, status, reason = resolve_template_name_with_status(
+        loan_number="ACC_TEST",
+        due_type="PREDUE",
+        mode="WHATSAPP",
+        language="ENGLISH",
+        digital_rule_id_map=digital_rule_id_map,
+        digital_rules_lookup=digital_rules_lookup,
+    )
+    # Must NOT match historical rule 48 because rule 48 is SMS and prediction is WHATSAPP
+    assert template == "ENGLISH TEST WHATSAPP"
+    assert status == "DB_COHORT_MATCH"
+
+
+def test_resolve_template_name_rejects_historical_rule_due_type_mismatch():
+    """
+    If account has rule 99 in past communication history with due_type=POSTDUE,
+    and this month's prediction is due_type=PREDUE, the historical rule must NOT match.
+    """
+    digital_rules_lookup = {
+        ("RULE_META", "99"): {
+            "due_type": "POSTDUE",
+            "mode": "WHATSAPP",
+            "language": "ENGLISH",
+            "iteration": "ENGLISH POST TEST WHATSAPP",
+        },
+        ("PREDUE", "WHATSAPP", "ENGLISH"): "ENGLISH TEST WHATSAPP",
+    }
+    digital_rule_id_map = {
+        ("ACC_TEST", "POSTDUE", "WHATSAPP", "ENGLISH"): ("99", "ENGLISH POST TEST WHATSAPP"),
+        ("ACC_TEST", "WHATSAPP", "ENGLISH"): "99",
+    }
+
+    template, status, reason = resolve_template_name_with_status(
+        loan_number="ACC_TEST",
+        due_type="PREDUE",
+        mode="WHATSAPP",
+        language="ENGLISH",
+        digital_rule_id_map=digital_rule_id_map,
+        digital_rules_lookup=digital_rules_lookup,
+    )
+    # Must NOT match historical rule 99 because rule 99 is POSTDUE and prediction is PREDUE
+    assert template == "ENGLISH TEST WHATSAPP"
+    assert status == "DB_COHORT_MATCH"
+
+
+def test_resolve_template_name_rejects_historical_rule_language_mismatch():
+    """
+    If account has rule 171 in past communication history with language=MARATHI,
+    and this month's prediction is language=ENGLISH, the historical rule must NOT match.
+    """
+    digital_rules_lookup = {
+        ("RULE_META", "171"): {
+            "due_type": "PREDUE",
+            "mode": "WHATSAPP",
+            "language": "MARATHI",
+            "iteration": "Marathi_Backup_Field_agency_WA_Template",
+        },
+        ("PREDUE", "WHATSAPP", "ENGLISH"): "ENGLISH TEST WHATSAPP",
+    }
+    digital_rule_id_map = {
+        ("ACC_TEST", "PREDUE", "WHATSAPP", "MARATHI"): ("171", "Marathi_Backup_Field_agency_WA_Template"),
+        ("ACC_TEST", "WHATSAPP", "MARATHI"): "171",
+    }
+
+    template, status, reason = resolve_template_name_with_status(
+        loan_number="ACC_TEST",
+        due_type="PREDUE",
+        mode="WHATSAPP",
+        language="ENGLISH",
+        digital_rule_id_map=digital_rule_id_map,
+        digital_rules_lookup=digital_rules_lookup,
+    )
+    # Must NOT match historical rule 171 because rule 171 is MARATHI and prediction is ENGLISH
+    assert template == "ENGLISH TEST WHATSAPP"
+    assert status == "DB_COHORT_MATCH"
+
 
 
