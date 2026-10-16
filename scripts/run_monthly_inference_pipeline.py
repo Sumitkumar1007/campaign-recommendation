@@ -1203,8 +1203,9 @@ def fetch_digital_rules_lookup(
                     lookup[(due_type_norm, mode_u, "DEFAULT")] = iter_val
                     lookup[(due_type_norm, mode_u, "")] = iter_val
                 elif not lang_u or lang_u == "DEFAULT":
-                    lookup.setdefault((due_type_norm, mode_u, "DEFAULT"), iter_val)
-                    lookup.setdefault((due_type_norm, mode_u, ""), iter_val)
+                    if validate_template_language_consistency(iter_val, "ENGLISH"):
+                        lookup.setdefault((due_type_norm, mode_u, "DEFAULT"), iter_val)
+                        lookup.setdefault((due_type_norm, mode_u, ""), iter_val)
 
                 # 2. Also map by (rule_id, mode, language) and with strict due_type metadata
                 lookup[(rule_id_str, mode_u, lang_u)] = iter_val
@@ -1469,8 +1470,9 @@ def build_latest_digital_rule_map(
                         latest_map[default_key] = template_name
                         latest_map[empty_key] = template_name
                     elif rec_lang in ("DEFAULT", "") and default_key not in latest_map:
-                        latest_map[default_key] = template_name
-                        latest_map[empty_key] = template_name
+                        if validate_template_language_consistency(template_name, "ENGLISH"):
+                            latest_map[default_key] = template_name
+                            latest_map[empty_key] = template_name
 
                 # 3. Backward-compatible mapping
                 if rec_lang:
@@ -1621,7 +1623,7 @@ def resolve_template_name_with_status(
         for k, iter_val in digital_rules_lookup.items():
             if isinstance(k, tuple) and len(k) == 3 and not str(k[0]).startswith("RULE_"):
                 d, m, l = k
-                if d == due_u and m == mode_u and iter_val:
+                if d == due_u and m == mode_u and (l == lang_u or l in ("DEFAULT", "")) and iter_val:
                     if (
                         validate_template_due_type_consistency(iter_val, due_u)
                         and validate_template_language_consistency(iter_val, lang_u)
@@ -1642,9 +1644,15 @@ def resolve_template_name_with_status(
     if digital_rules_lookup is not None or cohort_dict:
         available_modes = set()
         if cohort_dict:
-            available_modes.update(m for (d, m, l) in cohort_dict.keys() if d == due_u)
+            available_modes.update(
+                k[1] for k in cohort_dict.keys()
+                if isinstance(k, tuple) and len(k) == 3 and k[0] == due_u
+            )
         if digital_rules_lookup:
-            available_modes.update(m for (d, m, l) in digital_rules_lookup.keys() if d == due_u and not str(d).startswith("RULE_"))
+            available_modes.update(
+                k[1] for k in digital_rules_lookup.keys()
+                if isinstance(k, tuple) and len(k) == 3 and k[0] == due_u and not str(k[0]).startswith("RULE_")
+            )
 
         if mode_u not in available_modes:
             reason = f"No communication template or digital rule found for mode '{mode_u}' under due_type '{due_u}' (modes with templates in {due_u}: {sorted(available_modes) or 'none'})"

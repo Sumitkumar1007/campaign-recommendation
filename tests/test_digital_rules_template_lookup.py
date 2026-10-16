@@ -543,3 +543,51 @@ def test_build_latest_digital_rule_map_rejects_language_mismatch(tmp_path: Path)
     assert ("MOB-TEST-Aryan_AIML", "PREDUE", "WHATSAPP", "ENGLISH") not in rule_map
     assert ("COMM_COHORT", "PREDUE", "WHATSAPP", "ENGLISH") not in rule_map
 
+
+def test_failure_diagnostics_safe_unpacking():
+    """
+    Ensure resolve_template_name_with_status handles lookup dictionaries containing
+    arbitrary tuple lengths (such as ('RULE_META', id) or 4-tuples) without raising ValueError.
+    """
+    digital_rules_lookup = {
+        ("RULE_META", "171"): {
+            "due_type": "PREDUE",
+            "mode": "WHATSAPP",
+            "language": "MARATHI",
+            "iteration": "Marathi_Backup_Field_agency_WA_Template",
+        },
+        ("171", "PREDUE", "WHATSAPP", "MARATHI"): "Marathi_Backup_Field_agency_WA_Template",
+        ("PREDUE", "WHATSAPP", "MARATHI"): "Marathi_Backup_Field_agency_WA_Template",
+    }
+    template, status, reason = resolve_template_name_with_status(
+        loan_number="NEW_USER",
+        due_type="PREDUE",
+        mode="WHATSAPP",
+        language="ENGLISH",
+        digital_rules_lookup=digital_rules_lookup,
+    )
+    assert template == ""
+    assert status == "FAILED"
+    assert "No matching template for (PREDUE, WHATSAPP, ENGLISH)" in reason
+
+
+def test_db_mode_fallback_rejects_incompatible_language():
+    """
+    Verify that DB_MODE_FALLBACK does NOT return a regional language rule (e.g. MARATHI)
+    when an ENGLISH prediction is being resolved.
+    """
+    digital_rules_lookup = {
+        ("PREDUE", "WHATSAPP", "MARATHI"): "Some_Generic_WA_Template",
+    }
+    template, status, reason = resolve_template_name_with_status(
+        loan_number="NEW_USER",
+        due_type="PREDUE",
+        mode="WHATSAPP",
+        language="ENGLISH",
+        digital_rules_lookup=digital_rules_lookup,
+    )
+    # Generic template without MARATHI in name must still not be matched because cohort is MARATHI
+    assert template == ""
+    assert status == "FAILED"
+
+
