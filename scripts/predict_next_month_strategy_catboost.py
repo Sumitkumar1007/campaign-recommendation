@@ -22,6 +22,7 @@ from pipeline_common import (
     load_default_config,
     month_to_period,
     offsets_to_day_columns,
+    parse_day_offset,
     predict_top_k_by_risk,
     prepare_next_month_dataset,
 )
@@ -94,6 +95,12 @@ def parse_args() -> argparse.Namespace:
         "--config-file",
         default=os.getenv("CONFIG_FILE", str(REPO_ROOT / "config" / "default_config.json")),
         help="Path to JSON configuration file containing allowed_day_offsets.",
+    )
+    parser.add_argument(
+        "--allowed-day-offsets",
+        nargs="*",
+        default=None,
+        help="Allowed day offsets for prediction (e.g. -5 -4 -3 -2 -1 1 2 3 4 5). Overrides config-file.",
     )
     parser.add_argument(
         "--log-file",
@@ -531,8 +538,13 @@ def main() -> None:
                 len(bundle["feature_columns"]),
             )
 
-        app_config = load_default_config(args.config_file) if getattr(args, "config_file", None) else {}
-        allowed_offsets = app_config.get("allowed_day_offsets")
+        if args.allowed_day_offsets is not None and len(args.allowed_day_offsets) > 0:
+            parsed_offsets = [parse_day_offset(o) for o in args.allowed_day_offsets]
+            allowed_offsets = [o for o in parsed_offsets if o is not None and o != 0]
+            logger.info("Using CLI allowed_day_offsets: %s", allowed_offsets)
+        else:
+            app_config = load_default_config(args.config_file) if getattr(args, "config_file", None) else {}
+            allowed_offsets = app_config.get("allowed_day_offsets")
         allowed_day_labels = set(offsets_to_day_columns(allowed_offsets)) if allowed_offsets is not None else set(DAY_COLUMNS)
         if allowed_offsets is not None:
             configured_day_cols = [d for d in SCHEDULE_DAY_COLUMNS if d in allowed_day_labels or (d == "D" and 0 in allowed_offsets)]

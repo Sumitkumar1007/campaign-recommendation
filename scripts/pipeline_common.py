@@ -88,6 +88,46 @@ def day_label_to_offset(day: str) -> int:
         return 0
 
 
+def parse_day_offset(value: object) -> int | None:
+    """Parses a day offset from int, float, or string (e.g. -5, 5, 'D-5', 'D+5', '+5', '5', '-5').
+    Returns None if value is empty, None, or cannot be parsed as a valid integer offset.
+    """
+    if value is None:
+        return None
+    val_str = str(value).strip()
+    if not val_str:
+        return None
+    if val_str.upper() == "D":
+        return 0
+    if val_str.upper().startswith("D-"):
+        try:
+            return -int(val_str[2:].strip())
+        except ValueError:
+            return None
+    if val_str.upper().startswith("D+"):
+        try:
+            return int(val_str[2:].strip())
+        except ValueError:
+            return None
+    try:
+        return int(float(val_str))
+    except (ValueError, TypeError):
+        return None
+
+
+def offsets_from_window_range(start: object, end: object) -> list[int] | None:
+    """Computes a sorted list of non-zero integer day offsets between start and end (inclusive).
+    Returns None if either start or end is invalid.
+    """
+    start_offset = parse_day_offset(start)
+    end_offset = parse_day_offset(end)
+    if start_offset is None or end_offset is None:
+        return None
+    if start_offset > end_offset:
+        start_offset, end_offset = end_offset, start_offset
+    return [d for d in range(start_offset, end_offset + 1) if d != 0]
+
+
 def offsets_to_day_columns(offsets: list[int | str]) -> list[str]:
     """Converts a list of day offsets into chronologically sorted day labels (D-x..D-1, D, D+1..D+x)."""
     seen = set()

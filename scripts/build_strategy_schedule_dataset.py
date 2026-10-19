@@ -11,6 +11,7 @@ from pipeline_common import (
     SCHEDULE_DAY_COLUMNS,
     load_default_config,
     offsets_to_day_columns,
+    parse_day_offset,
 )
 from project_paths import SCHEDULE_DATA_DIR, TRAINING_DATA_DIR, ensure_parent_dir
 
@@ -39,6 +40,12 @@ def parse_args() -> argparse.Namespace:
         "--config-file",
         default="",
         help="Optional path to config JSON file with allowed_day_offsets for dynamic columns.",
+    )
+    parser.add_argument(
+        "--allowed-day-offsets",
+        nargs="*",
+        default=None,
+        help="Allowed day offsets for dynamic columns (e.g. -5 -4 -3 -2 -1 1 2 3 4 5). Overrides config-file.",
     )
     return parser.parse_args()
 
@@ -95,8 +102,12 @@ def main() -> None:
         .reset_index()
     )
 
-    app_config = load_default_config(args.config_file) if args.config_file else {}
-    allowed_offsets = app_config.get("allowed_day_offsets")
+    if args.allowed_day_offsets is not None and len(args.allowed_day_offsets) > 0:
+        parsed_offsets = [parse_day_offset(o) for o in args.allowed_day_offsets]
+        allowed_offsets = [o for o in parsed_offsets if o is not None and o != 0]
+    else:
+        app_config = load_default_config(args.config_file) if args.config_file else {}
+        allowed_offsets = app_config.get("allowed_day_offsets")
     if allowed_offsets is not None:
         allowed_days = offsets_to_day_columns(allowed_offsets)
         active_day_order = [d for d in DAY_ORDER if d in allowed_days or (d == "D" and 0 in allowed_offsets)]

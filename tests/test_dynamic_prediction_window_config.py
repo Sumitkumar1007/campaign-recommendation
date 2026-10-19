@@ -798,9 +798,335 @@ def test_prepare_probability_map_builds_x_pred_without_name_error(tmp_path: Path
         base_population_file=base_cases,
         prediction_source_month="SEP-2026",
     )
-    assert isinstance(prob_map, dict)
     assert ("ACC_001", "D-5") in prob_map
     assert ("ACC_001", "D+1") in prob_map
+
+
+def test_parse_day_offset():
+    from pipeline_common import parse_day_offset
+
+    # Integers
+    assert parse_day_offset(-5) == -5
+    assert parse_day_offset(0) == 0
+    assert parse_day_offset(5) == 5
+
+    # Floats
+    assert parse_day_offset(-5.0) == -5
+    assert parse_day_offset(5.0) == 5
+
+    # Strings
+    assert parse_day_offset("-5") == -5
+    assert parse_day_offset("5") == 5
+    assert parse_day_offset("+5") == 5
+    assert parse_day_offset("  -3  ") == -3
+    assert parse_day_offset("D-5") == -5
+    assert parse_day_offset("d-5") == -5
+    assert parse_day_offset("D+5") == 5
+    assert parse_day_offset("d+5") == 5
+    assert parse_day_offset("D") == 0
+    assert parse_day_offset("d") == 0
+
+    # Invalid / empty
+    assert parse_day_offset("") is None
+    assert parse_day_offset("   ") is None
+    assert parse_day_offset(None) is None
+    assert parse_day_offset("invalid") is None
+    assert parse_day_offset("D+abc") is None
+    assert parse_day_offset("D-xyz") is None
+
+
+def test_offsets_from_window_range():
+    from pipeline_common import offsets_from_window_range
+
+    # Symmetric window: -5 to 5 (excluding 0)
+    assert offsets_from_window_range("-5", "5") == [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5]
+    assert offsets_from_window_range("D-5", "D+5") == [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5]
+
+    # Pre-due only: -5 to -1
+    assert offsets_from_window_range(-5, -1) == [-5, -4, -3, -2, -1]
+    assert offsets_from_window_range("D-5", "D-1") == [-5, -4, -3, -2, -1]
+
+    # Post-due only: 1 to 5
+    assert offsets_from_window_range(1, 5) == [1, 2, 3, 4, 5]
+    assert offsets_from_window_range("D+1", "D+5") == [1, 2, 3, 4, 5]
+
+    # Inverted bounds: handles 5 to -5 gracefully by swapping
+    assert offsets_from_window_range(5, -5) == [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5]
+
+    # Invalid bounds
+    assert offsets_from_window_range(None, 5) is None
+    assert offsets_from_window_range("-5", None) is None
+    assert offsets_from_window_range("-5", "invalid") is None
+
+
+class DummyCursorResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return self._rows
+
+    def fetchone(self):
+        return self._rows[0] if self._rows else None
+
+
+class DummyDbConn:
+    def __init__(self, rows_by_table=None, default_rows=None, exception_on_table=None, execute_handler=None):
+        self.rows_by_table = rows_by_table or {}
+        self.default_rows = default_rows or []
+        self.exception_on_table = exception_on_table or {}
+        self.execute_handler = execute_handler
+        self.rolled_back = False
+        self.executed_queries = []
+
+    def execute(self, query, params=None):
+        q_str = str(query)
+        self.executed_queries.append((q_str, params))
+        if self.execute_handler:
+            return self.execute_handler(q_str, params)
+        for tbl, exc in self.exception_on_table.items():
+            if tbl in q_str:
+                raise exc
+        for tbl, rows in self.rows_by_table.items():
+            if tbl in q_str:
+                return DummyCursorResult(rows)
+        return DummyCursorResult(self.default_rows)
+
+    def rollback(self):
+        self.rolled_back = True
+
+
+def test_resolve_prediction_window_from_db_success():
+    from run_monthly_inference_pipeline import resolve_prediction_window_from_db
+
+    conn = DummyDbConn(
+        default_rows=[
+            ("aiml.start.day", "-5"),
+            ("aiml.end.day", "5"),
+        ]
+    )
+    offsets = resolve_prediction_window_from_db(conn, source_schema="test_src", target_schema="test_tgt")
+    assert offsets == [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5]
+
+
+def test_resolve_prediction_window_from_db_predue_only():
+    from run_monthly_inference_pipeline import resolve_prediction_window_from_db
+
+    conn = DummyDbConn(
+        default_rows=[
+            ("aiml.start.day", "D-5"),
+            ("aiml.end.day", "D-1"),
+        ]
+    )
+    offsets = resolve_prediction_window_from_db(conn)
+    assert offsets == [-5, -4, -3, -2, -1]
+
+
+def test_resolve_prediction_window_from_db_partial_or_missing():
+    from run_monthly_inference_pipeline import resolve_prediction_window_from_db
+
+    # Only start day present
+    conn_partial = DummyDbConn(default_rows=[("aiml.start.day", "-5")])
+    assert resolve_prediction_window_from_db(conn_partial) is None
+
+    # Empty rows
+    conn_empty = DummyDbConn(default_rows=[])
+    assert resolve_prediction_window_from_db(conn_empty) is None
+
+
+def test_resolve_prediction_window_from_db_unparseable():
+    from run_monthly_inference_pipeline import resolve_prediction_window_from_db
+
+    conn = DummyDbConn(
+        default_rows=[
+            ("aiml.start.day", "NOT_A_DAY"),
+            ("aiml.end.day", "5"),
+        ]
+    )
+    assert resolve_prediction_window_from_db(conn) is None
+
+
+def test_resolve_prediction_window_from_db_table_fallback():
+    from psycopg import errors
+    from run_monthly_inference_pipeline import resolve_prediction_window_from_db
+
+    def handler(q_str, params):
+        if "test_src" not in q_str:
+            raise errors.UndefinedTable("Table not found")
+        return DummyCursorResult([
+            ("aiml.start.day", "-3"),
+            ("aiml.end.day", "3"),
+        ])
+
+    conn = DummyDbConn(execute_handler=handler)
+    offsets = resolve_prediction_window_from_db(conn, source_schema="test_src")
+    assert offsets == [-3, -2, -1, 1, 2, 3]
+    assert conn.rolled_back is True
+
+
+def test_resolve_prediction_window_priorities(tmp_path: Path):
+    from run_monthly_inference_pipeline import resolve_prediction_window
+
+    cfg_file = tmp_path / "config.json"
+    cfg_file.write_text('{"allowed_day_offsets": [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5]}')
+
+    db_conn = DummyDbConn(
+        default_rows=[
+            ("aiml.start.day", "-2"),
+            ("aiml.end.day", "2"),
+        ]
+    )
+
+    # Priority 1: CLI overrides both DB and config_file
+    offsets, src = resolve_prediction_window(
+        conn=db_conn,
+        config_file=cfg_file,
+        cli_allowed_offsets=[-1, 1],
+    )
+    assert offsets == [-1, 1]
+    assert src == "cli"
+
+    # Priority 2: DB overrides config_file when CLI is absent
+    offsets, src = resolve_prediction_window(
+        conn=db_conn,
+        config_file=cfg_file,
+        cli_allowed_offsets=None,
+    )
+    assert offsets == [-2, -1, 1, 2]
+    assert src == "data_config"
+
+    # Priority 3: config_file is used when DB returns None (missing keys)
+    empty_db_conn = DummyDbConn(default_rows=[])
+    offsets, src = resolve_prediction_window(
+        conn=empty_db_conn,
+        config_file=cfg_file,
+        cli_allowed_offsets=None,
+    )
+    assert offsets == [-5, -4, -3, -2, -1, 1, 2, 3, 4, 5]
+    assert src == "config_file"
+
+    # Priority 4: Default full range when neither DB nor config_file has allowed_day_offsets
+    empty_cfg = tmp_path / "empty_cfg.json"
+    empty_cfg.write_text('{}')
+    offsets, src = resolve_prediction_window(
+        conn=empty_db_conn,
+        config_file=empty_cfg,
+        cli_allowed_offsets=None,
+    )
+    assert offsets is None
+    assert src == "default_full_range"
+
+
+def test_build_strategy_schedule_dataset_cli_allowed_offsets(tmp_path: Path, monkeypatch):
+    import sys
+    from build_strategy_schedule_dataset import main as build_schedule_main
+
+    input_csv = tmp_path / "train.csv"
+    pd.DataFrame(
+        [
+            {
+                "ENTITY_KEY": "ACC_01",
+                "MONTH": "MAY-2026",
+                "DAY": "D-5",
+                "RISK": "LOW",
+                "PREDICTED_STRATEGY": "SMS-11AM-ENGLISH",
+            },
+            {
+                "ENTITY_KEY": "ACC_01",
+                "MONTH": "MAY-2026",
+                "DAY": "D+1",
+                "RISK": "LOW",
+                "PREDICTED_STRATEGY": "WH-2PM-ENGLISH",
+            },
+        ]
+    ).to_csv(input_csv, index=False)
+
+    out_csv = tmp_path / "schedule_out.csv"
+    # CLI allowed offsets: only -5 and 1
+    test_args = [
+        "build_strategy_schedule_dataset.py",
+        "--input-file", str(input_csv),
+        "--output-file", str(out_csv),
+        "--allowed-day-offsets", "-5", "1",
+    ]
+    monkeypatch.setattr(sys, "argv", test_args)
+    build_schedule_main()
+
+    df = pd.read_csv(out_csv)
+    assert "D-5" in df.columns
+    assert "D+1" in df.columns
+    assert "D-1" not in df.columns
+    assert "D+5" not in df.columns
+    assert "D+20" not in df.columns
+
+
+def test_identify_new_customer_fallbacks_cli_allowed_offsets(tmp_path: Path, monkeypatch):
+    import sys
+    from identify_new_customer_fallbacks import main as fallbacks_main
+
+    cases_file = tmp_path / "cases.csv"
+    pd.DataFrame(
+        [
+            {
+                "apacCardNumber": "NEW_ACC_01",
+                "risk": "LOW",
+                "vertical": "LAP",
+                "emi_date": "05/05/2026",
+            }
+        ]
+    ).to_csv(cases_file, index=False)
+
+    sched_file = tmp_path / "schedule.csv"
+    pd.DataFrame(
+        [
+            {
+                "ENTITY_KEY": "HIST_01",
+                "MONTH": "APR-2026",
+                "RISK": "LOW",
+                "D-5": "SMS-11AM-ENGLISH",
+                "D-1": "SMS-11AM-ENGLISH",
+                "D+1": "WH-12PM-ENGLISH",
+                "D+5": "VOICE-11AM-ENGLISH",
+            }
+        ]
+    ).to_csv(sched_file, index=False)
+
+    pred_file = tmp_path / "pred.csv"
+    pd.DataFrame(
+        [
+            {
+                "Loan_number": "NEW_ACC_01",
+                "MONTH": "MAY-2026",
+                "SOURCE_RISK": "LOW",
+                "VERTICAL": "LAP",
+                "emi_date": "05/05/2026",
+                "D-5": "-",
+                "D-1": "-",
+                "D+1": "-",
+                "D+5": "-",
+            }
+        ]
+    ).to_csv(pred_file, index=False)
+
+    out_fallbacks = tmp_path / "fallbacks.csv"
+    # CLI allowed offsets: only -5 and -1 (pre-due only)
+    test_args = [
+        "identify_new_customer_fallbacks.py",
+        "--cases-file", str(cases_file),
+        "--schedule-file", str(sched_file),
+        "--output-file", str(out_fallbacks),
+        "--prediction-file", str(pred_file),
+        "--allowed-day-offsets", "-5", "-1",
+    ]
+    monkeypatch.setattr(sys, "argv", test_args)
+    fallbacks_main()
+
+    updated_pred = pd.read_csv(pred_file)
+    assert updated_pred.iloc[0]["D-5"] != "-"
+    assert updated_pred.iloc[0]["D-1"] != "-"
+    assert updated_pred.iloc[0]["D+1"] == "-"
+    assert updated_pred.iloc[0]["D+5"] == "-"
+
 
 
 

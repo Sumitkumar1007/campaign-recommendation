@@ -37,7 +37,9 @@ from pipeline_common import (
     get_configured_default_template,
     get_first_valid_communication,
     load_default_config,
+    offsets_from_window_range,
     offsets_to_day_columns,
+    parse_day_offset,
     prepare_next_month_dataset,
     snap_hour_to_window,
     split_by_source_month,
@@ -95,6 +97,8 @@ VENDOR_CONFIG_KEYS = {
     "WHATSAPP": "whatsapp.service.vendor-list",
 }
 EMI_DATES_CONFIG_KEY = "upload.scheduler.emi-dates"
+AIML_START_DAY_CONFIG_KEY = "aiml.start.day"
+AIML_END_DAY_CONFIG_KEY = "aiml.end.day"
 
 
 def parse_args() -> argparse.Namespace:
@@ -234,6 +238,12 @@ def parse_args() -> argparse.Namespace:
         "--config-file",
         default=os.getenv("CONFIG_FILE", str(REPO_ROOT / "config" / "default_config.json")),
         help="Path to JSON configuration file (default: config/default_config.json).",
+    )
+    parser.add_argument(
+        "--allowed-day-offsets",
+        nargs="*",
+        default=None,
+        help="Allowed day offsets for prediction window (e.g. -5 -4 -3 -2 -1 1 2 3 4 5). Overrides data_config and config-file.",
     )
     args = parser.parse_args()
     missing = [
@@ -2337,6 +2347,120 @@ def resolve_scheduler_emi_dates(
     return []
 
 
+def resolve_prediction_window_from_db(
+    conn,
+    *,
+    source_schema: str = "",
+    target_schema: str = "",
+    logger: logging.Logger | None = None,
+) -> list[int] | None:
+    """Queries data_config table for aiml.start.day and aiml.end.day.
+    Returns a sorted list of non-zero integer day offsets, or None if keys are not present/valid.
+    """
+    candidate_refs = _candidate_data_config_refs(source_schema, target_schema)
+    for table_ref in candidate_refs:
+        try:
+            rows = conn.execute(
+                sql.SQL(
+                    "SELECT key_name, value FROM {} WHERE key_name IN (%s, %s)"
+                ).format(table_ref),
+                (AIML_START_DAY_CONFIG_KEY, AIML_END_DAY_CONFIG_KEY),
+            ).fetchall()
+        except errors.UndefinedTable:
+            conn.rollback()
+            continue
+        except Exception:
+            if logger:
+                logger.exception("Prediction window lookup failed on data_config.")
+            conn.rollback()
+            break
+
+        if not rows:
+            continue
+
+        val_map = {str(row[0]).strip(): row[1] for row in rows}
+        raw_start = val_map.get(AIML_START_DAY_CONFIG_KEY)
+        raw_end = val_map.get(AIML_END_DAY_CONFIG_KEY)
+
+        if raw_start is None or raw_end is None:
+            if logger:
+                logger.info(
+                    "Partial or missing prediction window in data_config | start=%s end=%s. Falling back to JSON config.",
+                    raw_start,
+                    raw_end,
+                )
+            continue
+
+        offsets = offsets_from_window_range(raw_start, raw_end)
+        if offsets is None:
+            if logger:
+                logger.warning(
+                    "Unparseable prediction window in data_config | start=%r end=%r. Falling back to JSON config.",
+                    raw_start,
+                    raw_end,
+                )
+            continue
+
+        if logger:
+            logger.info(
+                "Resolved prediction window from data_config | start_key=%s (%s) end_key=%s (%s) -> offsets=%s",
+                AIML_START_DAY_CONFIG_KEY,
+                raw_start,
+                AIML_END_DAY_CONFIG_KEY,
+                raw_end,
+                offsets,
+            )
+        return offsets
+
+    return None
+
+
+def resolve_prediction_window(
+    conn=None,
+    *,
+    source_schema: str = "",
+    target_schema: str = "",
+    config_file: str | Path | None = None,
+    cli_allowed_offsets: list[int | str] | None = None,
+    logger: logging.Logger | None = None,
+) -> tuple[list[int] | None, str]:
+    """Resolves allowed prediction day offsets.
+    Priority:
+      1. CLI explicit argument (--allowed-day-offsets) if provided.
+      2. PostgreSQL data_config table (aiml.start.day, aiml.end.day) if connected.
+      3. Config file JSON (allowed_day_offsets).
+      4. Full range (None).
+    """
+    if cli_allowed_offsets is not None and len(cli_allowed_offsets) > 0:
+        parsed = [parse_day_offset(o) for o in cli_allowed_offsets]
+        cleaned = [o for o in parsed if o is not None and o != 0]
+        if cleaned:
+            if logger:
+                logger.info("Using allowed_day_offsets from CLI: %s", cleaned)
+            return cleaned, "cli"
+
+    if conn is not None:
+        db_offsets = resolve_prediction_window_from_db(
+            conn,
+            source_schema=source_schema,
+            target_schema=target_schema,
+            logger=logger,
+        )
+        if db_offsets is not None:
+            return db_offsets, "data_config"
+
+    app_config = load_default_config(config_file) if config_file else {}
+    file_offsets = app_config.get("allowed_day_offsets")
+    if file_offsets is not None:
+        parsed_file = [parse_day_offset(o) for o in file_offsets]
+        cleaned_file = [o for o in parsed_file if o is not None and o != 0]
+        if logger:
+            logger.info("Using allowed_day_offsets from config file %s: %s", config_file, cleaned_file)
+        return cleaned_file, "config_file"
+
+    return None, "default_full_range"
+
+
 def _derive_emi_cycles_from_dates(date_values: list[str]) -> list[int]:
     cycles: list[int] = []
     seen: set[int] = set()
@@ -3723,6 +3847,57 @@ def main() -> None:
                 )
     # -------------------------------------------------------------------
 
+    # --- DYNAMIC PREDICTION WINDOW: data_config / config file ---
+    allowed_day_offsets = None
+    config_source = "default_full_range"
+    if getattr(args, "allowed_day_offsets", None) and len(args.allowed_day_offsets) > 0:
+        allowed_day_offsets, config_source = resolve_prediction_window(
+            cli_allowed_offsets=args.allowed_day_offsets,
+            logger=logger,
+        )
+    elif not args.dry_run and args.host and args.dbname and args.user:
+        try:
+            db_conn_config = PostgresConfig(
+                host=args.host,
+                port=args.port,
+                dbname=args.dbname,
+                user=args.user,
+                password=args.password,
+            )
+            with connect_db(db_conn_config) as conn:
+                allowed_day_offsets, config_source = resolve_prediction_window(
+                    conn,
+                    source_schema=args.source_schema,
+                    target_schema=args.target_schema,
+                    config_file=getattr(args, "config_file", None),
+                    cli_allowed_offsets=getattr(args, "allowed_day_offsets", None),
+                    logger=logger,
+                )
+        except Exception:
+            logger.exception("Failed to query DB for prediction window. Falling back to JSON config.")
+            allowed_day_offsets, config_source = resolve_prediction_window(
+                None,
+                config_file=getattr(args, "config_file", None),
+                cli_allowed_offsets=getattr(args, "allowed_day_offsets", None),
+                logger=logger,
+            )
+    else:
+        allowed_day_offsets, config_source = resolve_prediction_window(
+            None,
+            config_file=getattr(args, "config_file", None),
+            cli_allowed_offsets=getattr(args, "allowed_day_offsets", None),
+            logger=logger,
+        )
+
+    configured_campaign_days = offsets_to_day_columns(allowed_day_offsets) if allowed_day_offsets is not None else None
+    logger.info(
+        "Active inference prediction window | source=%s offsets=%s campaign_days=%s",
+        config_source,
+        allowed_day_offsets,
+        configured_campaign_days,
+    )
+    # -------------------------------------------------------------
+
     source_extract_base_file = default_communication_output_file(args.source_month)
     source_cases_file = current_cases_file(args.predict_month)
 
@@ -3827,7 +4002,7 @@ def main() -> None:
         #         logger=logger,
         #     )
         with log_step(logger, "build_schedule_dataset"):
-            run_python_script(
+            sched_cmd = [
                 "build_strategy_schedule_dataset.py",
                 "--input-file",
                 str(TRAINING_DATA_DIR / "strategy_training_dataset_inference.csv"),
@@ -3835,8 +4010,10 @@ def main() -> None:
                 str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv"),
                 "--config-file",
                 str(args.config_file),
-                logger=logger,
-            )
+            ]
+            if allowed_day_offsets is not None:
+                sched_cmd.extend(["--allowed-day-offsets", *[str(o) for o in allowed_day_offsets]])
+            run_python_script(*sched_cmd, logger=logger)
         # with log_step(logger, "build_monthly_features"):
         #     run_python_script(
         #         "build_monthly_feature_dataset.py",
@@ -3888,7 +4065,7 @@ def main() -> None:
                 model_file=model_file,
                 prediction_file=prediction_file,
             ):
-                run_python_script(
+                catboost_cmd = [
                     "predict_next_month_strategy_catboost.py",
                     "--model-file",
                     str(model_file),
@@ -3904,6 +4081,11 @@ def main() -> None:
                     str(SCHEDULE_DATA_DIR / "strategy_schedule_dataset_inference.csv"),
                     "--config-file",
                     str(args.config_file),
+                ]
+                if allowed_day_offsets is not None:
+                    catboost_cmd.extend(["--allowed-day-offsets", *[str(o) for o in allowed_day_offsets]])
+                run_python_script(
+                    *catboost_cmd,
                     logger=logger,
                 )
             cold_start_output_file = CASE_DATA_DIR / f"new_customer_fallbacks_{args.predict_month.replace('-', '_')}.csv"
@@ -3916,7 +4098,7 @@ def main() -> None:
                 output_file=cold_start_output_file,
                 schedule_file=fallback_schedule_file,
             ):
-                run_python_script(
+                fallback_cmd = [
                     "identify_new_customer_fallbacks.py",
                     "--cases-file",
                     str(source_cases_file),
@@ -3930,6 +4112,11 @@ def main() -> None:
                     str(prediction_file),
                     "--config-file",
                     str(args.config_file),
+                ]
+                if allowed_day_offsets is not None:
+                    fallback_cmd.extend(["--allowed-day-offsets", *[str(o) for o in allowed_day_offsets]])
+                run_python_script(
+                    *fallback_cmd,
                     logger=logger,
                 )
             with log_step(
@@ -4066,12 +4253,10 @@ def main() -> None:
                         logger=logger,
                     )
                     app_config = load_default_config(getattr(args, "config_file", None))
-                    allowed_offsets = app_config.get("allowed_day_offsets")
-                    configured_campaign_days = offsets_to_day_columns(allowed_offsets) if allowed_offsets is not None else None
                     configured_send_hour_window = app_config.get("send_hour_window")
                     configured_default_templates = app_config.get("default_templates")
                     if configured_campaign_days is not None:
-                        logger.info("Using configured campaign days from %s: %s", args.config_file, configured_campaign_days)
+                        logger.info("Using configured campaign days (%s): %s", config_source, configured_campaign_days)
                     if configured_send_hour_window is not None:
                         logger.info("Using configured send hour window from %s: %s", args.config_file, configured_send_hour_window)
                     if configured_default_templates is not None:
@@ -4159,8 +4344,6 @@ def main() -> None:
             campaign_vendors = []
             configured_emi_dates = []
             app_config = load_default_config(getattr(args, "config_file", None))
-            allowed_offsets = app_config.get("allowed_day_offsets")
-            configured_campaign_days = offsets_to_day_columns(allowed_offsets) if allowed_offsets is not None else None
             configured_send_hour_window = app_config.get("send_hour_window")
             configured_default_templates = app_config.get("default_templates")
             template_logger = get_template_logger()

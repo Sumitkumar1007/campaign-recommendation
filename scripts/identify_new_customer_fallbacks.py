@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from pipeline_common import DAY_COLUMNS, load_default_config, offsets_to_day_columns
+from pipeline_common import DAY_COLUMNS, load_default_config, offsets_to_day_columns, parse_day_offset
 from project_paths import CASE_DATA_DIR, COMMUNICATION_DATA_DIR, REPO_ROOT, SCHEDULE_DATA_DIR, ensure_parent_dir
 
 
@@ -47,6 +47,12 @@ def parse_args() -> argparse.Namespace:
         "--config-file",
         default=os.getenv("CONFIG_FILE", str(REPO_ROOT / "config" / "default_config.json")),
         help="Path to JSON configuration file containing allowed_day_offsets.",
+    )
+    parser.add_argument(
+        "--allowed-day-offsets",
+        nargs="*",
+        default=None,
+        help="Allowed day offsets for prediction window (e.g. -5 -4 -3 -2 -1 1 2 3 4 5). Overrides config-file.",
     )
     return parser.parse_args()
 
@@ -321,8 +327,12 @@ def main() -> None:
     output_file = ensure_parent_dir(args.output_file)
     communication_files = [Path(path) for path in args.communication_files] or sorted(COMMUNICATION_DATA_DIR.glob("*.csv"))
 
-    app_config = load_default_config(args.config_file) if getattr(args, "config_file", None) else {}
-    allowed_offsets = app_config.get("allowed_day_offsets")
+    if args.allowed_day_offsets is not None and len(args.allowed_day_offsets) > 0:
+        parsed_offsets = [parse_day_offset(o) for o in args.allowed_day_offsets]
+        allowed_offsets = [o for o in parsed_offsets if o is not None and o != 0]
+    else:
+        app_config = load_default_config(args.config_file) if getattr(args, "config_file", None) else {}
+        allowed_offsets = app_config.get("allowed_day_offsets")
     allowed_day_labels = set(offsets_to_day_columns(allowed_offsets)) if allowed_offsets is not None else None
 
     case_apacs = load_case_apacs(cases_file)
