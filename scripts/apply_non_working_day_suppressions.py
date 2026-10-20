@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import json
 import logging
 from pathlib import Path
 import re
@@ -149,6 +150,18 @@ def suppress_non_working_days_in_dataframe(
             if suppress_reason:
                 df.at[idx, day_col] = suppress_reason
                 stats["total_suppressions"] += 1
+                if "PREDICTION_REASON" in df.columns:
+                    raw_reason = df.at[idx, "PREDICTION_REASON"]
+                    try:
+                        reasons_dict = json.loads(str(raw_reason)) if raw_reason and not pd.isna(raw_reason) else {}
+                    except json.JSONDecodeError:
+                        reasons_dict = {}
+                    if isinstance(reasons_dict, dict):
+                        reasons_dict[day_col] = (
+                            f"Communication suppressed on {day_col} because the scheduled contact date "
+                            f"falls on a non-working bank day ({suppress_reason})."
+                        )
+                        df.at[idx, "PREDICTION_REASON"] = json.dumps(reasons_dict, sort_keys=True)
 
     return df, stats
 

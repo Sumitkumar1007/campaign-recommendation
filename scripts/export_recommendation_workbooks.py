@@ -199,8 +199,14 @@ def fetch_campaign_reasons(conn, *, schema: str, mapping_table: str, source_mont
     with conn.cursor() as cur:
         cur.execute(query, (source_month, prediction_month, model_name))
         for campaign_name, prediction_reason in cur.fetchall():
-            if campaign_name not in reasons and prediction_reason:
-                reasons[str(campaign_name)] = str(prediction_reason)
+            c_name = str(campaign_name)
+            p_reason = str(prediction_reason).strip() if prediction_reason else ""
+            if not p_reason:
+                continue
+            if c_name not in reasons:
+                reasons[c_name] = p_reason
+            elif reasons[c_name].startswith("Reason not available") and not p_reason.startswith("Reason not available"):
+                reasons[c_name] = p_reason
     return reasons
 
 
@@ -220,6 +226,18 @@ def build_scheduler_rows(campaigns: pd.DataFrame, reasons: dict[str, str]) -> li
     rows: list[list[str]] = []
     for _, row in campaigns.iterrows():
         campaign_name = str(row["name"])
+        reason_text = reasons.get(campaign_name, "")
+        if not reason_text or reason_text.startswith("Reason not available"):
+            mode = str(row.get("mode", ""))
+            due_type = str(row.get("due_type", ""))
+            risk = str(row.get("risk", ""))
+            date_val = str(row.get("date", ""))
+            time_val = str(row.get("time", ""))
+            time_clause = f" at {time_val}" if time_val else ""
+            reason_text = (
+                f"{due_type} {mode}{time_clause} campaign scheduled on {date_val} "
+                f"aligned with {risk} risk strategy cohort patterns."
+            )
         rows.append([
             campaign_name,
             str(row["mode"]),
@@ -229,7 +247,7 @@ def build_scheduler_rows(campaigns: pd.DataFrame, reasons: dict[str, str]) -> li
             str(row["dataset_name"]),
             str(row["vendor"]),
             str(row["active"]),
-            reasons.get(campaign_name, ""),
+            reason_text,
         ])
     return rows
 

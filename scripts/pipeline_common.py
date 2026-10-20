@@ -140,6 +140,37 @@ def offsets_to_day_columns(offsets: list[int | str]) -> list[str]:
     return sorted(labels, key=day_label_to_offset)
 
 
+def parse_strategy_parts(strategy: str) -> tuple[str, str, str] | None:
+    """Parses a strategy token like 'SMS-11AM-ENGLISH' into (channel, hour, language)."""
+    parts = str(strategy or "").strip().split("-")
+    if len(parts) != 3:
+        return None
+    return parts[0].strip().upper(), parts[1].strip().upper(), parts[2].strip().upper()
+
+
+def readable_strategy(strategy: str) -> str:
+    """Formats a strategy token or multi-mode bundle into a business-readable string.
+    Example: 'SMS-11AM-ENGLISH' -> 'SMS at 11AM in English'
+    Example: 'SMS-11AM-ENGLISH|WH-12PM-ENGLISH' -> 'SMS at 11AM in English, WhatsApp at 12PM in English'
+    """
+    if not strategy or str(strategy).strip() in ("", "-"):
+        return "no communication"
+    tokens = [s.strip() for s in str(strategy).split("|") if s.strip() and s.strip() != "-"]
+    if not tokens:
+        return "no communication"
+    formatted = []
+    for token in tokens:
+        parts = parse_strategy_parts(token)
+        if not parts:
+            formatted.append(token)
+            continue
+        channel, hour, language = parts
+        channel_name = {"SMS": "SMS", "WH": "WhatsApp", "VOICE": "voice call", "VOICE_BOT": "voice bot"}.get(channel, channel)
+        language_name = "Regional language" if language == "REGIONAL" else language.title()
+        formatted.append(f"{channel_name} at {hour} in {language_name}")
+    return ", ".join(formatted)
+
+
 def extract_template_from_entry(entry: object, language: str = "") -> str | None:
     """Extracts a template name string from a config entry (which can be a string, dict, etc.)."""
     if entry is None or pd.isna(entry):
@@ -291,15 +322,86 @@ def enforce_single_communication_per_day(
     return df
 
 
+TARGET_POSTDUE_MODES = ["SMS", "WHATSAPP", "VOICE"]
+DEFAULT_MODE_FALLBACKS = {
+    "SMS": "SMS-11AM-ENGLISH",
+    "WHATSAPP": "WH-12PM-ENGLISH",
+    "VOICE": "VOICE-4PM-ENGLISH",
+}
+
+
+def extract_canonical_mode_from_label(label: str) -> str | None:
+    """Extracts canonical mode (SMS, WHATSAPP, VOICE) from a strategy label."""
+    if not label or label in ("-", "None", "nan") or pd.isna(label):
+        return None
+    channel = str(label).split("-")[0].strip().upper()
+    if channel == "SMS":
+        return "SMS"
+    if channel in ("WH", "WHATSAPP"):
+        return "WHATSAPP"
+    if channel in ("VOICE", "VOICE_BOT", "IVR"):
+        return "VOICE"
+    return None
+
+
+def extract_hour_from_label(label: str) -> str | None:
+    """Extracts hour part from a strategy label like 'SMS-11AM-ENGLISH' -> '11AM'."""
+    if not label or label in ("-", "None", "nan") or pd.isna(label):
+        return None
+    parts = str(label).split("-")
+    if len(parts) >= 3:
+        return "-".join(parts[1:-1]).strip()
+    return None
+
+
+def enforce_single_communication_per_mode_per_day(
+    df: pd.DataFrame,
+    day_columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Enforces at most one communication per distinct mode (SMS, WHATSAPP, VOICE) per day,
+    preserving distinct mode recommendations and discarding duplicate modes.
+    """
+    df = df.copy()
+    cols_to_check = [c for c in (day_columns or POSTDUE_DAY_COLUMNS) if c in df.columns]
+    for day in cols_to_check:
+        new_vals = []
+        for val in df[day]:
+            if pd.isna(val) or val in ("", "-", "None", "nan"):
+                new_vals.append("-")
+                continue
+            val_str = str(val).strip()
+            parts = [p.strip() for p in val_str.split("|") if p.strip() not in ("", "-", "None", "nan")]
+            if not parts:
+                new_vals.append("-")
+                continue
+            seen_modes: set[str] = set()
+            deduped: list[str] = []
+            for p in parts:
+                mode = extract_canonical_mode_from_label(p)
+                if mode and mode not in seen_modes:
+                    seen_modes.add(mode)
+                    deduped.append(p)
+                elif not mode and not deduped:
+                    deduped.append(p)
+            new_vals.append("|".join(deduped) if deduped else "-")
+        df[day] = new_vals
+    return df
+
+
 def apply_postdue_risk_rules(
     df: pd.DataFrame,
     postdue_days: list[str] | None = None,
+    allow_multimode: bool = False,
 ) -> pd.DataFrame:
     """
-    Enforces at most one communication per day across post-due days (D+1..D+20)
-    by selecting the first valid recommendation.
+    Enforces post-due communication rules across post-due days (D+1..D+20).
+    When allow_multimode is True, allows up to 1 communication per distinct mode (SMS, WHATSAPP, VOICE) per day.
+    When allow_multimode is False, caps each day to the single first valid communication.
     """
     cols = [d for d in (postdue_days or POSTDUE_DAY_COLUMNS) if d in df.columns]
+    if allow_multimode:
+        return enforce_single_communication_per_mode_per_day(df, cols)
     return enforce_single_communication_per_day(df, cols)
 
 
@@ -582,4 +684,84 @@ def predict_top_k_by_risk(
         top_indices = row_probs.argsort()[-k:][::-1]
         labels = [str(encoder.classes_[index]) for index in top_indices]
         output.append("|".join(labels))
+    return pd.Series(output, index=X.index)
+
+
+def predict_distinct_modes_by_risk(
+    model,
+    encoder,
+    X: pd.DataFrame,
+    risks: pd.Series | None = None,
+    target_modes: list[str] | None = None,
+    default_fallbacks: dict[str, str] | None = None,
+) -> pd.Series:
+    """
+    Selects the highest probability recommendation for each distinct mode (SMS, WHATSAPP, VOICE)
+    for each account from model probabilities, avoiding same-hour collision across the selected modes.
+    Language can be repeated across modes.
+    """
+    modes_to_use = target_modes or TARGET_POSTDUE_MODES
+    fallbacks = default_fallbacks or DEFAULT_MODE_FALLBACKS
+    probabilities = model.predict_proba(X)
+    classes = [str(c) for c in encoder.classes_]
+
+    # Pre-index class indices by canonical mode
+    mode_class_indices: dict[str, list[int]] = {m: [] for m in modes_to_use}
+    for idx, label in enumerate(classes):
+        m = extract_canonical_mode_from_label(label)
+        if m in mode_class_indices:
+            mode_class_indices[m].append(idx)
+
+    output: list[str] = []
+    for row_probs in probabilities:
+        # Collect candidate classes per mode sorted by probability descending
+        mode_candidates: dict[str, list[tuple[str, float, str]]] = {}
+        for mode in modes_to_use:
+            cand_list: list[tuple[str, float, str]] = []
+            for c_idx in mode_class_indices.get(mode, []):
+                lbl = classes[c_idx]
+                prob = float(row_probs[c_idx])
+                hr = extract_hour_from_label(lbl) or ""
+                cand_list.append((lbl, prob, hr))
+            cand_list.sort(key=lambda item: item[1], reverse=True)
+            mode_candidates[mode] = cand_list
+
+        # Order modes so that the mode with highest peak probability chooses its optimal hour first
+        mode_order = sorted(
+            modes_to_use,
+            key=lambda m: mode_candidates[m][0][1] if mode_candidates[m] else -1.0,
+            reverse=True,
+        )
+
+        chosen_by_mode: dict[str, str] = {}
+        used_hours: set[str] = set()
+
+        for mode in mode_order:
+            candidates = mode_candidates[mode]
+            if not candidates:
+                fb = fallbacks.get(mode, f"{mode}-12PM-ENGLISH")
+                chosen_by_mode[mode] = fb
+                fb_hr = extract_hour_from_label(fb)
+                if fb_hr:
+                    used_hours.add(fb_hr)
+                continue
+
+            # Pick highest probability candidate whose hour has not been taken yet
+            selected = None
+            for lbl, prob, hr in candidates:
+                if hr and hr not in used_hours:
+                    selected = (lbl, hr)
+                    break
+
+            # If all candidate hours were used, take top candidate
+            if selected is None:
+                selected = (candidates[0][0], candidates[0][2])
+
+            chosen_by_mode[mode] = selected[0]
+            if selected[1]:
+                used_hours.add(selected[1])
+
+        day_recommendations = [chosen_by_mode[m] for m in modes_to_use if m in chosen_by_mode]
+        output.append("|".join(day_recommendations) if day_recommendations else "-")
+
     return pd.Series(output, index=X.index)

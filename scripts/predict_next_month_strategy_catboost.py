@@ -23,6 +23,7 @@ from pipeline_common import (
     month_to_period,
     offsets_to_day_columns,
     parse_day_offset,
+    predict_distinct_modes_by_risk,
     predict_top_k_by_risk,
     prepare_next_month_dataset,
 )
@@ -101,6 +102,12 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=None,
         help="Allowed day offsets for prediction (e.g. -5 -4 -3 -2 -1 1 2 3 4 5). Overrides config-file.",
+    )
+    parser.add_argument(
+        "--multimode-postdue",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Predict 3 distinct modes (SMS, WhatsApp, Voice) per post-due day [default: True].",
     )
     parser.add_argument(
         "--log-file",
@@ -634,12 +641,20 @@ def main() -> None:
                         logger.info("Predicting day column | day=%s", day)
                         encoder = bundle["label_encoders"][day]
                         model = bundle["models"][day]
-                        prediction_output[day] = predict_top_k_by_risk(
-                            model,
-                            encoder,
-                            X_pred,
-                            prediction_rows["RISK"],
-                        )
+                        if day in POSTDUE_DAY_COLUMNS and getattr(args, "multimode_postdue", True):
+                            prediction_output[day] = predict_distinct_modes_by_risk(
+                                model,
+                                encoder,
+                                X_pred,
+                                risks=prediction_rows["RISK"],
+                            )
+                        else:
+                            prediction_output[day] = predict_top_k_by_risk(
+                                model,
+                                encoder,
+                                X_pred,
+                                prediction_rows["RISK"],
+                            )
                     else:
                         logger.info("Day column outside allowed_day_offsets, skipping prediction | day=%s", day)
                         prediction_output[day] = "-"
@@ -725,7 +740,11 @@ def main() -> None:
             active_predue = [d for d in PREDUE_DAY_COLUMNS if d in allowed_day_labels]
             active_postdue = [d for d in POSTDUE_DAY_COLUMNS if d in allowed_day_labels]
             prediction_output = apply_predue_risk_rules(prediction_output, predue_days=active_predue)
-            prediction_output = apply_postdue_risk_rules(prediction_output, postdue_days=active_postdue)
+            prediction_output = apply_postdue_risk_rules(
+                prediction_output,
+                postdue_days=active_postdue,
+                allow_multimode=getattr(args, "multimode_postdue", True),
+            )
             for day in configured_day_cols:
                 if day in DAY_COLUMNS and day not in allowed_day_labels:
                     prediction_output[day] = "-"

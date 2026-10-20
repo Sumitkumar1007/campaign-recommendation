@@ -34,6 +34,7 @@ from pipeline_common import (
     PREDUE_DAY_COLUMNS,
     SCHEDULE_DAY_COLUMNS,
     build_feature_matrix,
+    extract_canonical_mode_from_label,
     get_configured_default_template,
     get_first_valid_communication,
     load_default_config,
@@ -244,6 +245,18 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=None,
         help="Allowed day offsets for prediction window (e.g. -5 -4 -3 -2 -1 1 2 3 4 5). Overrides data_config and config-file.",
+    )
+    parser.add_argument(
+        "--multimode-postdue",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable multi-mode prediction and campaign mapping (SMS, WhatsApp, Voice) for post-due days [default: True].",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=False,
+        help="Run without database connection; falls back to local configuration file.",
     )
     args = parser.parse_args()
     missing = [
@@ -2244,21 +2257,40 @@ def _load_prediction_context_lookup(prediction_file: Path, prediction_month_labe
         context: dict[str, object] = {}
         raw_reason = row.get("PREDICTION_REASON") if "PREDICTION_REASON" in row.index else None
         if raw_reason is not None and not pd.isna(raw_reason):
+            raw_str = str(raw_reason).strip()
             try:
-                parsed = json.loads(str(raw_reason))
+                parsed = json.loads(raw_str)
             except json.JSONDecodeError:
                 parsed = {}
-            if isinstance(parsed, dict):
+            if isinstance(parsed, dict) and parsed:
                 context["reasons"] = {str(key): str(value) for key, value in parsed.items()}
-        lookup[str(row["Loan_number"])] = context
+            elif raw_str:
+                context["raw_reason"] = raw_str
+        context["is_new_customer"] = str(row.get("IS_NEW_CUSTOMER", "")).strip().lower() == "true"
+        context["risk"] = str(row.get("SOURCE_RISK", row.get("RISK", "LOW"))).strip().upper()
+        context["vertical"] = str(row.get("SOURCE_VERTICAL", row.get("VERTICAL", ""))).strip().upper()
+
+        loan_raw = str(row.get("Loan_number", "")).strip()
+        loan_clean = loan_raw.replace(".0", "").lstrip("0")
+        for key in {loan_raw, loan_clean, loan_raw.zfill(18)}:
+            if key:
+                lookup[key] = context
     return lookup
 
 
 def _mapping_prediction_reason(row: pd.Series, context_lookup: dict[str, dict[str, object]]) -> str:
-    loan_reasons = context_lookup.get(str(row["loan_number"]), {}).get("reasons", {})
+    loan_number = str(row.get("loan_number", "")).strip()
+    clean_loan = loan_number.replace(".0", "").lstrip("0")
+    context = (
+        context_lookup.get(loan_number)
+        or context_lookup.get(clean_loan)
+        or context_lookup.get(loan_number.zfill(18))
+        or {}
+    )
+    loan_reasons = context.get("reasons", {})
     parts: list[str] = []
     seen: set[str] = set()
-    for day in str(row["date"]).split(","):
+    for day in str(row.get("date", "")).split(","):
         day = day.strip()
         if not day:
             continue
@@ -2268,7 +2300,28 @@ def _mapping_prediction_reason(row: pd.Series, context_lookup: dict[str, dict[st
             parts.append(reason)
     if parts:
         return " ".join(parts)
-    return "Reason not available from prediction output for this campaign mapping."
+
+    mode = str(row.get("mode", "communication"))
+    time_val = str(row.get("time", ""))
+    lang = str(row.get("language", "English")).title()
+    risk = str(row.get("risk", context.get("risk", "LOW"))).upper()
+    due_type = str(row.get("due_type", "scheduled")).title()
+    date_val = str(row.get("date", ""))
+
+    if context.get("is_new_customer"):
+        time_part = f" at {time_val}" if time_val else ""
+        return (
+            f"Cold-start fallback: {mode}{time_part} in {lang} is recommended for new customer on {date_val} "
+            f"based on {risk}-risk cohort historical response patterns, as no prior communication history was found."
+        )
+    if context.get("raw_reason"):
+        return str(context["raw_reason"])
+
+    time_clause = f" at {time_val}" if time_val else ""
+    return (
+        f"{mode}{time_clause} in {lang} is recommended for {due_type} follow-up on {date_val} "
+        f"based on {risk}-risk strategy guidelines."
+    )
 
 
 def _extract_scheduler_emi_dates(raw_value: object) -> list[str]:
@@ -2492,6 +2545,7 @@ def _build_campaign_assignment_groups(
     campaign_days: list[str] | None = None,
     send_hour_window: dict[str, int] | None = None,
     single_communication_per_day: bool = False,
+    multimode_postdue: bool = False,
     default_templates: dict[str, object] | list | None = None,
     audit_collector: dict[str, object] | None = None,
     template_logger: logging.Logger | None = None,
@@ -2518,8 +2572,22 @@ def _build_campaign_assignment_groups(
         for day in days_to_process:
             raw_val = str(row.get(day, ""))
             if single_communication_per_day:
-                first_strat = get_first_valid_communication(raw_val)
-                strategies = [first_strat] if first_strat not in ("", "-") else []
+                if multimode_postdue and day in POSTDUE_DAYS:
+                    seen_modes: set[str] = set()
+                    strategies = []
+                    for s in raw_val.split("|"):
+                        s_clean = s.strip()
+                        if s_clean in ("", "-"):
+                            continue
+                        m = extract_canonical_mode_from_label(s_clean)
+                        if m and m not in seen_modes:
+                            seen_modes.add(m)
+                            strategies.append(s_clean)
+                        elif not m and not strategies:
+                            strategies.append(s_clean)
+                else:
+                    first_strat = get_first_valid_communication(raw_val)
+                    strategies = [first_strat] if first_strat not in ("", "-") else []
             else:
                 strategies = [s.strip() for s in raw_val.split("|") if s.strip() not in ("", "-")]
             for strategy in strategies:
@@ -2650,6 +2718,7 @@ def _prepare_campaign_outputs(
     allowed_day_offsets: list[int | str] | None = None,
     send_hour_window: dict[str, int] | None = None,
     single_communication_per_day: bool = False,
+    multimode_postdue: bool = False,
     default_templates: dict[str, object] | list | None = None,
     audit_collector: dict[str, object] | None = None,
     template_logger: logging.Logger | None = None,
@@ -2673,6 +2742,7 @@ def _prepare_campaign_outputs(
         campaign_days=campaign_days,
         send_hour_window=send_hour_window,
         single_communication_per_day=single_communication_per_day,
+        multimode_postdue=multimode_postdue,
         default_templates=default_templates,
         audit_collector=audit_collector,
         template_logger=template_logger,
@@ -2824,6 +2894,7 @@ def build_campaign_recommendations(
     allowed_day_offsets: list[int | str] | None = None,
     send_hour_window: dict[str, int] | None = None,
     single_communication_per_day: bool = False,
+    multimode_postdue: bool = False,
     default_templates: dict[str, object] | list | None = None,
 ) -> pd.DataFrame:
     campaign_rows, _ = _prepare_campaign_outputs(
@@ -2839,6 +2910,7 @@ def build_campaign_recommendations(
         allowed_day_offsets=allowed_day_offsets,
         send_hour_window=send_hour_window,
         single_communication_per_day=single_communication_per_day,
+        multimode_postdue=multimode_postdue,
         default_templates=default_templates,
     )
     return campaign_rows
@@ -2858,6 +2930,7 @@ def build_campaign_mappings(
     allowed_day_offsets: list[int | str] | None = None,
     send_hour_window: dict[str, int] | None = None,
     single_communication_per_day: bool = False,
+    multimode_postdue: bool = False,
     default_templates: dict[str, object] | list | None = None,
 ) -> pd.DataFrame:
     _, mapping_rows = _prepare_campaign_outputs(
@@ -2873,6 +2946,7 @@ def build_campaign_mappings(
         allowed_day_offsets=allowed_day_offsets,
         send_hour_window=send_hour_window,
         single_communication_per_day=single_communication_per_day,
+        multimode_postdue=multimode_postdue,
         default_templates=default_templates,
     )
     return mapping_rows
@@ -3855,7 +3929,7 @@ def main() -> None:
             cli_allowed_offsets=args.allowed_day_offsets,
             logger=logger,
         )
-    elif not args.dry_run and args.host and args.dbname and args.user:
+    elif not getattr(args, "dry_run", False) and args.host and args.dbname and args.user:
         try:
             db_conn_config = PostgresConfig(
                 host=args.host,
@@ -4084,6 +4158,10 @@ def main() -> None:
                 ]
                 if allowed_day_offsets is not None:
                     catboost_cmd.extend(["--allowed-day-offsets", *[str(o) for o in allowed_day_offsets]])
+                if getattr(args, "multimode_postdue", True):
+                    catboost_cmd.append("--multimode-postdue")
+                else:
+                    catboost_cmd.append("--no-multimode-postdue")
                 run_python_script(
                     *catboost_cmd,
                     logger=logger,
@@ -4301,6 +4379,7 @@ def main() -> None:
                         campaign_days=configured_campaign_days,
                         send_hour_window=configured_send_hour_window,
                         single_communication_per_day=True,
+                        multimode_postdue=getattr(args, "multimode_postdue", True),
                         default_templates=configured_default_templates,
                         audit_collector=template_audit,
                         template_logger=template_logger,
@@ -4360,6 +4439,7 @@ def main() -> None:
                 campaign_days=configured_campaign_days,
                 send_hour_window=configured_send_hour_window,
                 single_communication_per_day=True,
+                multimode_postdue=getattr(args, "multimode_postdue", True),
                 default_templates=configured_default_templates,
                 audit_collector=template_audit,
                 template_logger=template_logger,

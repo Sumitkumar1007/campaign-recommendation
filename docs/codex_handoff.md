@@ -78,3 +78,8 @@ Campaign recommendation ML pipeline with MCollect Digital scheduler integration.
 - Monthly inference stored `1` prediction snapshot, `14` campaign recommendations, `14` campaign mappings, and updated one `ai_configurations` row in Postgres.
 - Export script now writes only `dataset`, `qrtz_job_details`, `qrtz_triggers`, and `qrtz_cron_triggers`. Existing `digital_rules` templates are referenced by name and remain manually managed.
 - Current export dry run for `APR-2026 -> MAY-2026`: `14` campaigns, `7` datasets, `4` template refs, `14` jobs, `14` triggers.
+- Production inference run for `SEP-2026 -> OCT-2026` completed with 8,127 prediction rows, 405 campaigns, 38,154 mappings, and 100% template resolution across 80,112 touchpoints.
+- Fixed `--dry-run` AttributeError in `run_monthly_inference_pipeline.py`.
+- Added `--auto-class-weights` and class distribution reporting in `train_next_month_strategy_model_catboost.py`.
+- Overhauled recommendation reasoning: eliminated `"Reason not available..."` placeholders, added structured JSON cold-start fallback reasons, loan key normalization, and bank holiday suppression explanations. Chat history saved to `docs/chat_history_2026_10_19.md`.
+

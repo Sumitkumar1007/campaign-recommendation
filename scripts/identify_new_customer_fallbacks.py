@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 
 import pandas as pd
 
-from pipeline_common import DAY_COLUMNS, load_default_config, offsets_to_day_columns, parse_day_offset
+from pipeline_common import DAY_COLUMNS, load_default_config, offsets_to_day_columns, parse_day_offset, readable_strategy
 from project_paths import CASE_DATA_DIR, COMMUNICATION_DATA_DIR, REPO_ROOT, SCHEDULE_DATA_DIR, ensure_parent_dir
 
 
@@ -197,6 +198,15 @@ def build_fallback_rows(
         fallback_by_day = fallback_by_risk.get(risk) or fallback_by_risk.get("LOW", {})
         for day in DAY_COLUMNS:
             strategy = fallback_by_day.get(day, "-") if (allowed_day_labels is None or day in allowed_day_labels) else "-"
+            if strategy and strategy != "-":
+                reason_text = (
+                    f"Cold-start fallback: {readable_strategy(strategy)} is recommended based on "
+                    f"{risk}-risk historical average, as no communication history was found for this customer."
+                )
+            else:
+                reason_text = (
+                    f"No communication is recommended on {day} based on {risk}-risk cohort guidelines."
+                )
             records.append(
                 {
                     "apacCardNumber": case["apacCardNumber"],
@@ -206,10 +216,7 @@ def build_fallback_rows(
                     "day": day,
                     "recommendedStrategy": strategy,
                     "isActionable": "false" if strategy == "-" else "true",
-                    "reason": (
-                        "No communication history found for this APAC. "
-                        f"{risk}-risk average historical strategy is used as cold-start fallback."
-                    ),
+                    "reason": reason_text,
                 }
             )
     return pd.DataFrame(records)
@@ -227,8 +234,8 @@ def apply_fallbacks_to_prediction_file(
         raise ValueError("Prediction file must contain Loan_number column.")
 
     fallback_map: dict[tuple[str, str], str] = {}
+    day_reason_map: dict[tuple[str, str], str] = {}
     risk_map: dict[str, str] = {}
-    reason_map: dict[str, str] = {}
     vertical_map: dict[str, str] = {}
 
     for row in fallback_rows.itertuples(index=False):
@@ -238,13 +245,14 @@ def apply_fallbacks_to_prediction_file(
         risk_val = str(row.fallbackRiskUsed).strip().upper() or "LOW"
         reas_val = str(row.reason).strip()
         vert_val = str(row.vertical).strip().upper()
+        day_val = str(row.day).strip()
 
         for key_c in {raw_card, clean_card, raw_card.zfill(18)}:
             if not key_c:
                 continue
-            fallback_map[(key_c, str(row.day).strip())] = strat
+            fallback_map[(key_c, day_val)] = strat
+            day_reason_map[(key_c, day_val)] = reas_val
             risk_map[key_c] = risk_val
-            reason_map[key_c] = reas_val
             vertical_map[key_c] = vert_val
 
     if "IS_NEW_CUSTOMER" not in predictions.columns:
@@ -264,16 +272,24 @@ def apply_fallbacks_to_prediction_file(
 
         if "SOURCE_RISK" in predictions.columns:
             predictions.at[idx, "SOURCE_RISK"] = risk_map[matched_key]
+        day_reasons: dict[str, str] = {}
         for day in DAY_COLUMNS:
             if day in predictions.columns:
                 if allowed_day_labels is not None and day not in allowed_day_labels:
                     predictions.at[idx, day] = "-"
+                    day_reasons[day] = f"No communication scheduled on {day} (outside active prediction window)."
                 else:
-                    predictions.at[idx, day] = fallback_map.get((matched_key, day), "-")
+                    strat = fallback_map.get((matched_key, day), "-")
+                    predictions.at[idx, day] = strat
+                    day_reasons[day] = day_reason_map.get(
+                        (matched_key, day),
+                        f"Cold-start fallback strategy applied based on {risk_map[matched_key]}-risk historical average."
+                    )
         if "D" in predictions.columns:
             predictions.at[idx, "D"] = "-"
+            day_reasons["D"] = "No communication is scheduled on the EMI due date."
         if "PREDICTION_REASON" in predictions.columns:
-            predictions.at[idx, "PREDICTION_REASON"] = reason_map[matched_key]
+            predictions.at[idx, "PREDICTION_REASON"] = json.dumps(day_reasons, sort_keys=True)
         predictions.at[idx, "IS_NEW_CUSTOMER"] = "True"
         updated += 1
 
@@ -292,7 +308,7 @@ def apply_fallbacks_to_prediction_file(
             matched_key = loan if loan in risk_map else clean_loan
             risk = risk_map.get(matched_key, "LOW")
             vertical = vertical_map.get(matched_key, "LAP")
-            reason = reason_map.get(matched_key, "")
+            row_day_reasons: dict[str, str] = {}
             row_dict = {
                 "SOURCE_RISK": risk,
                 "SOURCE_VERTICAL": vertical,
@@ -300,16 +316,23 @@ def apply_fallbacks_to_prediction_file(
                 "Loan_number": loan,
                 "SOURCE_MONTH_USED": sample_month_used,
                 "MONTH": sample_month,
-                "PREDICTION_REASON": reason,
                 "IS_NEW_CUSTOMER": "True",
             }
             for day in DAY_COLUMNS:
                 if allowed_day_labels is not None and day not in allowed_day_labels:
                     row_dict[day] = "-"
+                    row_day_reasons[day] = f"No communication scheduled on {day} (outside active prediction window)."
                 else:
-                    row_dict[day] = fallback_map.get((loan, day), "-")
-            if "D" in row_dict:
+                    strat = fallback_map.get((loan, day), "-")
+                    row_dict[day] = strat
+                    row_day_reasons[day] = day_reason_map.get(
+                        (matched_key, day),
+                        f"Cold-start fallback strategy applied based on {risk}-risk historical average."
+                    )
+            if "D" in row_dict or "D" in predictions.columns:
                 row_dict["D"] = "-"
+                row_day_reasons["D"] = "No communication is scheduled on the EMI due date."
+            row_dict["PREDICTION_REASON"] = json.dumps(row_day_reasons, sort_keys=True)
             new_rows.append(row_dict)
 
         new_df = pd.DataFrame(new_rows)

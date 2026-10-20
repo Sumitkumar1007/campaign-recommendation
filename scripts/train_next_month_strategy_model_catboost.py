@@ -174,6 +174,12 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("USE_RANDOM_DATA_SPLIT", "false").strip().lower() in {"1", "true", "yes", "on"},
         help="Use random 70/15/15 stratified data split across all labeled data instead of chronological month split.",
     )
+    parser.add_argument(
+        "--auto-class-weights",
+        choices=["None", "Balanced", "SqrtBalanced"],
+        default=os.getenv("AUTO_CLASS_WEIGHTS", "None"),
+        help="Class balancing mode for CatBoost models: 'None' (default, unbalanced), 'Balanced', or 'SqrtBalanced'.",
+    )
     return parser.parse_args()
 
 
@@ -297,6 +303,7 @@ def fit_day_model(
     checkpoint_dir: Path,
     checkpoint_metadata: dict,
     fallback_config: dict[str, str] | None = None,
+    auto_class_weights: str | None = None,
 ) -> tuple[str, Any, LabelEncoder]:
     logger = logging.getLogger("catboost_training")
     checkpoint_file = checkpoint_dir / f"{day.replace('+', 'plus').replace('-', 'minus')}.joblib"
@@ -312,6 +319,7 @@ def fit_day_model(
         "iterations": iterations,
         "learning_rate": learning_rate,
         "depth": depth,
+        "auto_class_weights": auto_class_weights,
         "feature_columns": X_train.columns.tolist(),
         "target_value_counts": y_train[day].astype(str).value_counts().sort_index().to_dict(),
         "sample_weight_enabled": sample_weight_enabled,
@@ -386,16 +394,19 @@ def fit_day_model(
     train_dir.mkdir(parents=True, exist_ok=True)
     encoder = LabelEncoder()
     y_encoded = encoder.fit_transform(y_train[day].astype(str))
-    model = CatBoostClassifier(
-        iterations=iterations,
-        learning_rate=learning_rate,
-        depth=depth,
-        loss_function="MultiClass",
-        random_seed=42,
-        verbose=False,
-        thread_count=1,
-        train_dir=str(train_dir),
-    )
+    catboost_kwargs: dict[str, Any] = {
+        "iterations": iterations,
+        "learning_rate": learning_rate,
+        "depth": depth,
+        "loss_function": "MultiClass",
+        "random_seed": 42,
+        "verbose": False,
+        "thread_count": 1,
+        "train_dir": str(train_dir),
+    }
+    if auto_class_weights and auto_class_weights != "None":
+        catboost_kwargs["auto_class_weights"] = auto_class_weights
+    model = CatBoostClassifier(**catboost_kwargs)
     model.fit(X_train, y_encoded, sample_weight=sample_weight)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     joblib.dump(
@@ -409,6 +420,7 @@ def fit_day_model(
                 "iterations": iterations,
                 "learning_rate": learning_rate,
                 "depth": depth,
+                "auto_class_weights": auto_class_weights,
                 "feature_columns": X_train.columns.tolist(),
                 "target_value_counts": y_train[day].astype(str).value_counts().sort_index().to_dict(),
             },
@@ -687,11 +699,13 @@ def main() -> None:
                 "train_source_months": effective_train_source_months,
                 "train_rows": int(len(train_df)),
                 "sample_weight_mode": sample_weight_mode,
+                "auto_class_weights": args.auto_class_weights,
             }
             logger.info(
-                "Checkpoint directory | path=%s existing_checkpoints=%s",
+                "Checkpoint directory | path=%s existing_checkpoints=%s auto_class_weights=%s",
                 checkpoint_dir,
                 completed_checkpoints,
+                args.auto_class_weights,
             )
             fitted_models = Parallel(n_jobs=args.n_jobs, verbose=10, prefer="threads")(
                 delayed(fit_day_model)(
@@ -705,11 +719,21 @@ def main() -> None:
                     checkpoint_dir,
                     checkpoint_metadata,
                     day_fallback_config.get(day),
+                    auto_class_weights=args.auto_class_weights,
                 )
                 for day in DAY_COLUMNS
             )
             models: dict[str, CatBoostClassifier] = {day: model for day, model, _ in fitted_models}
             label_encoders: dict[str, LabelEncoder] = {day: encoder for day, _, encoder in fitted_models}
+
+        target_class_distributions: dict[str, dict[str, int]] = {
+            day: y_train[day].astype(str).value_counts().sort_index().to_dict()
+            for day in DAY_COLUMNS
+        }
+        logger.info("Training class distribution summary by day:")
+        for day in DAY_COLUMNS:
+            counts = target_class_distributions[day]
+            logger.info("  Day %s: total=%d distribution=%s", day, sum(counts.values()), counts)
 
         with log_step(logger, "evaluate_models"):
             train_metrics = evaluate_models(models, label_encoders, X_train, y_train)
@@ -728,6 +752,8 @@ def main() -> None:
             "split_method": "random_split (70% Train / 15% Validation / 15% Test)" if use_random_split else "month_based_split",
             "target_offset_months": args.target_offset_months,
             "history_window_months": args.history_window_months,
+            "auto_class_weights": args.auto_class_weights,
+            "target_class_distributions": target_class_distributions,
             "train_source_months": ["ALL_MONTHS_RANDOM_SAMPLED_70%"] if use_random_split else effective_train_source_months,
             "validation_source_months": ["ALL_MONTHS_RANDOM_SAMPLED_15%"] if use_random_split else effective_validation_source_months,
             "test_source_months": ["ALL_MONTHS_RANDOM_SAMPLED_15%"] if use_random_split else effective_test_source_months,

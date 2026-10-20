@@ -4,6 +4,7 @@ import json
 import sys
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 import pytest
@@ -150,6 +151,32 @@ def test_fit_day_model_uses_constant_non_dash_fallback_for_single_class_day(tmp_
     assert encoder.classes_.tolist() == ["SMS-9AM-ENGLISH"]
     output = predict_top_k_by_risk(model, encoder, X_train, pd.Series(["LOW", "MEDIUM", "HIGH"]))
     assert output.tolist() == ["SMS-9AM-ENGLISH", "SMS-9AM-ENGLISH", "SMS-9AM-ENGLISH"]
+
+
+def test_fit_day_model_supports_auto_class_weights(tmp_path: Path) -> None:
+    X_train = pd.DataFrame({"feature_a": [1, 2, 3, 4, 5, 6]})
+    y_train = pd.DataFrame({"D-3": ["SMS-9AM-ENGLISH", "SMS-9AM-ENGLISH", "SMS-9AM-ENGLISH", "SMS-9AM-ENGLISH", "WH-2PM-ENGLISH", "WH-2PM-ENGLISH"]})
+
+    day, model, encoder = fit_day_model(
+        "D-3",
+        X_train,
+        y_train,
+        sample_weight=None,
+        iterations=5,
+        learning_rate=0.05,
+        depth=2,
+        checkpoint_dir=tmp_path,
+        checkpoint_metadata={"train_rows": 6},
+        auto_class_weights="Balanced",
+    )
+
+    assert day == "D-3"
+    assert len(encoder.classes_) == 2
+    checkpoint_file = tmp_path / "Dminus3.joblib"
+    assert checkpoint_file.exists()
+    checkpoint = joblib.load(checkpoint_file)
+    assert checkpoint["metadata"]["auto_class_weights"] == "Balanced"
+    assert checkpoint["metadata"]["target_value_counts"] == {"SMS-9AM-ENGLISH": 4, "WH-2PM-ENGLISH": 2}
 
 
 def test_analyze_day_target_variation_marks_missing_day_data() -> None:

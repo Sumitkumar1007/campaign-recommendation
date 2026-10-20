@@ -1128,6 +1128,47 @@ def test_identify_new_customer_fallbacks_cli_allowed_offsets(tmp_path: Path, mon
     assert updated_pred.iloc[0]["D+5"] == "-"
 
 
+def test_monthly_inference_pipeline_dry_run_flag(monkeypatch):
+    from run_monthly_inference_pipeline import parse_args
+
+    # Without --dry-run
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_monthly_inference_pipeline.py",
+            "--host", "localhost",
+            "--dbname", "testdb",
+            "--user", "testuser",
+            "--password", "testpw",
+            "--source-month", "2026-04",
+            "--predict-month", "2026-05",
+        ],
+    )
+    args = parse_args()
+    assert hasattr(args, "dry_run")
+    assert args.dry_run is False
+
+    # With --dry-run
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "run_monthly_inference_pipeline.py",
+            "--host", "localhost",
+            "--dbname", "testdb",
+            "--user", "testuser",
+            "--password", "testpw",
+            "--source-month", "2026-04",
+            "--predict-month", "2026-05",
+            "--dry-run",
+        ],
+    )
+    args_dry = parse_args()
+    assert args_dry.dry_run is True
+
+
+
 
 
 
