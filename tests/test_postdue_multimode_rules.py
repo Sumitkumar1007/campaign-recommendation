@@ -218,3 +218,128 @@ def test_build_campaign_mappings_multimode_postdue(tmp_path: Path):
         "POSTDUE_AIML_WA_ENGLISH",
         "POSTDUE_AIML_VOICE_ENGLISH",
     }
+
+
+def test_new_customer_postdue_multimode_fallback(tmp_path: Path):
+    from identify_new_customer_fallbacks import build_average_strategy_by_risk
+
+    schedule_csv = tmp_path / "schedule.csv"
+    pd.DataFrame({"RISK": ["LOW"], "D-5": ["SMS-10AM-ENGLISH"], "D+1": ["-"]}).to_csv(schedule_csv, index=False)
+
+    fallback_multi = build_average_strategy_by_risk(schedule_csv, multimode_postdue=True)
+    # Pre-due remains single strategy
+    assert fallback_multi["LOW"]["D-5"] == "SMS-10AM-ENGLISH"
+    # Post-due produces 3-channel multi-mode strategy
+    d1_strat = fallback_multi["LOW"]["D+1"]
+    assert d1_strat == "SMS-10AM-ENGLISH|WH-1PM-ENGLISH|VOICE-4PM-ENGLISH"
+
+    # When multimode_postdue is False, falls back to single strategy
+    fallback_single = build_average_strategy_by_risk(schedule_csv, multimode_postdue=False)
+    assert fallback_single["LOW"]["D+1"] == "-"
+
+
+def test_new_customer_postdue_multimode_language_harmonization(tmp_path: Path):
+    from identify_new_customer_fallbacks import build_average_strategy_by_risk
+
+    schedule_csv = tmp_path / "schedule_hindi.csv"
+    pd.DataFrame({"RISK": ["HIGH"], "D+1": ["SMS-10AM-HINDI"]}).to_csv(schedule_csv, index=False)
+
+    fallback = build_average_strategy_by_risk(schedule_csv, multimode_postdue=True)
+    # All 3 modes harmonize to HINDI
+    d1_strat = fallback["HIGH"]["D+1"]
+    assert d1_strat == "SMS-10AM-HINDI|WH-1PM-HINDI|VOICE-4PM-HINDI"
+
+
+def test_new_customer_postdue_multimode_campaign_expansion(tmp_path: Path):
+    from identify_new_customer_fallbacks import build_fallback_rows, apply_fallbacks_to_prediction_file
+
+    new_cases = pd.DataFrame([{"apacCardNumber": "NEW_CUST_1", "originalRisk": "LOW", "vertical": "LAP"}])
+    fallback_by_risk = {
+        "LOW": {
+            "D-5": "SMS-11AM-ENGLISH",
+            "D+1": "SMS-10AM-ENGLISH|WH-1PM-ENGLISH|VOICE-4PM-ENGLISH",
+        }
+    }
+    fallback_rows = build_fallback_rows(new_cases, fallback_by_risk, allowed_day_labels={"D-5", "D+1"})
+
+    pred_file = tmp_path / "predictions_new_cust.csv"
+    pd.DataFrame([
+        {
+            "Loan_number": "NEW_CUST_1",
+            "SOURCE_RISK": "LOW",
+            "SOURCE_VERTICAL": "LAP",
+            "MONTH": "MAY-2026",
+            "SOURCE_MONTH_USED": "APR-2026",
+            "emi_date": "05/05/2026",
+            "D-5": "-",
+            "D+1": "-",
+            "IS_NEW_CUSTOMER": "False",
+        }
+    ]).to_csv(pred_file, index=False)
+
+    apply_fallbacks_to_prediction_file(pred_file, fallback_rows)
+
+    df_pred = pd.read_csv(pred_file, dtype=str)
+    assert df_pred.iloc[0]["D-5"] == "SMS-11AM-ENGLISH"
+    assert df_pred.iloc[0]["D+1"] == "SMS-10AM-ENGLISH|WH-1PM-ENGLISH|VOICE-4PM-ENGLISH"
+    assert df_pred.iloc[0]["IS_NEW_CUSTOMER"] == "True"
+
+    mappings = build_campaign_mappings(
+        pred_file,
+        source_month_label="APR-2026",
+        prediction_month_label="MAY-2026",
+        model_name="catboost_3m",
+        emi_cycles=[5],
+        vertical="LAP",
+        vendors=["prutech"],
+        run_date=pd.Timestamp("2026-04-08").to_pydatetime(),
+        single_communication_per_day=True,
+        multimode_postdue=True,
+    )
+    d_plus_1 = mappings[mappings["date"] == "D+1"]
+    assert len(d_plus_1) == 3
+    assert set(d_plus_1["mode"]) == {"SMS", "WHATSAPP", "VOICE"}
+    assert set(d_plus_1["time"]) == {"10:00:00", "13:00:00", "16:00:00"}
+
+
+def test_multimode_postdue_env_flag_config(monkeypatch):
+    import sys
+    from env_utils import env_flag
+    import predict_next_month_strategy_catboost as pred_cb
+    import run_monthly_inference_pipeline as run_inf
+    import identify_new_customer_fallbacks as ident_fb
+
+    # 1. When MULTIMODE_POSTDUE=false in env
+    monkeypatch.setenv("MULTIMODE_POSTDUE", "false")
+    assert env_flag("MULTIMODE_POSTDUE", default=True) is False
+
+    monkeypatch.setattr(sys, "argv", ["predict_next_month_strategy_catboost.py", "--feature-file", "dummy", "--schedule-file", "dummy", "--model-file", "dummy", "--base-population-file", "dummy"])
+    args_cb = pred_cb.parse_args()
+    assert args_cb.multimode_postdue is False
+
+    monkeypatch.setattr(sys, "argv", ["run_monthly_inference_pipeline.py", "--host", "dummy", "--dbname", "dummy", "--user", "dummy", "--password", "dummy", "--source-month", "2026-09", "--predict-month", "2026-10", "--dry-run"])
+    args_inf = run_inf.parse_args()
+    assert args_inf.multimode_postdue is False
+
+    monkeypatch.setattr(sys, "argv", ["identify_new_customer_fallbacks.py"])
+    args_fb = ident_fb.parse_args()
+    assert args_fb.multimode_postdue is False
+
+    # 2. Explicit CLI flag --multimode-postdue overrides env=false
+    monkeypatch.setattr(sys, "argv", ["predict_next_month_strategy_catboost.py", "--feature-file", "dummy", "--schedule-file", "dummy", "--model-file", "dummy", "--base-population-file", "dummy", "--multimode-postdue"])
+    args_cb_override = pred_cb.parse_args()
+    assert args_cb_override.multimode_postdue is True
+
+    # 3. When MULTIMODE_POSTDUE=true in env
+    monkeypatch.setenv("MULTIMODE_POSTDUE", "true")
+    assert env_flag("MULTIMODE_POSTDUE", default=False) is True
+
+    monkeypatch.setattr(sys, "argv", ["run_monthly_inference_pipeline.py", "--host", "dummy", "--dbname", "dummy", "--user", "dummy", "--password", "dummy", "--source-month", "2026-09", "--predict-month", "2026-10", "--dry-run"])
+    args_inf_true = run_inf.parse_args()
+    assert args_inf_true.multimode_postdue is True
+
+    # 4. Explicit CLI flag --no-multimode-postdue overrides env=true
+    monkeypatch.setattr(sys, "argv", ["run_monthly_inference_pipeline.py", "--host", "dummy", "--dbname", "dummy", "--user", "dummy", "--password", "dummy", "--source-month", "2026-09", "--predict-month", "2026-10", "--dry-run", "--no-multimode-postdue"])
+    args_inf_false = run_inf.parse_args()
+    assert args_inf_false.multimode_postdue is False
+

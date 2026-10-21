@@ -7,15 +7,28 @@ from pathlib import Path
 
 import pandas as pd
 
-from pipeline_common import DAY_COLUMNS, load_default_config, offsets_to_day_columns, parse_day_offset, readable_strategy
+from pipeline_common import (
+    DAY_COLUMNS,
+    POSTDUE_DAY_COLUMNS,
+    PREDUE_DAY_COLUMNS,
+    TARGET_POSTDUE_MODES,
+    extract_canonical_mode_from_label,
+    extract_hour_from_label,
+    load_default_config,
+    offsets_to_day_columns,
+    parse_day_offset,
+    readable_strategy,
+)
+from env_utils import env_flag, load_dotenv
 from project_paths import CASE_DATA_DIR, COMMUNICATION_DATA_DIR, REPO_ROOT, SCHEDULE_DATA_DIR, ensure_parent_dir
 
 
 def parse_args() -> argparse.Namespace:
+    load_dotenv(override=True)
     parser = argparse.ArgumentParser(
         description=(
             "Identify APACs present in current cases but absent from communication "
-            "history, then prepare LOW-risk average fallback strategies."
+            "history, then prepare fallback strategies."
         )
     )
     parser.add_argument(
@@ -54,6 +67,12 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=None,
         help="Allowed day offsets for prediction window (e.g. -5 -4 -3 -2 -1 1 2 3 4 5). Overrides config-file.",
+    )
+    parser.add_argument(
+        "--multimode-postdue",
+        action=argparse.BooleanOptionalAction,
+        default=env_flag("MULTIMODE_POSTDUE", env_flag("STRATEGY_MULTIMODE_POSTDUE", default=True)),
+        help="Enable multi-mode post-due fallback (SMS, WhatsApp, Voice) for post-due days [default: True, or MULTIMODE_POSTDUE env].",
     )
     return parser.parse_args()
 
@@ -159,12 +178,110 @@ def most_common_strategy(values: pd.Series) -> str:
     return str(normalized.value_counts().sort_values(ascending=False).index[0])
 
 
-def build_average_strategy_by_risk(schedule_file: Path) -> dict[str, dict[str, str]]:
+DEFAULT_POSTDUE_FALLBACK_MODES: dict[str, str] = {
+    "SMS": "SMS-10AM-ENGLISH",
+    "WHATSAPP": "WH-1PM-ENGLISH",
+    "VOICE": "VOICE-4PM-ENGLISH",
+}
+
+
+def build_postdue_multimode_strategy(
+    values: pd.Series | None,
+    target_modes: list[str] | None = None,
+    default_fallbacks: dict[str, str] | None = None,
+) -> str:
+    """
+    Constructs a multi-mode fallback strategy for a post-due day
+    (e.g. SMS-10AM-ENGLISH|WH-1PM-ENGLISH|VOICE-4PM-ENGLISH).
+    Extracts most common strategies per mode from historical schedule values if present,
+    harmonizes language across modes, resolves hour collisions, and fills missing modes with
+    staggered default fallbacks.
+    """
+    modes_to_use = target_modes or TARGET_POSTDUE_MODES
+    fallbacks = default_fallbacks or DEFAULT_POSTDUE_FALLBACK_MODES
+
+    mode_token_counts: dict[str, dict[str, int]] = {m: {} for m in modes_to_use}
+    detected_languages: list[str] = []
+
+    if values is not None and not values.empty:
+        for raw_val in values.dropna():
+            val_str = str(raw_val).strip()
+            if not val_str or val_str in ("-", "None", "nan"):
+                continue
+            for token in val_str.split("|"):
+                token_clean = normalize_fallback_strategy(token.strip())
+                if not token_clean or token_clean in ("-", "None", "nan"):
+                    continue
+                mode = extract_canonical_mode_from_label(token_clean)
+                if mode in mode_token_counts:
+                    mode_token_counts[mode][token_clean] = mode_token_counts[mode].get(token_clean, 0) + 1
+                parts = token_clean.split("-")
+                if len(parts) >= 3:
+                    lang = parts[-1].strip().upper()
+                    if lang and lang not in ("-", "NONE", "NAN"):
+                        detected_languages.append(lang)
+
+    dominant_language = "ENGLISH"
+    if detected_languages:
+        dominant_language = str(pd.Series(detected_languages).value_counts().index[0])
+
+    default_hour_slots = {"SMS": "10AM", "WHATSAPP": "1PM", "VOICE": "4PM"}
+    allowed_fallback_hours = ["10AM", "1PM", "4PM", "11AM", "12PM", "2PM", "3PM", "5PM"]
+
+    used_hours: set[str] = set()
+    chosen_strategies: list[str] = []
+
+    for mode in modes_to_use:
+        counts = mode_token_counts.get(mode, {})
+        chosen_token = None
+        if counts:
+            sorted_candidates = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+            for cand, _ in sorted_candidates:
+                cand_hr = extract_hour_from_label(cand)
+                if cand_hr and cand_hr not in used_hours:
+                    chosen_token = cand
+                    used_hours.add(cand_hr)
+                    break
+
+        if chosen_token is None:
+            fallback_template = fallbacks.get(mode, f"{mode}-{default_hour_slots.get(mode, '12PM')}-ENGLISH")
+            parts = fallback_template.split("-")
+            ch = parts[0]
+            pref_hr = parts[1] if len(parts) >= 2 else default_hour_slots.get(mode, "12PM")
+            lang = dominant_language if dominant_language else (parts[-1] if len(parts) >= 3 else "ENGLISH")
+
+            if pref_hr not in used_hours:
+                chosen_hr = pref_hr
+            else:
+                chosen_hr = next((h for h in allowed_fallback_hours if h not in used_hours), pref_hr)
+
+            used_hours.add(chosen_hr)
+            chosen_token = f"{ch}-{chosen_hr}-{lang}"
+
+        chosen_strategies.append(chosen_token)
+
+    return "|".join(chosen_strategies) if chosen_strategies else "-"
+
+
+def build_average_strategy_by_risk(
+    schedule_file: Path,
+    multimode_postdue: bool = True,
+) -> dict[str, dict[str, str]]:
     schedule = pd.read_csv(schedule_file, dtype=str)
     if "RISK" not in schedule.columns:
         return {
             "LOW": {
-                day: most_common_strategy(schedule[day]) if day in schedule.columns else "-"
+                day: (
+                    build_postdue_multimode_strategy(schedule[day])
+                    if multimode_postdue and day in POSTDUE_DAY_COLUMNS
+                    else most_common_strategy(schedule[day])
+                )
+                if day in schedule.columns
+                else (
+                    build_postdue_multimode_strategy(None)
+                    if multimode_postdue and day in POSTDUE_DAY_COLUMNS
+                    else "-"
+                )
                 for day in DAY_COLUMNS
             }
         }
@@ -175,13 +292,33 @@ def build_average_strategy_by_risk(schedule_file: Path) -> dict[str, dict[str, s
         if not risk:
             continue
         average_by_risk[risk] = {
-            day: most_common_strategy(risk_df[day]) if day in risk_df.columns else "-"
+            day: (
+                build_postdue_multimode_strategy(risk_df[day])
+                if multimode_postdue and day in POSTDUE_DAY_COLUMNS
+                else most_common_strategy(risk_df[day])
+            )
+            if day in risk_df.columns
+            else (
+                build_postdue_multimode_strategy(None)
+                if multimode_postdue and day in POSTDUE_DAY_COLUMNS
+                else "-"
+            )
             for day in DAY_COLUMNS
         }
 
     if "LOW" not in average_by_risk:
         average_by_risk["LOW"] = {
-            day: most_common_strategy(schedule[day]) if day in schedule.columns else "-"
+            day: (
+                build_postdue_multimode_strategy(schedule[day])
+                if multimode_postdue and day in POSTDUE_DAY_COLUMNS
+                else most_common_strategy(schedule[day])
+            )
+            if day in schedule.columns
+            else (
+                build_postdue_multimode_strategy(None)
+                if multimode_postdue and day in POSTDUE_DAY_COLUMNS
+                else "-"
+            )
             for day in DAY_COLUMNS
         }
     return average_by_risk
@@ -365,7 +502,10 @@ def main() -> None:
         | case_apacs["apacCardNumber"].str.lstrip("0").isin(history_apacs)
     )
     new_cases = case_apacs[~is_in_history].copy()
-    fallback_by_risk = build_average_strategy_by_risk(Path(args.schedule_file))
+    fallback_by_risk = build_average_strategy_by_risk(
+        Path(args.schedule_file),
+        multimode_postdue=getattr(args, "multimode_postdue", True),
+    )
     output = build_fallback_rows(new_cases, fallback_by_risk, allowed_day_labels=allowed_day_labels)
     output.to_csv(output_file, index=False)
     updated_predictions = apply_fallbacks_to_prediction_file(Path(args.prediction_file), output, allowed_day_labels=allowed_day_labels) if args.prediction_file else 0

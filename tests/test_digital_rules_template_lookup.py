@@ -389,8 +389,8 @@ def test_resolve_template_name_priority_order():
     assert t4 == "DB_PREDUE_VOICE_ENG"
     assert s4 == "DB_COHORT_MATCH"
 
-    # Priority 5: Config defaults fallback
-    t5, s5, _ = resolve_template_name_with_status(
+    # Priority 5: Config defaults are not used -> Unmatched mode returns empty string and FAILED status
+    t5, s5, reason5 = resolve_template_name_with_status(
         loan_number="ACC_NEW",
         due_type="POSTDUE",
         mode="SMS",
@@ -399,8 +399,9 @@ def test_resolve_template_name_priority_order():
         digital_rules_lookup=digital_rules_lookup,
         default_templates=config_defaults,
     )
-    assert t5 == "CONFIG_POSTDUE_SMS_DEF"
-    assert s5 == "CONFIG_FALLBACK"
+    assert t5 == ""
+    assert s5 == "FAILED"
+    assert "No active digital rule found" in reason5
 
     # Priority 6: Unmatched / Missing -> Return empty string and FAILED status
     t6, s6, reason6 = resolve_template_name_with_status(

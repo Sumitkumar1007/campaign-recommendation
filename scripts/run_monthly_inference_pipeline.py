@@ -21,7 +21,7 @@ from psycopg.types.json import Jsonb
 from app_logging import log_step, setup_logging
 from drift_utils import compute_drift_report
 from model_fallbacks import register_legacy_joblib_aliases
-from env_utils import load_dotenv
+from env_utils import env_flag, load_dotenv
 from fetch_month_from_postgres import (
     configured_prediction_month_from_emi_dates,
     configured_source_month_from_emi_dates,
@@ -42,6 +42,7 @@ from pipeline_common import (
     offsets_to_day_columns,
     parse_day_offset,
     prepare_next_month_dataset,
+    readable_strategy,
     snap_hour_to_window,
     split_by_source_month,
 )
@@ -249,8 +250,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--multimode-postdue",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Enable multi-mode prediction and campaign mapping (SMS, WhatsApp, Voice) for post-due days [default: True].",
+        default=env_flag("MULTIMODE_POSTDUE", env_flag("STRATEGY_MULTIMODE_POSTDUE", default=True)),
+        help="Enable multi-mode prediction and campaign mapping (SMS, WhatsApp, Voice) for post-due days [default: True, or MULTIMODE_POSTDUE env].",
     )
     parser.add_argument(
         "--dry-run",
@@ -1173,9 +1174,10 @@ def fetch_digital_rules_lookup(
         try:
             query = sql.SQL(
                 """
-                SELECT id, {mode_col} AS mode, language, campaign_identifier, iteration
+                SELECT id, {mode_col} AS mode, language, campaign_identifier, iteration, active
                 FROM {table_ref}
                 WHERE iteration IS NOT NULL AND iteration <> ''
+                  AND (active IS TRUE OR active = 't' OR active = true)
                 {id_filter}
                 ORDER BY id ASC
                 """
@@ -1192,7 +1194,7 @@ def fetch_digital_rules_lookup(
             try:
                 query_fallback = sql.SQL(
                     """
-                    SELECT id, {mode_col} AS mode, language, NULL AS campaign_identifier, iteration
+                    SELECT id, {mode_col} AS mode, language, campaign_identifier, iteration
                     FROM {table_ref}
                     WHERE iteration IS NOT NULL AND iteration <> ''
                     {id_filter}
@@ -1208,10 +1210,39 @@ def fetch_digital_rules_lookup(
                     rows = cur.fetchall()
                     break
             except Exception:
-                continue
+                try:
+                    query_fallback_no_cid = sql.SQL(
+                        """
+                        SELECT id, {mode_col} AS mode, language, NULL AS campaign_identifier, iteration
+                        FROM {table_ref}
+                        WHERE iteration IS NOT NULL AND iteration <> ''
+                        {id_filter}
+                        ORDER BY id ASC
+                        """
+                    ).format(
+                        mode_col=sql.Identifier(col),
+                        table_ref=table_ref,
+                        id_filter=id_filter_sql,
+                    )
+                    with conn.cursor() as cur:
+                        cur.execute(query_fallback_no_cid, params)
+                        rows = cur.fetchall()
+                        break
+                except Exception:
+                    continue
 
     if rows is not None:
-        for rule_id, mode, language, campaign_identifier, iteration in rows:
+        for row in rows:
+            rule_id = row[0]
+            mode = row[1]
+            language = row[2]
+            campaign_identifier = row[3]
+            iteration = row[4]
+            is_active = True
+            if len(row) > 5 and row[5] is not None:
+                is_active = str(row[5]).strip().lower() in ("true", "t", "1")
+            if not is_active:
+                continue
             if rule_id is not None and mode and iteration:
                 rule_id_str = str(rule_id).strip()
                 mode_u = str(mode).strip().upper()
@@ -1240,6 +1271,7 @@ def fetch_digital_rules_lookup(
                     "mode": mode_u,
                     "language": lang_u,
                     "iteration": iter_val,
+                    "active": is_active,
                 }
     else:
         log.warning("Could not pre-fetch digital_rules lookup table from schema=%s", schema)
@@ -1394,6 +1426,7 @@ def build_latest_digital_rule_map(
     log = logger or get_template_logger()
     latest_map: dict[object, object] = {}
     rule_meta_map: dict[str, dict] = {}
+    seen_rejections: set[str] = set()
     if digital_rules_lookup:
         rule_meta_map = {
             str(k[1]): v
@@ -1457,6 +1490,8 @@ def build_latest_digital_rule_map(
                 template_name = ""
                 meta = rule_meta_map.get(rule_id)
                 if meta:
+                    if not meta.get("active", True):
+                        continue
                     meta_due = meta.get("due_type", "")
                     meta_mode = meta.get("mode", "")
                     meta_template = meta.get("iteration", "")
@@ -1464,45 +1499,44 @@ def build_latest_digital_rule_map(
 
                     # Check for inconsistency between comm_due_type and rule metadata
                     if comm_due_type and meta_due and comm_due_type != meta_due:
-                        log.warning(
-                            "Inconsistent historical rule rejected: apac=%s rule_id=%s comm_due=%s rule_due=%s mode=%s template=%s",
-                            apac, rule_id, comm_due_type, meta_due, mode, meta_template,
-                        )
-                        # Do not record inconsistent rule for this communication due_type
+                        rej_msg = f"Inconsistent historical rule rejected: apac={apac} rule_id={rule_id} comm_due={comm_due_type} rule_due={meta_due} mode={mode} template={meta_template}"
+                        if rej_msg not in seen_rejections:
+                            seen_rejections.add(rej_msg)
+                            log.debug("%s", rej_msg)
                         continue
                     if meta_mode and meta_mode != mode:
-                        log.warning(
-                            "Historical rule mode mismatch rejected: apac=%s rule_id=%s comm_mode=%s rule_mode=%s",
-                            apac, rule_id, mode, meta_mode,
-                        )
+                        rej_msg = f"Historical rule mode mismatch rejected: apac={apac} rule_id={rule_id} comm_mode={mode} rule_mode={meta_mode}"
+                        if rej_msg not in seen_rejections:
+                            seen_rejections.add(rej_msg)
+                            log.debug("%s", rej_msg)
                         continue
                     if meta_lang and lang and meta_lang != lang:
-                        log.warning(
-                            "Historical rule language mismatch rejected: apac=%s rule_id=%s comm_lang=%s rule_lang=%s mode=%s template=%s",
-                            apac, rule_id, lang, meta_lang, mode, meta_template,
-                        )
+                        rej_msg = f"Historical rule language mismatch rejected: apac={apac} rule_id={rule_id} comm_lang={lang} rule_lang={meta_lang} mode={mode} template={meta_template}"
+                        if rej_msg not in seen_rejections:
+                            seen_rejections.add(rej_msg)
+                            log.debug("%s", rej_msg)
                         continue
 
                     effective_due = comm_due_type or meta_due
                     effective_lang = meta_lang or lang
                     if meta_template:
                         if effective_due and not validate_template_due_type_consistency(meta_template, effective_due):
-                            log.warning(
-                                "Inconsistent historical template due_type rejected: apac=%s rule_id=%s due=%s template=%s",
-                                apac, rule_id, effective_due, meta_template,
-                            )
+                            rej_msg = f"Inconsistent historical template due_type rejected: apac={apac} rule_id={rule_id} due={effective_due} template={meta_template}"
+                            if rej_msg not in seen_rejections:
+                                seen_rejections.add(rej_msg)
+                                log.debug("%s", rej_msg)
                             continue
                         if not validate_template_mode_consistency(meta_template, mode):
-                            log.warning(
-                                "Inconsistent historical template mode rejected: apac=%s rule_id=%s mode=%s template=%s",
-                                apac, rule_id, mode, meta_template,
-                            )
+                            rej_msg = f"Inconsistent historical template mode rejected: apac={apac} rule_id={rule_id} mode={mode} template={meta_template}"
+                            if rej_msg not in seen_rejections:
+                                seen_rejections.add(rej_msg)
+                                log.debug("%s", rej_msg)
                             continue
                         if effective_lang and not validate_template_language_consistency(meta_template, effective_lang):
-                            log.warning(
-                                "Inconsistent historical template language rejected: apac=%s rule_id=%s lang=%s template=%s",
-                                apac, rule_id, effective_lang, meta_template,
-                            )
+                            rej_msg = f"Inconsistent historical template language rejected: apac={apac} rule_id={rule_id} lang={effective_lang} template={meta_template}"
+                            if rej_msg not in seen_rejections:
+                                seen_rejections.add(rej_msg)
+                                log.debug("%s", rej_msg)
                             continue
                     template_name = meta_template
                 else:
@@ -1516,22 +1550,22 @@ def build_latest_digital_rule_map(
                         )
                         if candidate:
                             if comm_due_type and not validate_template_due_type_consistency(candidate, comm_due_type):
-                                log.warning(
-                                    "Inconsistent historical template candidate rejected: apac=%s rule_id=%s comm_due=%s template=%s",
-                                    apac, rule_id, comm_due_type, candidate,
-                                )
+                                rej_msg = f"Inconsistent historical template candidate rejected: apac={apac} rule_id={rule_id} comm_due={comm_due_type} template={candidate}"
+                                if rej_msg not in seen_rejections:
+                                    seen_rejections.add(rej_msg)
+                                    log.debug("%s", rej_msg)
                                 continue
                             if not validate_template_mode_consistency(candidate, mode):
-                                log.warning(
-                                    "Inconsistent historical template mode rejected: apac=%s rule_id=%s comm_mode=%s template=%s",
-                                    apac, rule_id, mode, candidate,
-                                )
+                                rej_msg = f"Inconsistent historical template mode rejected: apac={apac} rule_id={rule_id} comm_mode={mode} template={candidate}"
+                                if rej_msg not in seen_rejections:
+                                    seen_rejections.add(rej_msg)
+                                    log.debug("%s", rej_msg)
                                 continue
                             if lang and not validate_template_language_consistency(candidate, lang):
-                                log.warning(
-                                    "Inconsistent historical template language rejected: apac=%s rule_id=%s comm_lang=%s template=%s",
-                                    apac, rule_id, lang, candidate,
-                                )
+                                rej_msg = f"Inconsistent historical template language rejected: apac={apac} rule_id={rule_id} comm_lang={lang} template={candidate}"
+                                if rej_msg not in seen_rejections:
+                                    seen_rejections.add(rej_msg)
+                                    log.debug("%s", rej_msg)
                                 continue
                             template_name = candidate
 
@@ -1616,6 +1650,7 @@ def resolve_template_name_with_status(
             rule_due = rule_meta.get("due_type") if rule_meta else None
             rule_mode = rule_meta.get("mode") if rule_meta else None
             rule_lang = str(rule_meta.get("language") or "").strip().upper() if rule_meta else ""
+            rule_active = rule_meta.get("active", True) if rule_meta else True
 
             # Check that due_type, mode, and language of rule and candidate template match prediction
             due_ok = (rule_due is None or rule_due == due_u) and validate_template_due_type_consistency(template_candidate, due_u)
@@ -1624,7 +1659,7 @@ def resolve_template_name_with_status(
                 (rule_lang == lang_u) or (lang_u == "ENGLISH" and rule_lang in ("DEFAULT", "", None))
             ) and validate_template_language_consistency(template_candidate, lang_u)
 
-            if template_candidate and due_ok and mode_ok and lang_ok:
+            if template_candidate and rule_active and due_ok and mode_ok and lang_ok:
                 return template_candidate, "ACCOUNT_RULE_MATCH", f"Matched account historical rule ID {rule_id}"
 
         # Check fallback to non-due-qualified match, but ONLY if rule metadata strictly matches due_type, mode, and language!
@@ -1638,12 +1673,13 @@ def resolve_template_name_with_status(
             rule_due = rule_meta.get("due_type") if rule_meta else None
             rule_mode = rule_meta.get("mode") if rule_meta else None
             rule_lang = str(rule_meta.get("language") or "").strip().upper() if rule_meta else ""
+            rule_active = rule_meta.get("active", True) if rule_meta else True
 
             due_ok = (rule_due is None or rule_due == due_u)
             mode_ok = (rule_mode is None or rule_mode == mode_u)
             lang_ok = (not rule_lang or rule_lang == lang_u or (lang_u == "ENGLISH" and rule_lang in ("DEFAULT", "", None)))
 
-            if due_ok and mode_ok and lang_ok:
+            if rule_active and due_ok and mode_ok and lang_ok:
                 template_candidate = (
                     rule_meta.get("iteration") if rule_meta else ""
                 ) or (
@@ -1698,7 +1734,7 @@ def resolve_template_name_with_status(
             and validate_template_mode_consistency(db_exact, mode_u)
             and validate_template_language_consistency(db_exact, lang_u)
         ):
-            return db_exact, "DB_COHORT_MATCH", f"Matched digital_rules table for ({due_u}, {mode_u}, {lang_u})"
+            return db_exact, "DB_COHORT_MATCH", f"Matched active digital_rules table for ({due_u}, {mode_u}, {lang_u})"
 
         for fallback_lang in ("DEFAULT", "ENGLISH", ""):
             db_fallback = digital_rules_lookup.get((due_u, mode_u, fallback_lang))
@@ -1708,7 +1744,7 @@ def resolve_template_name_with_status(
                 and validate_template_mode_consistency(db_fallback, mode_u)
                 and validate_template_language_consistency(db_fallback, lang_u)
             ):
-                return db_fallback, "DB_LANG_FALLBACK", f"Language '{lang_u}' fell back to digital_rules default '{db_fallback}'"
+                return db_fallback, "DB_LANG_FALLBACK", f"Language '{lang_u}' fell back to active digital_rules default '{db_fallback}'"
 
         # Mode fallback strictly within SAME due_type (NEVER cross due_types) AND same language
         for k, iter_val in digital_rules_lookup.items():
@@ -1722,18 +1758,7 @@ def resolve_template_name_with_status(
                     ):
                         return iter_val, "DB_MODE_FALLBACK", f"Fell back to active {due_u} {mode_u} rule '{iter_val}'"
 
-    # Step 5: Fallback to config default_templates
-    if default_templates:
-        cfg_default = get_configured_default_template(default_templates, due_type=due_type, mode=mode, language=language)
-        if (
-            cfg_default
-            and validate_template_due_type_consistency(cfg_default, due_u)
-            and validate_template_mode_consistency(cfg_default, mode_u)
-            and validate_template_language_consistency(cfg_default, lang_u)
-        ):
-            return cfg_default, "CONFIG_FALLBACK", f"Fell back to configured default '{cfg_default}'"
-
-    # Step 6: Failure diagnostics
+    # Step 5: Failure diagnostics (NO config default fallback - returns blank "" with clear reason)
     if digital_rules_lookup is not None or cohort_dict:
         available_modes = set()
         if cohort_dict:
@@ -1748,9 +1773,9 @@ def resolve_template_name_with_status(
             )
 
         if mode_u not in available_modes:
-            reason = f"No communication template or digital rule found for mode '{mode_u}' under due_type '{due_u}' (modes with templates in {due_u}: {sorted(available_modes) or 'none'})"
+            reason = f"No communication template or digital rule found for mode '{mode_u}' under due_type '{due_u}' (No active digital rule found; active modes in {due_u}: {sorted(available_modes) or 'none'})"
         else:
-            reason = f"No matching template for ({due_u}, {mode_u}, {lang_u}) and no default in communications or digital_rules"
+            reason = f"No matching template for ({due_u}, {mode_u}, {lang_u}) and no default in communications or digital_rules (active=True check failed or rule missing)"
         return "", "FAILED", reason
 
     # Offline pure fallback
@@ -1808,9 +1833,8 @@ def emit_template_resolution_audit(
         f"  - Account History Matches     : {status_counts.get('ACCOUNT_RULE_MATCH', 0):,}",
         f"  - Communication Cohort Matches: {status_counts.get('COMM_COHORT_MATCH', 0):,}",
         f"  - Communication Lang Fallbacks: {status_counts.get('COMM_LANG_FALLBACK', 0):,}",
-        f"  - Database Cohort Fallbacks   : {status_counts.get('DB_COHORT_MATCH', 0) + status_counts.get('DB_COHORT_FALLBACK', 0) + status_counts.get('DB_LANG_FALLBACK', 0) + status_counts.get('DB_MODE_FALLBACK', 0):,}",
-        f"  - Config Default Fallbacks    : {status_counts.get('CONFIG_FALLBACK', 0):,}",
-        f"Failed / Unresolved (EMPTY)     : {failed:,} ({100.0 - pct:.1f}%)" + ("  <-- [ACTION REQUIRED]" if failed > 0 else ""),
+        f"  - Database Cohort Matches     : {status_counts.get('DB_COHORT_MATCH', 0) + status_counts.get('DB_COHORT_FALLBACK', 0) + status_counts.get('DB_LANG_FALLBACK', 0) + status_counts.get('DB_MODE_FALLBACK', 0):,}",
+        f"Blank / Unresolved (EMPTY)      : {failed:,} ({100.0 - pct:.1f}%)" + ("  <-- [ACTION REQUIRED: Missing active template in digital_rules]" if failed > 0 else ""),
         "-" * 80,
         "ACTIVE TEMPLATES IN USE:",
     ]
@@ -1822,16 +1846,16 @@ def emit_template_resolution_audit(
 
     if fallbacks:
         lines.append("-" * 80)
-        lines.append("LANGUAGE & DEFAULT FALLBACKS APPLIED:")
+        lines.append("COHORT & LANGUAGE FALLBACKS APPLIED:")
         for (d, m, l, res_t, r_reason), count in sorted(fallbacks.items(), key=lambda x: x[1], reverse=True):
             lines.append(f"  - ({d}, {m}, {l}) -> '{res_t}' [Count: {count:,}]")
             lines.append(f"    Reason: {r_reason}")
 
     if failures:
         lines.append("-" * 80)
-        lines.append("FAILED RESOLUTIONS (EMPTY TEMPLATE):")
+        lines.append("BLANK TEMPLATES (NO ACTIVE DIGITAL RULE):")
         for (d, m, l, f_reason), count in sorted(failures.items(), key=lambda x: x[1], reverse=True):
-            lines.append(f"  - [FAILED] ({d}, {m}, {l}) -> Count: {count:,}")
+            lines.append(f"  - [BLANK] ({d}, {m}, {l}) -> Count: {count:,} touchpoints")
             lines.append(f"    Reason: {f_reason}")
 
     lines.append("=" * 80)
@@ -2278,6 +2302,141 @@ def _load_prediction_context_lookup(prediction_file: Path, prediction_month_labe
     return lookup
 
 
+def _channel_display_name(mode: str) -> str:
+    m = str(mode).upper().strip()
+    if m in ("WHATSAPP", "WH"):
+        return "WhatsApp"
+    if m in ("VOICE", "CALL"):
+        return "Voice call"
+    if m == "VOICE_BOT":
+        return "Voice bot"
+    if m == "SMS":
+        return "SMS"
+    return mode.title()
+
+
+def _format_time_display(time_val: str) -> str:
+    if not time_val:
+        return ""
+    times = [t.strip() for t in str(time_val).split(",") if t.strip()]
+    formatted_times = []
+    for t in times:
+        m_simple = re.match(r"^(\d{1,2})\s*([AP]M)$", t, re.IGNORECASE)
+        if m_simple:
+            formatted_times.append(f"{int(m_simple.group(1))}{m_simple.group(2).upper()}")
+            continue
+        m_12 = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?\s*([AP]M)$", t, re.IGNORECASE)
+        if m_12:
+            formatted_times.append(f"{int(m_12.group(1))}{m_12.group(3).upper()}")
+            continue
+        m_24 = re.match(r"^(\d{1,2}):(\d{2})(?::\d{2})?$", t)
+        if m_24:
+            hour = int(m_24.group(1))
+            suffix = "AM" if hour < 12 else "PM"
+            display_hour = 12 if hour in (0, 12) else hour % 12
+            formatted_times.append(f"{display_hour}{suffix}")
+            continue
+        formatted_times.append(t)
+    return ", ".join(formatted_times)
+
+
+def _reason_matches_mode(reason: str, mode: str) -> bool:
+    r_lower = reason.lower().strip()
+    m_upper = mode.upper().strip()
+    if m_upper == "SMS":
+        return "sms" in r_lower and "whatsapp" not in r_lower and "voice" not in r_lower
+    if m_upper in ("WHATSAPP", "WH"):
+        return "whatsapp" in r_lower and "sms" not in r_lower and "voice" not in r_lower
+    if m_upper in ("VOICE", "CALL"):
+        return ("voice" in r_lower or "call" in r_lower) and "sms" not in r_lower and "whatsapp" not in r_lower
+    if m_upper == "VOICE_BOT":
+        return "voice bot" in r_lower and "sms" not in r_lower and "whatsapp" not in r_lower
+    return True
+
+
+def _align_reason_to_mode(
+    reason: str,
+    row: pd.Series,
+    context: dict[str, object],
+) -> str:
+    if not reason:
+        return ""
+    mode = str(row.get("mode", "communication")).strip()
+    if _reason_matches_mode(reason, mode):
+        return reason
+
+    channel_name = _channel_display_name(mode)
+    time_str = _format_time_display(str(row.get("time", "")))
+    time_part = f" at {time_str}" if time_str else ""
+    lang_raw = str(row.get("language", "English")).strip()
+    lang_display = "Regional language" if lang_raw.upper() == "REGIONAL" else lang_raw.title()
+    readable_channel = f"{channel_name}{time_part} in {lang_display}"
+
+    # 1. Single unique outcome fallback
+    if "contained only one unique outcome" in reason:
+        return (
+            f"{readable_channel} is recommended because historical training data for this day "
+            f"contained only one unique outcome, so the system has applied that same recommendation consistently."
+        )
+
+    # 2. Missing data fallback
+    if "historical training data was not available" in reason or "missing_day_data" in reason:
+        return (
+            f"{readable_channel} is recommended using fallback logic because "
+            f"standard historical training data was not available for this day."
+        )
+
+    # 3. Generic fallback logic
+    if "used fallback logic because standard training data was not available" in reason:
+        return (
+            f"{readable_channel} recommendation for this day used fallback logic "
+            f"because standard training data was not available."
+        )
+
+    # 4. Cold-start fallback
+    if "cold-start fallback" in reason.lower() or context.get("is_new_customer"):
+        risk = str(row.get("risk", context.get("risk", "LOW"))).upper()
+        return (
+            f"Cold-start fallback: {readable_channel} is recommended based on "
+            f"{risk}-risk historical average, as no communication history was found for this customer."
+        )
+
+    # 5. Pattern like "... is/are recommended because <explanation>"
+    match = re.search(r"\b(?:is|are)\s+recommended\s+because\s+(.*)$", reason, re.IGNORECASE)
+    if match:
+        clause = match.group(1).strip()
+        clause_lower = clause.lower()
+        has_conflicting_channel = False
+        m_up = mode.upper()
+        if m_up == "SMS" and ("whatsapp" in clause_lower or "voice" in clause_lower):
+            has_conflicting_channel = True
+        elif m_up in ("WHATSAPP", "WH") and ("sms" in clause_lower or "voice" in clause_lower):
+            has_conflicting_channel = True
+        elif m_up in ("VOICE", "CALL") and ("sms" in clause_lower or "whatsapp" in clause_lower):
+            has_conflicting_channel = True
+        elif m_up == "VOICE_BOT" and ("sms" in clause_lower or "whatsapp" in clause_lower):
+            has_conflicting_channel = True
+
+        if not has_conflicting_channel:
+            return f"{readable_channel} is recommended because {clause}"
+
+    # 6. Channel-specific substitute reasons
+    m_up = mode.upper()
+    if m_up in ("WHATSAPP", "WH"):
+        return f"{readable_channel} is recommended because WhatsApp has been an effective digital communication channel for this customer."
+    if m_up in ("VOICE", "CALL"):
+        return f"{readable_channel} is recommended because direct customer interaction may be helpful for this account."
+    if m_up == "VOICE_BOT":
+        return f"{readable_channel} is recommended because an automated voice bot reminder may be helpful for this account."
+    if m_up == "SMS":
+        return f"{readable_channel} is recommended because SMS has been a suitable communication channel for this customer."
+
+    due_type = str(row.get("due_type", "scheduled")).title()
+    risk = str(row.get("risk", context.get("risk", "LOW"))).upper()
+    date_val = str(row.get("date", ""))
+    return f"{readable_channel} is recommended for {due_type} follow-up on {date_val} based on {risk}-risk strategy guidelines."
+
+
 def _mapping_prediction_reason(row: pd.Series, context_lookup: dict[str, dict[str, object]]) -> str:
     loan_number = str(row.get("loan_number", "")).strip()
     clean_loan = loan_number.replace(".0", "").lstrip("0")
@@ -2294,32 +2453,34 @@ def _mapping_prediction_reason(row: pd.Series, context_lookup: dict[str, dict[st
         day = day.strip()
         if not day:
             continue
-        reason = loan_reasons.get(day)
-        if reason and reason not in seen:
-            seen.add(reason)
-            parts.append(reason)
+        raw_reason = loan_reasons.get(day)
+        if raw_reason:
+            aligned = _align_reason_to_mode(raw_reason, row, context)
+            if aligned and aligned not in seen:
+                seen.add(aligned)
+                parts.append(aligned)
     if parts:
         return " ".join(parts)
 
     mode = str(row.get("mode", "communication"))
     time_val = str(row.get("time", ""))
+    time_str = _format_time_display(time_val)
+    time_part = f" at {time_str}" if time_str else ""
     lang = str(row.get("language", "English")).title()
     risk = str(row.get("risk", context.get("risk", "LOW"))).upper()
     due_type = str(row.get("due_type", "scheduled")).title()
     date_val = str(row.get("date", ""))
 
     if context.get("is_new_customer"):
-        time_part = f" at {time_val}" if time_val else ""
         return (
             f"Cold-start fallback: {mode}{time_part} in {lang} is recommended for new customer on {date_val} "
             f"based on {risk}-risk cohort historical response patterns, as no prior communication history was found."
         )
     if context.get("raw_reason"):
-        return str(context["raw_reason"])
+        return _align_reason_to_mode(str(context["raw_reason"]), row, context)
 
-    time_clause = f" at {time_val}" if time_val else ""
     return (
-        f"{mode}{time_clause} in {lang} is recommended for {due_type} follow-up on {date_val} "
+        f"{mode}{time_part} in {lang} is recommended for {due_type} follow-up on {date_val} "
         f"based on {risk}-risk strategy guidelines."
     )
 
@@ -4193,6 +4354,10 @@ def main() -> None:
                 ]
                 if allowed_day_offsets is not None:
                     fallback_cmd.extend(["--allowed-day-offsets", *[str(o) for o in allowed_day_offsets]])
+                if getattr(args, "multimode_postdue", True):
+                    fallback_cmd.append("--multimode-postdue")
+                else:
+                    fallback_cmd.append("--no-multimode-postdue")
                 run_python_script(
                     *fallback_cmd,
                     logger=logger,

@@ -10,6 +10,7 @@ import pandas as pd
 
 from app_logging import log_step, setup_logging
 from entity_keys import annotate_entity_key, entity_key_column_name
+from env_utils import env_flag, load_dotenv
 from model_fallbacks import register_legacy_joblib_aliases
 from pipeline_common import (
     DAY_COLUMNS,
@@ -26,6 +27,7 @@ from pipeline_common import (
     predict_distinct_modes_by_risk,
     predict_top_k_by_risk,
     prepare_next_month_dataset,
+    readable_strategy,
 )
 from project_paths import (
     CASE_DATA_DIR,
@@ -39,6 +41,7 @@ from project_paths import (
 
 
 def parse_args() -> argparse.Namespace:
+    load_dotenv(override=True)
     parser = argparse.ArgumentParser(
         description=(
             "Run inference only for the next-month CatBoost strategy model using "
@@ -106,8 +109,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--multimode-postdue",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Predict 3 distinct modes (SMS, WhatsApp, Voice) per post-due day [default: True].",
+        default=env_flag("MULTIMODE_POSTDUE", env_flag("STRATEGY_MULTIMODE_POSTDUE", default=True)),
+        help="Predict 3 distinct modes (SMS, WhatsApp, Voice) per post-due day [default: True, or MULTIMODE_POSTDUE env].",
     )
     parser.add_argument(
         "--log-file",
@@ -474,8 +477,10 @@ def _fallback_prediction_reason(day: str, fallback_config: dict[str, str], predi
     if fallback_reason == "single_unique_value":
         if predicted_label == "-":
             return "No campaign is recommended because historical training data for this day contained only one unique outcome, so the system has defaulted to no communication."
-        readable = _readable_strategy(predicted_label)
-        return f"{readable} is recommended because historical training data for this day contained only one unique outcome, so the system has applied that same recommendation consistently."
+        readable = readable_strategy(predicted_label)
+        labels = [l for l in str(predicted_label).split("|") if l.strip() and l.strip() != "-"]
+        verb = "are" if len(labels) > 1 else "is"
+        return f"{readable} {verb} recommended because historical training data for this day contained only one unique outcome, so the system has applied that same recommendation consistently."
     return "The recommendation for this day used fallback logic because standard training data was not available."
 
 
@@ -493,12 +498,14 @@ def build_prediction_reason(
             payload[day] = _no_campaign_reason(day)
             continue
 
-        ranked_labels = _ranked_business_labels(prediction_row.get(day, "-"))
+        raw_val = prediction_row.get(day, "-")
+        ranked_labels = _ranked_business_labels(raw_val)
         first_label = ranked_labels[0] if ranked_labels else "-"
         fallback_info = (day_fallback_config or {}).get(day)
         if fallback_info is not None:
             payload[day] = _fallback_prediction_reason(day, fallback_info, first_label)
             continue
+
         alternate_label = next((label for label in ranked_labels[1:] if label != "-"), None)
         if first_label == "-" and alternate_label is not None:
             payload[day] = _no_campaign_reason(day) + " " + _business_alternate_reason_for_label(

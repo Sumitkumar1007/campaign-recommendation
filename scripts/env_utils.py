@@ -20,3 +20,10 @@ def load_dotenv(path: str | Path | None = None, override: bool = False) -> None:
         value = value.strip().strip('"').strip("'")
         if key and (override or key not in os.environ):
             os.environ[key] = value
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
