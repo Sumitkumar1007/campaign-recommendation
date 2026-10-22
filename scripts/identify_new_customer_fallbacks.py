@@ -12,6 +12,7 @@ from pipeline_common import (
     POSTDUE_DAY_COLUMNS,
     PREDUE_DAY_COLUMNS,
     TARGET_POSTDUE_MODES,
+    apply_predue_risk_rules,
     extract_canonical_mode_from_label,
     extract_hour_from_label,
     load_default_config,
@@ -266,10 +267,12 @@ def build_postdue_multimode_strategy(
 def build_average_strategy_by_risk(
     schedule_file: Path,
     multimode_postdue: bool = True,
+    apply_predue_rules: bool = True,
+    allowed_predue_days: list[str] | None = None,
 ) -> dict[str, dict[str, str]]:
     schedule = pd.read_csv(schedule_file, dtype=str)
     if "RISK" not in schedule.columns:
-        return {
+        average_by_risk = {
             "LOW": {
                 day: (
                     build_postdue_multimode_strategy(schedule[day])
@@ -285,42 +288,51 @@ def build_average_strategy_by_risk(
                 for day in DAY_COLUMNS
             }
         }
+    else:
+        schedule["_RISK"] = schedule["RISK"].fillna("").astype(str).str.upper().str.strip()
+        average_by_risk = {}
+        for risk, risk_df in schedule.groupby("_RISK", sort=False):
+            if not risk:
+                continue
+            average_by_risk[risk] = {
+                day: (
+                    build_postdue_multimode_strategy(risk_df[day])
+                    if multimode_postdue and day in POSTDUE_DAY_COLUMNS
+                    else most_common_strategy(risk_df[day])
+                )
+                if day in risk_df.columns
+                else (
+                    build_postdue_multimode_strategy(None)
+                    if multimode_postdue and day in POSTDUE_DAY_COLUMNS
+                    else "-"
+                )
+                for day in DAY_COLUMNS
+            }
 
-    schedule["_RISK"] = schedule["RISK"].fillna("").astype(str).str.upper().str.strip()
-    average_by_risk: dict[str, dict[str, str]] = {}
-    for risk, risk_df in schedule.groupby("_RISK", sort=False):
-        if not risk:
-            continue
-        average_by_risk[risk] = {
-            day: (
-                build_postdue_multimode_strategy(risk_df[day])
-                if multimode_postdue and day in POSTDUE_DAY_COLUMNS
-                else most_common_strategy(risk_df[day])
-            )
-            if day in risk_df.columns
-            else (
-                build_postdue_multimode_strategy(None)
-                if multimode_postdue and day in POSTDUE_DAY_COLUMNS
-                else "-"
-            )
-            for day in DAY_COLUMNS
-        }
+    for r in ("LOW", "MEDIUM", "HIGH"):
+        if r not in average_by_risk:
+            average_by_risk[r] = {
+                day: (
+                    build_postdue_multimode_strategy(schedule[day] if day in schedule.columns else None)
+                    if multimode_postdue and day in POSTDUE_DAY_COLUMNS
+                    else (most_common_strategy(schedule[day]) if day in schedule.columns else "-")
+                )
+                for day in DAY_COLUMNS
+            }
 
-    if "LOW" not in average_by_risk:
-        average_by_risk["LOW"] = {
-            day: (
-                build_postdue_multimode_strategy(schedule[day])
-                if multimode_postdue and day in POSTDUE_DAY_COLUMNS
-                else most_common_strategy(schedule[day])
-            )
-            if day in schedule.columns
-            else (
-                build_postdue_multimode_strategy(None)
-                if multimode_postdue and day in POSTDUE_DAY_COLUMNS
-                else "-"
-            )
-            for day in DAY_COLUMNS
-        }
+    if apply_predue_rules and average_by_risk:
+        risk_rows = []
+        for risk, day_dict in average_by_risk.items():
+            risk_rows.append({"RISK": risk, **day_dict})
+        risk_df = pd.DataFrame(risk_rows)
+        risk_df = apply_predue_risk_rules(risk_df, predue_days=allowed_predue_days)
+        for _, row in risk_df.iterrows():
+            risk_val = str(row["RISK"]).upper().strip()
+            if risk_val in average_by_risk:
+                for col in risk_df.columns:
+                    if col in DAY_COLUMNS:
+                        average_by_risk[risk_val][col] = str(row[col])
+
     return average_by_risk
 
 
@@ -502,9 +514,12 @@ def main() -> None:
         | case_apacs["apacCardNumber"].str.lstrip("0").isin(history_apacs)
     )
     new_cases = case_apacs[~is_in_history].copy()
+    active_predue_days = [d for d in PREDUE_DAY_COLUMNS if allowed_day_labels is None or d in allowed_day_labels]
     fallback_by_risk = build_average_strategy_by_risk(
         Path(args.schedule_file),
         multimode_postdue=getattr(args, "multimode_postdue", True),
+        apply_predue_rules=True,
+        allowed_predue_days=active_predue_days,
     )
     output = build_fallback_rows(new_cases, fallback_by_risk, allowed_day_labels=allowed_day_labels)
     output.to_csv(output_file, index=False)

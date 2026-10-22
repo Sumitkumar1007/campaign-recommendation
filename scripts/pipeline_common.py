@@ -676,13 +676,26 @@ def predict_top_k_by_risk(
     encoder,
     X: pd.DataFrame,
     risks: pd.Series,
+    mandatory_communication: bool = False,
 ) -> pd.Series:
     probabilities = model.predict_proba(X)
+    classes = [str(c) for c in encoder.classes_]
     output: list[str] = []
     for row_probs, risk in zip(probabilities, risks.fillna("LOW").astype(str), strict=False):
         k = RISK_TOP_K.get(risk.upper(), 1)
-        top_indices = row_probs.argsort()[-k:][::-1]
-        labels = [str(encoder.classes_[index]) for index in top_indices]
+        sorted_indices = row_probs.argsort()[::-1]
+        if mandatory_communication:
+            non_dash_indices = [idx for idx in sorted_indices if classes[idx] not in ("", "-", "None", "nan")]
+            if non_dash_indices:
+                chosen_indices = [non_dash_indices[0]]
+                for idx in sorted_indices:
+                    if idx != non_dash_indices[0] and len(chosen_indices) < k:
+                        chosen_indices.append(idx)
+            else:
+                chosen_indices = list(sorted_indices[:k])
+        else:
+            chosen_indices = list(sorted_indices[:k])
+        labels = [classes[index] for index in chosen_indices]
         output.append("|".join(labels))
     return pd.Series(output, index=X.index)
 

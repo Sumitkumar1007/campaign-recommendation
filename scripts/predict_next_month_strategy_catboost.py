@@ -661,6 +661,7 @@ def main() -> None:
                                 encoder,
                                 X_pred,
                                 prediction_rows["RISK"],
+                                mandatory_communication=(day == "D-5"),
                             )
                     else:
                         logger.info("Day column outside allowed_day_offsets, skipping prediction | day=%s", day)

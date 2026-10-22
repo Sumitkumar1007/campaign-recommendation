@@ -826,6 +826,7 @@ def main() -> None:
                         encoder,
                         X_pred,
                         prediction_rows["RISK"],
+                        mandatory_communication=(day == "D-5"),
                     )
                 prediction_output["D"] = "-"
                 prediction_output = prediction_output[
