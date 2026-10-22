@@ -343,3 +343,44 @@ def test_multimode_postdue_env_flag_config(monkeypatch):
     args_inf_false = run_inf.parse_args()
     assert args_inf_false.multimode_postdue is False
 
+
+def test_postdue_picks_second_best_when_top_is_dash():
+    from pipeline_common import predict_top_k_by_risk, POSTDUE_DAY_COLUMNS
+
+    class DummyModel:
+        def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+            return np.array(
+                [
+                    [0.75, 0.20, 0.05],  # Top is '-', 2nd best is SMS-11AM-ENGLISH, 3rd is WH-1PM-ENGLISH
+                    [0.75, 0.20, 0.05],
+                    [0.75, 0.20, 0.05],
+                ]
+            )
+
+    class DummyEncoder:
+        classes_ = np.array(["-", "SMS-11AM-ENGLISH", "WH-1PM-ENGLISH"])
+
+    X = pd.DataFrame({"feat": [1, 2, 3]})
+    risks = pd.Series(["LOW", "MEDIUM", "HIGH"])
+
+    # For postdue days, mandatory_communication is set so that if '-' is top, it picks 2nd best
+    for day in ["D+1", "D+2", "D+5"]:
+        assert day in POSTDUE_DAY_COLUMNS
+        is_mandatory = (day == "D-5" or day in POSTDUE_DAY_COLUMNS)
+        assert is_mandatory is True
+
+        output = predict_top_k_by_risk(
+            DummyModel(),
+            DummyEncoder(),
+            X,
+            risks,
+            mandatory_communication=is_mandatory,
+        )
+        # LOW risk (k=1) picks 2nd best ("SMS-11AM-ENGLISH") instead of '-'
+        assert output.iloc[0] == "SMS-11AM-ENGLISH"
+        # MEDIUM risk (k=2) prioritizes non-dash options
+        assert output.iloc[1] == "SMS-11AM-ENGLISH|WH-1PM-ENGLISH"
+        # HIGH risk (k=3) includes all 3 with non-dash first
+        assert output.iloc[2] == "SMS-11AM-ENGLISH|WH-1PM-ENGLISH|-"
+
+

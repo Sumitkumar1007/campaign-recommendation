@@ -16,7 +16,7 @@ from typing import Any
 import pandas as pd
 
 from app_logging import setup_logging
-from pipeline_common import SCHEDULE_DAY_COLUMNS, load_default_config, offsets_to_day_columns
+from pipeline_common import SCHEDULE_DAY_COLUMNS, load_default_config, offsets_to_day_columns, parse_day_offset
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,6 +31,12 @@ def parse_args() -> argparse.Namespace:
         "--config-file",
         default=None,
         help="Path to optional JSON configuration file containing allowed_day_offsets.",
+    )
+    parser.add_argument(
+        "--allowed-day-offsets",
+        nargs="*",
+        default=None,
+        help="Optional allowed day offsets (e.g. -5 -4 ... 10) to determine which schedule days to evaluate in summary workbooks.",
     )
     return parser.parse_args()
 
@@ -115,17 +121,24 @@ def generate_summary_workbooks(
     stem: str,
     day_columns: list[str] | None = None,
     config_file: Path | str | None = None,
+    allowed_day_offsets: list[int | str] | None = None,
 ) -> tuple[Path, Path]:
     """Generate counts and percentage Excel workbooks with separate sheets per Risk tier, day-wise Audit sheet, and Communication Intensity sheet."""
     if day_columns is not None:
         configured_days = day_columns
-    else:
+    elif allowed_day_offsets is not None and len(allowed_day_offsets) > 0:
+        parsed_offsets = [parse_day_offset(o) for o in allowed_day_offsets]
+        valid_offsets = [o for o in parsed_offsets if o is not None]
+        configured_days = offsets_to_day_columns(valid_offsets)
+    elif config_file is not None:
         cfg = load_default_config(config_file)
         allowed_offsets = cfg.get("allowed_day_offsets")
         if allowed_offsets is not None:
             configured_days = offsets_to_day_columns(allowed_offsets)
         else:
-            configured_days = SCHEDULE_DAY_COLUMNS
+            configured_days = [d for d in SCHEDULE_DAY_COLUMNS if d in predictions_df.columns]
+    else:
+        configured_days = [d for d in SCHEDULE_DAY_COLUMNS if d in predictions_df.columns]
 
     days_to_process = [d for d in configured_days if d in predictions_df.columns]
     if not days_to_process:
@@ -435,6 +448,7 @@ def main() -> None:
         out_dir,
         pred_path.stem,
         config_file=args.config_file,
+        allowed_day_offsets=args.allowed_day_offsets,
     )
 
     print(f"Saved counts summary Excel file to: {counts_file}")

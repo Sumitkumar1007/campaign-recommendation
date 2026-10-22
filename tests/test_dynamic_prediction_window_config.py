@@ -1168,6 +1168,65 @@ def test_monthly_inference_pipeline_dry_run_flag(monkeypatch):
     assert args_dry.dry_run is True
 
 
+def test_generate_summary_workbooks_inherits_dataframe_columns(tmp_path: Path):
+    from generate_prediction_summary import generate_summary_workbooks
+
+    days_d5_to_d10 = [f"D-{i}" for i in range(5, 0, -1)] + [f"D+{i}" for i in range(1, 11)]
+    pred_data = {
+        "MONTH": ["OCT-2026"],
+        "APAC_NO": ["ACC_01"],
+        "SOURCE_RISK": ["LOW"],
+    }
+    for day in days_d5_to_d10:
+        pred_data[day] = ["SMS-11AM-ENGLISH"]
+    pred_df = pd.DataFrame(pred_data)
+
+    counts_file, pct_file = generate_summary_workbooks(
+        pred_df,
+        tmp_path,
+        "test_inherit",
+    )
+
+    counts_xl = pd.read_excel(counts_file, sheet_name="Low Risk")
+    for day in days_d5_to_d10:
+        assert day in counts_xl.columns, f"{day} should be present in summary counts"
+    assert "D+11" not in counts_xl.columns
+
+
+def test_apply_non_working_day_suppressions_preserves_extended_window(tmp_path: Path, monkeypatch):
+    import apply_non_working_day_suppressions
+
+    days_d5_to_d10 = [f"D-{i}" for i in range(5, 0, -1)] + [f"D+{i}" for i in range(1, 11)]
+    pred_data = {
+        "MONTH": ["OCT-2026"],
+        "APAC_NO": ["ACC_01"],
+        "SOURCE_RISK": ["LOW"],
+        "emi_date": ["10-10-2026"],
+    }
+    for day in days_d5_to_d10:
+        pred_data[day] = ["SMS-11AM-ENGLISH"]
+    pred_df = pd.DataFrame(pred_data)
+
+    pred_csv = tmp_path / "test_extended_pred.csv"
+    pred_df.to_csv(pred_csv, index=False)
+
+    test_args = [
+        "apply_non_working_day_suppressions.py",
+        "--prediction-file", str(pred_csv),
+        "--saturday-mode", "bank_saturdays",
+    ]
+    monkeypatch.setattr(sys, "argv", test_args)
+    apply_non_working_day_suppressions.main()
+
+    counts_file = tmp_path / "test_extended_pred_summary_counts.xlsx"
+    assert counts_file.exists()
+    counts_xl = pd.read_excel(counts_file, sheet_name="Low Risk")
+    for day in days_d5_to_d10:
+        assert day in counts_xl.columns, f"{day} should be preserved in summary counts post-suppression"
+    assert "D+11" not in counts_xl.columns
+
+
+
 
 
 

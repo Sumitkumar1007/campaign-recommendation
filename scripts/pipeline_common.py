@@ -687,10 +687,11 @@ def predict_top_k_by_risk(
         if mandatory_communication:
             non_dash_indices = [idx for idx in sorted_indices if classes[idx] not in ("", "-", "None", "nan")]
             if non_dash_indices:
-                chosen_indices = [non_dash_indices[0]]
-                for idx in sorted_indices:
-                    if idx != non_dash_indices[0] and len(chosen_indices) < k:
-                        chosen_indices.append(idx)
+                chosen_indices = list(non_dash_indices[:k])
+                if len(chosen_indices) < k:
+                    for idx in sorted_indices:
+                        if idx not in chosen_indices and len(chosen_indices) < k:
+                            chosen_indices.append(idx)
             else:
                 chosen_indices = list(sorted_indices[:k])
         else:

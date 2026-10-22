@@ -4369,7 +4369,7 @@ def main() -> None:
                 saturday_mode=args.saturday_mode,
                 suppress_sundays=args.suppress_sundays,
             ):
-                run_python_script(
+                suppress_cmd = [
                     "apply_non_working_day_suppressions.py",
                     "--prediction-file",
                     str(prediction_file),
@@ -4377,6 +4377,11 @@ def main() -> None:
                     args.saturday_mode,
                     "--config-file",
                     str(args.config_file),
+                ]
+                if allowed_day_offsets is not None:
+                    suppress_cmd.extend(["--allowed-day-offsets", *[str(o) for o in allowed_day_offsets]])
+                run_python_script(
+                    *suppress_cmd,
                     logger=logger,
                 )
             with log_step(

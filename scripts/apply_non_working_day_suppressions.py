@@ -10,7 +10,7 @@ import re
 import pandas as pd
 
 from app_logging import setup_logging
-from pipeline_common import DAY_COLUMNS
+from pipeline_common import DAY_COLUMNS, SCHEDULE_DAY_COLUMNS, offsets_to_day_columns, parse_day_offset
 from project_paths import PREDICTIONS_DIR, ensure_parent_dir
 
 logger = logging.getLogger(__name__)
@@ -55,6 +55,12 @@ def parse_args() -> argparse.Namespace:
         "--config-file",
         default=None,
         help="Path to optional JSON configuration file containing allowed_day_offsets.",
+    )
+    parser.add_argument(
+        "--allowed-day-offsets",
+        nargs="*",
+        default=None,
+        help="Optional allowed day offsets (e.g. -5 -4 ... 10) to determine which schedule days to evaluate in summary workbooks.",
     )
     parser.add_argument(
         "--log-file",
@@ -203,11 +209,23 @@ def main() -> None:
 
     try:
         from generate_prediction_summary import generate_summary_workbooks
+
+        configured_day_cols = None
+        if args.allowed_day_offsets:
+            parsed_offsets = [parse_day_offset(o) for o in args.allowed_day_offsets]
+            valid_offsets = [o for o in parsed_offsets if o is not None]
+            if valid_offsets:
+                configured_day_cols = [d for d in offsets_to_day_columns(valid_offsets) if d in updated_df.columns]
+        if not configured_day_cols:
+            configured_day_cols = [d for d in SCHEDULE_DAY_COLUMNS if d in updated_df.columns]
+
         generate_summary_workbooks(
             updated_df,
             output_file.parent,
             output_file.stem,
+            day_columns=configured_day_cols,
             config_file=args.config_file,
+            allowed_day_offsets=args.allowed_day_offsets,
         )
         logger.info("Saved updated summary Excel files post non-working day suppression.")
     except Exception as e:

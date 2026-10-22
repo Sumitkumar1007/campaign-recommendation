@@ -656,12 +656,13 @@ def main() -> None:
                                 risks=prediction_rows["RISK"],
                             )
                         else:
+                            is_mandatory = (day == "D-5" or day in POSTDUE_DAY_COLUMNS)
                             prediction_output[day] = predict_top_k_by_risk(
                                 model,
                                 encoder,
                                 X_pred,
                                 prediction_rows["RISK"],
-                                mandatory_communication=(day == "D-5"),
+                                mandatory_communication=is_mandatory,
                             )
                     else:
                         logger.info("Day column outside allowed_day_offsets, skipping prediction | day=%s", day)

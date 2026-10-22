@@ -821,12 +821,13 @@ def main() -> None:
                 ).dt.to_timestamp().dt.strftime("%b-%Y").str.upper()
                 for day in DAY_COLUMNS:
                     encoder = label_encoders[day]
+                    is_mandatory = (day == "D-5" or day in POSTDUE_DAY_COLUMNS)
                     prediction_output[day] = predict_top_k_by_risk(
                         models[day],
                         encoder,
                         X_pred,
                         prediction_rows["RISK"],
-                        mandatory_communication=(day == "D-5"),
+                        mandatory_communication=is_mandatory,
                     )
                 prediction_output["D"] = "-"
                 prediction_output = prediction_output[
