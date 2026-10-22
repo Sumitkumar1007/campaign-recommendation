@@ -656,13 +656,13 @@ def main() -> None:
                                 risks=prediction_rows["RISK"],
                             )
                         else:
-                            is_mandatory = (day == "D-5" or day in POSTDUE_DAY_COLUMNS)
                             prediction_output[day] = predict_top_k_by_risk(
                                 model,
                                 encoder,
                                 X_pred,
                                 prediction_rows["RISK"],
-                                mandatory_communication=is_mandatory,
+                                mandatory_communication=True,
+                                k_override=1 if day in POSTDUE_DAY_COLUMNS else None,
                             )
                     else:
                         logger.info("Day column outside allowed_day_offsets, skipping prediction | day=%s", day)
@@ -702,12 +702,39 @@ def main() -> None:
             blank_output["MONTH"] = (
                 source_period + target_offset_months
             ).dt.to_timestamp().dt.strftime("%b-%Y").str.upper()
-            for day in configured_day_cols:
-                blank_output[day] = "-"
+
+            X_blank = build_feature_matrix(blank_rows).reindex(
+                columns=bundle["feature_columns"],
+                fill_value=0,
+            )
+            for day in DAY_COLUMNS:
+                if day in allowed_day_labels:
+                    encoder = bundle["label_encoders"][day]
+                    model = bundle["models"][day]
+                    if day in POSTDUE_DAY_COLUMNS and getattr(args, "multimode_postdue", True):
+                        blank_output[day] = predict_distinct_modes_by_risk(
+                            model,
+                            encoder,
+                            X_blank,
+                            risks=blank_rows["RISK"],
+                        )
+                    else:
+                        blank_output[day] = predict_top_k_by_risk(
+                            model,
+                            encoder,
+                            X_blank,
+                            blank_rows["RISK"],
+                            mandatory_communication=True,
+                            k_override=1 if day in POSTDUE_DAY_COLUMNS else None,
+                        )
+                else:
+                    blank_output[day] = "-"
+
             blank_output["PREDICTION_REASON"] = [
                 build_prediction_reason(
                     prediction_row=blank_output.iloc[row_idx],
                     source_row=None,
+                    day_fallback_config=day_fallback_config,
                     target_days=configured_day_cols,
                 )
                 for row_idx in range(len(blank_output))
@@ -748,7 +775,11 @@ def main() -> None:
         with log_step(logger, "write_predictions", prediction_file=prediction_file):
             active_predue = [d for d in PREDUE_DAY_COLUMNS if d in allowed_day_labels]
             active_postdue = [d for d in POSTDUE_DAY_COLUMNS if d in allowed_day_labels]
-            prediction_output = apply_predue_risk_rules(prediction_output, predue_days=active_predue)
+            prediction_output = apply_predue_risk_rules(
+                prediction_output,
+                predue_days=active_predue,
+                default_strategy=None,
+            )
             prediction_output = apply_postdue_risk_rules(
                 prediction_output,
                 postdue_days=active_postdue,

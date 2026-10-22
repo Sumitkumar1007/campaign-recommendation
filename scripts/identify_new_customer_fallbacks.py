@@ -419,9 +419,27 @@ def apply_fallbacks_to_prediction_file(
         if matched_key is None:
             continue
 
-        if "SOURCE_RISK" in predictions.columns:
+        if "SOURCE_RISK" in predictions.columns and (pd.isna(predictions.at[idx, "SOURCE_RISK"]) or str(predictions.at[idx, "SOURCE_RISK"]).strip() in ("", "-", "None", "nan")):
             predictions.at[idx, "SOURCE_RISK"] = risk_map[matched_key]
-        day_reasons: dict[str, str] = {}
+
+        # If the row was already evaluated by the model and has active predictions, preserve them!
+        has_existing_predictions = any(
+            str(predictions.at[idx, d]).strip() not in ("", "-", "None", "nan")
+            for d in DAY_COLUMNS if d in predictions.columns
+        )
+        if has_existing_predictions:
+            predictions.at[idx, "IS_NEW_CUSTOMER"] = "True"
+            updated += 1
+            continue
+
+        existing_reasons = {}
+        if "PREDICTION_REASON" in predictions.columns and predictions.at[idx, "PREDICTION_REASON"]:
+            try:
+                existing_reasons = json.loads(predictions.at[idx, "PREDICTION_REASON"])
+            except Exception:
+                existing_reasons = {}
+
+        day_reasons: dict[str, str] = dict(existing_reasons)
         for day in DAY_COLUMNS:
             if day in predictions.columns:
                 if allowed_day_labels is not None and day not in allowed_day_labels:
@@ -429,11 +447,22 @@ def apply_fallbacks_to_prediction_file(
                     day_reasons[day] = f"No communication scheduled on {day} (outside active prediction window)."
                 else:
                     strat = fallback_map.get((matched_key, day), "-")
-                    predictions.at[idx, day] = strat
-                    day_reasons[day] = day_reason_map.get(
-                        (matched_key, day),
-                        f"Cold-start fallback strategy applied based on {risk_map[matched_key]}-risk historical average."
-                    )
+                    if strat not in ("", "-", "None", "nan"):
+                        predictions.at[idx, day] = strat
+                        day_reasons[day] = day_reason_map.get(
+                            (matched_key, day),
+                            f"Cold-start fallback strategy applied based on {risk_map[matched_key]}-risk historical average."
+                        )
+                    else:
+                        curr_val = str(predictions.at[idx, day]).strip()
+                        if curr_val not in ("", "-", "None", "nan") and day in existing_reasons:
+                            day_reasons[day] = existing_reasons[day]
+                        else:
+                            predictions.at[idx, day] = curr_val if curr_val not in ("", "None", "nan") else "-"
+                            day_reasons[day] = day_reason_map.get(
+                                (matched_key, day),
+                                f"No communication scheduled on {day} based on {risk_map[matched_key]}-risk cohort guidelines."
+                            )
         if "D" in predictions.columns:
             predictions.at[idx, "D"] = "-"
             day_reasons["D"] = "No communication is scheduled on the EMI due date."

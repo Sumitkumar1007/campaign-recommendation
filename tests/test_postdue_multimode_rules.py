@@ -384,3 +384,166 @@ def test_postdue_picks_second_best_when_top_is_dash():
         assert output.iloc[2] == "SMS-11AM-ENGLISH|WH-1PM-ENGLISH|-"
 
 
+def test_predue_capping_vs_postdue_no_limit_no_default_strategy():
+    """
+    Validates that:
+    1. Pre-due and post-due pick 2nd-best when model top is '-'.
+    2. Pre-due has communication capping based on risk (LOW: 2, MED: 3, HIGH: 4).
+    3. Post-due has NO capping limit (all active post-due days retain their 2nd-best prediction).
+    4. NO static default_strategy (like SMS-11AM-ENGLISH) is injected.
+    """
+    from pipeline_common import apply_predue_risk_rules, apply_postdue_risk_rules
+
+    # Simulated DataFrame where model predicted 2nd-best for all days (since top was '-')
+    # Notice: D-5 predicted WH-2PM-ENGLISH, D-4 predicted SMS-4PM-ENGLISH, etc. (NOT SMS-11AM-ENGLISH)
+    df = pd.DataFrame(
+        [
+            {
+                "Loan_number": "ACC_LOW",
+                "SOURCE_RISK": "LOW",
+                "D-5": "WH-2PM-ENGLISH",
+                "D-4": "SMS-4PM-ENGLISH",
+                "D-3": "WH-1PM-ENGLISH",
+                "D-2": "SMS-12PM-ENGLISH",
+                "D-1": "WH-4PM-ENGLISH",
+                "D+1": "WH-3PM-ENGLISH",
+                "D+2": "SMS-12PM-ENGLISH",
+                "D+7": "IVR-5PM-ENGLISH",
+            },
+            {
+                "Loan_number": "ACC_MED",
+                "SOURCE_RISK": "MEDIUM",
+                "D-5": "WH-2PM-ENGLISH",
+                "D-4": "SMS-4PM-ENGLISH",
+                "D-3": "WH-1PM-ENGLISH",
+                "D-2": "SMS-12PM-ENGLISH",
+                "D-1": "WH-4PM-ENGLISH",
+                "D+1": "WH-3PM-ENGLISH",
+                "D+2": "SMS-12PM-ENGLISH",
+                "D+7": "IVR-5PM-ENGLISH",
+            },
+            {
+                "Loan_number": "ACC_HIGH",
+                "SOURCE_RISK": "HIGH",
+                "D-5": "WH-2PM-ENGLISH",
+                "D-4": "SMS-4PM-ENGLISH",
+                "D-3": "WH-1PM-ENGLISH",
+                "D-2": "SMS-12PM-ENGLISH",
+                "D-1": "WH-4PM-ENGLISH",
+                "D+1": "WH-3PM-ENGLISH",
+                "D+2": "SMS-12PM-ENGLISH",
+                "D+7": "IVR-5PM-ENGLISH",
+            },
+        ]
+    )
+
+    predue_days = ["D-5", "D-4", "D-3", "D-2", "D-1"]
+    postdue_days = ["D+1", "D+2", "D+7"]
+
+    # Apply pre-due risk rules with default_strategy=None
+    res = apply_predue_risk_rules(df, predue_days=predue_days, default_strategy=None)
+    # Apply post-due risk rules (no capping limit)
+    res = apply_postdue_risk_rules(res, postdue_days=postdue_days, allow_multimode=False)
+
+    # 1. Check LOW risk:
+    # Pre-due is capped at exactly 2 communications (D-5 kept, plus 1 other day)
+    low_row = res.iloc[0]
+    low_predue_active = [d for d in predue_days if low_row[d] != "-"]
+    assert len(low_predue_active) == 2
+    assert low_row["D-5"] == "WH-2PM-ENGLISH"  # Preserved model's 2nd-best, NOT static SMS-11AM-ENGLISH!
+    # Capped days are '-'
+    assert low_row["D-3"] == "-"
+    assert low_row["D-2"] == "-"
+    assert low_row["D-1"] == "-"
+    # Post-due has NO limit: all active postdue days keep their 2nd-best prediction
+    assert low_row["D+1"] == "WH-3PM-ENGLISH"
+    assert low_row["D+2"] == "SMS-12PM-ENGLISH"
+    assert low_row["D+7"] == "IVR-5PM-ENGLISH"
+
+    # 2. Check MEDIUM risk:
+    # Pre-due is capped at exactly 3 communications
+    med_row = res.iloc[1]
+    med_predue_active = [d for d in predue_days if med_row[d] != "-"]
+    assert len(med_predue_active) == 3
+    assert med_row["D-5"] == "WH-2PM-ENGLISH"
+    assert med_row["D-2"] == "-"
+    assert med_row["D-1"] == "-"
+    # Post-due has NO limit
+    assert med_row["D+1"] == "WH-3PM-ENGLISH"
+    assert med_row["D+2"] == "SMS-12PM-ENGLISH"
+    assert med_row["D+7"] == "IVR-5PM-ENGLISH"
+
+    # 3. Check HIGH risk:
+    # Pre-due is capped at exactly 4 communications
+    high_row = res.iloc[2]
+    high_predue_active = [d for d in predue_days if high_row[d] != "-"]
+    assert len(high_predue_active) == 4
+    assert high_row["D-5"] == "WH-2PM-ENGLISH"
+    assert high_row["D-1"] == "-"
+    # Post-due has NO limit
+    assert high_row["D+1"] == "WH-3PM-ENGLISH"
+    assert high_row["D+2"] == "SMS-12PM-ENGLISH"
+    assert high_row["D+7"] == "IVR-5PM-ENGLISH"
+
+
+def test_new_apac_model_predictions_preserved_without_static_fallbacks(tmp_path: Path):
+    """
+    Validates that when new APAC accounts are predicted by the model (using zero-history features),
+    downstream apply_fallbacks_to_prediction_file preserves the model's 2nd-best predictions
+    rather than overwriting them with static cohort defaults.
+    """
+    from identify_new_customer_fallbacks import build_fallback_rows, apply_fallbacks_to_prediction_file
+
+    pred_file = tmp_path / "predictions.csv"
+    # New APAC row that came from model evaluation
+    pd.DataFrame(
+        [
+            {
+                "Loan_number": "NEW_APAC_001",
+                "SOURCE_RISK": "LOW",
+                "SOURCE_VERTICAL": "LAP",
+                "MONTH": "OCT-2026",
+                "SOURCE_MONTH_USED": "SEP-2026",
+                "D-5": "SMS-2PM-ENGLISH",   # Model's 2nd-best
+                "D-4": "SMS-4PM-ENGLISH",   # Model's 2nd-best
+                "D-3": "-",                # Capped by pre-due risk rule
+                "D-2": "-",                # Capped by pre-due risk rule
+                "D-1": "-",                # Capped by pre-due risk rule
+                "D": "-",
+                "D+1": "WH-3PM-ENGLISH",   # Model's 2nd-best (post-due no limit)
+                "D+2": "SMS-12PM-ENGLISH", # Model's 2nd-best (post-due no limit)
+                "IS_NEW_CUSTOMER": "True",
+                "PREDICTION_REASON": '{"D-5": "Learned from cohort data", "D+1": "Learned from cohort data"}',
+            }
+        ]
+    ).to_csv(pred_file, index=False)
+
+    new_cases = pd.DataFrame([
+        {"apacCardNumber": "NEW_APAC_001", "originalRisk": "LOW", "vertical": "LAP"}
+    ])
+    fallback_by_risk = {
+        "LOW": {
+            "D-5": "SMS-11AM-ENGLISH",      # Static default fallback
+            "D-4": "SMS-11AM-ENGLISH",
+            "D-3": "SMS-11AM-ENGLISH",
+            "D+1": "SMS-10AM-ENGLISH",      # Static default fallback
+            "D+2": "SMS-10AM-ENGLISH",
+        }
+    }
+    fallback_rows = build_fallback_rows(new_cases, fallback_by_risk)
+
+    apply_fallbacks_to_prediction_file(pred_file, fallback_rows)
+
+    result_df = pd.read_csv(pred_file, dtype=str)
+    row = result_df.iloc[0]
+
+    # Model's predictions must be preserved!
+    assert row["D-5"] == "SMS-2PM-ENGLISH"   # NOT overwritten with static SMS-11AM-ENGLISH
+    assert row["D-4"] == "SMS-4PM-ENGLISH"   # NOT overwritten
+    assert row["D-3"] == "-"                # Retains risk capping
+    assert row["D+1"] == "WH-3PM-ENGLISH"   # NOT overwritten with static SMS-10AM-ENGLISH
+    assert row["D+2"] == "SMS-12PM-ENGLISH" # NOT overwritten
+    assert row["IS_NEW_CUSTOMER"] == "True"
+
+
+

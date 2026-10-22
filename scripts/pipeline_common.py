@@ -407,12 +407,12 @@ def apply_postdue_risk_rules(
 
 def apply_predue_risk_rules(
     df: pd.DataFrame,
-    default_strategy: str = DEFAULT_PREDUE_STRATEGY,
+    default_strategy: str | None = DEFAULT_PREDUE_STRATEGY,
     predue_days: list[str] | None = None,
 ) -> pd.DataFrame:
     """
     Enforces mandatory baseline communication rule and risk-based pre-due touchpoint limits:
-    - If D-5 is configured, it is mandatory for 100% of base population (defaults to SMS-11AM-ENGLISH if blank).
+    - If D-5 is configured, it is mandatory for 100% of base population (defaults to SMS-11AM-ENGLISH if blank and default_strategy is set).
     - Ensures single communication per day (selects 1st option if multiple given).
     - LOW Risk: Exactly 2 communications across configured pre-due days (1 per day).
     - MEDIUM Risk: Exactly 3 communications across configured pre-due days (1 per day).
@@ -442,9 +442,9 @@ def apply_predue_risk_rules(
         # 2. Mandatory D-5 Full Base Communication (if D-5 is configured)
         if has_d5:
             d5_val = str(df.at[idx, "D-5"]).strip()
-            if d5_val in ("", "-", "None", "nan"):
+            if d5_val in ("", "-", "None", "nan") and default_strategy:
                 df.at[idx, "D-5"] = default_strategy
-            base_count = 1
+            base_count = 1 if str(df.at[idx, "D-5"]).strip() not in ("", "-", "None", "nan") else 0
         else:
             base_count = 0
 
@@ -464,8 +464,8 @@ def apply_predue_risk_rules(
                 if day not in allowed_other:
                     df.at[idx, day] = "-"
 
-        # 5. Fill in missing pre-due days if count is below target_exact
-        elif current_active < target_exact:
+        # 5. Fill in missing pre-due days if count is below target_exact (only when default_strategy is provided)
+        elif current_active < target_exact and default_strategy:
             needed = target_exact - current_active
             priority_fill = sorted(other_predue_days, key=day_label_to_offset, reverse=True)
             filled = 0
@@ -677,25 +677,20 @@ def predict_top_k_by_risk(
     X: pd.DataFrame,
     risks: pd.Series,
     mandatory_communication: bool = False,
+    k_override: int | None = None,
 ) -> pd.Series:
     probabilities = model.predict_proba(X)
     classes = [str(c) for c in encoder.classes_]
     output: list[str] = []
     for row_probs, risk in zip(probabilities, risks.fillna("LOW").astype(str), strict=False):
-        k = RISK_TOP_K.get(risk.upper(), 1)
+        effective_k = k_override if k_override is not None else RISK_TOP_K.get(risk.upper(), 1)
         sorted_indices = row_probs.argsort()[::-1]
         if mandatory_communication:
             non_dash_indices = [idx for idx in sorted_indices if classes[idx] not in ("", "-", "None", "nan")]
-            if non_dash_indices:
-                chosen_indices = list(non_dash_indices[:k])
-                if len(chosen_indices) < k:
-                    for idx in sorted_indices:
-                        if idx not in chosen_indices and len(chosen_indices) < k:
-                            chosen_indices.append(idx)
-            else:
-                chosen_indices = list(sorted_indices[:k])
+            dash_indices = [idx for idx in sorted_indices if classes[idx] in ("", "-", "None", "nan")]
+            chosen_indices = (non_dash_indices + dash_indices)[:effective_k]
         else:
-            chosen_indices = list(sorted_indices[:k])
+            chosen_indices = list(sorted_indices[:effective_k])
         labels = [classes[index] for index in chosen_indices]
         output.append("|".join(labels))
     return pd.Series(output, index=X.index)
