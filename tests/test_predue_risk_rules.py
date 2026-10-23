@@ -218,3 +218,123 @@ def test_new_customers_receive_predue_risk_rules(tmp_path: Path):
     assert len(low_active) == 2
     assert low_row["D-5"] != "-"
 
+
+def test_three_apacs_old_and_new_distinction_and_postdue_single_class():
+    """
+    Validates:
+    1. Pre-due: Only D-5 is mandatory (forces 2nd-best if top is '-').
+       Other pre-due days (D-4..D-1) allow '-' so genuine feature distinctions are preserved.
+    2. New customer gets D-5 from model, and pre-due risk rules fill missing touchpoints to meet risk quota.
+    3. Post-due: Days with only 1 class ('-') predict '-'.
+       Days with non-dash classes pick 2nd-best by risk quota instead of '-'.
+    """
+    class MockModel:
+        def __init__(self, probs):
+            self._probs = np.array(probs)
+
+        def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+            return self._probs
+
+    class MockEncoder:
+        def __init__(self, classes):
+            self.classes_ = np.array(classes)
+
+    # 3 accounts:
+    # Row 0: NEW customer (LOW risk) -> no features, top is '-' on all days
+    # Row 1: OLD customer 1 (LOW risk) -> features trigger D-2 as top
+    # Row 2: OLD customer 2 (HIGH risk) -> features trigger D-4 as top
+    X = pd.DataFrame({"feat": [0, 1, 2]})
+    risks = pd.Series(["LOW", "LOW", "HIGH"])
+
+    # 1. D-5: mandatory_communication=True for all
+    enc_d5 = MockEncoder(["-", "SMS-2PM-ENGLISH", "WH-11AM-ENGLISH"])
+    model_d5 = MockModel([
+        [0.80, 0.15, 0.05],  # Row 0 (New): top is '-', picks 2nd best SMS-2PM-ENGLISH
+        [0.80, 0.15, 0.05],  # Row 1 (Old 1): top is '-', picks 2nd best SMS-2PM-ENGLISH
+        [0.80, 0.05, 0.15],  # Row 2 (Old 2): top is '-', picks 2nd best WH-11AM-ENGLISH
+    ])
+    d5_pred = predict_top_k_by_risk(model_d5, enc_d5, X, risks, mandatory_communication=True)
+    assert d5_pred.iloc[0] == "SMS-2PM-ENGLISH"
+    assert d5_pred.iloc[1] == "SMS-2PM-ENGLISH"
+    assert d5_pred.iloc[2].startswith("WH-11AM-ENGLISH")
+
+    # 2. D-4: mandatory_communication=False (reverted)
+    enc_d4 = MockEncoder(["-", "SMS-4PM-ENGLISH"])
+    model_d4 = MockModel([
+        [0.99, 0.01],  # Row 0: top is '-', stays '-'
+        [0.99, 0.01],  # Row 1: top is '-', stays '-'
+        [0.10, 0.90],  # Row 2 (Old 2): features trigger SMS-4PM-ENGLISH!
+    ])
+    d4_pred = predict_top_k_by_risk(model_d4, enc_d4, X, risks, mandatory_communication=False)
+    assert d4_pred.iloc[0] == "-"
+    assert d4_pred.iloc[1] == "-"
+    assert d4_pred.iloc[2].startswith("SMS-4PM-ENGLISH")
+
+    # 3. D-2: mandatory_communication=False (reverted)
+    enc_d2 = MockEncoder(["-", "WH-10AM-ENGLISH"])
+    model_d2 = MockModel([
+        [0.95, 0.05],  # Row 0: top is '-', stays '-'
+        [0.20, 0.80],  # Row 1 (Old 1): features trigger WH-10AM-ENGLISH!
+        [0.95, 0.05],  # Row 2
+    ])
+    d2_pred = predict_top_k_by_risk(model_d2, enc_d2, X, risks, mandatory_communication=False)
+    # For Row 2, overwrite to '-' as it had no D-2 signal
+    d2_pred.iloc[2] = "-"
+    assert d2_pred.iloc[0] == "-"
+    assert d2_pred.iloc[1] == "WH-10AM-ENGLISH"
+    assert d2_pred.iloc[2] == "-"
+
+    # Combine into DataFrame and apply pre-due risk rules
+    pred_df = pd.DataFrame({
+        "Loan_number": ["ACC_NEW", "ACC_OLD_1", "ACC_OLD_2"],
+        "SOURCE_RISK": ["LOW", "LOW", "HIGH"],
+        "D-5": d5_pred,
+        "D-4": d4_pred,
+        "D-3": ["-", "-", "-"],
+        "D-2": d2_pred,
+        "D-1": ["-", "-", "-"],
+    })
+    res = apply_predue_risk_rules(pred_df, predue_days=["D-5", "D-4", "D-3", "D-2", "D-1"], default_strategy=None)
+
+    # Account NEW (LOW risk): has D-5 from model, and no hardcoded strategy injected on missing days!
+    new_active = [c for c in ["D-5", "D-4", "D-3", "D-2", "D-1"] if res.iloc[0][c] != "-"]
+    assert len(new_active) == 1
+    assert res.iloc[0]["D-5"] == "SMS-2PM-ENGLISH"
+    assert res.iloc[0]["D-1"] == "-"  # NOT filled with fake SMS-11AM-ENGLISH!
+
+    # Account OLD 1 (LOW risk): has D-5 and feature-triggered D-2 (NOT identical to NEW!)
+    old1_active = [c for c in ["D-5", "D-4", "D-3", "D-2", "D-1"] if res.iloc[1][c] != "-"]
+    assert len(old1_active) == 2
+    assert res.iloc[1]["D-5"] == "SMS-2PM-ENGLISH"
+    assert res.iloc[1]["D-2"] == "WH-10AM-ENGLISH"
+    assert res.iloc[1]["D-1"] == "-"
+
+    # Account OLD 2 (HIGH risk): has D-5 and feature-triggered D-4
+    old2_active = [c for c in ["D-5", "D-4", "D-3", "D-2", "D-1"] if res.iloc[2][c] != "-"]
+    assert len(old2_active) == 2
+    assert res.iloc[2]["D-5"] == "WH-11AM-ENGLISH"
+    assert res.iloc[2]["D-4"] == "SMS-4PM-ENGLISH"
+
+    # 4. Post-due: single class '-' vs multi-class with 2nd best by risk
+    # D+3 has single class '-'
+    enc_dplus3 = MockEncoder(["-"])
+    model_dplus3 = MockModel([[1.0], [1.0], [1.0]])
+    dplus3_pred = predict_top_k_by_risk(model_dplus3, enc_dplus3, X, risks, mandatory_communication=True)
+    assert dplus3_pred.iloc[0] == "-"
+    assert dplus3_pred.iloc[1] == "-"
+    assert dplus3_pred.iloc[2] == "-"
+
+    # D+1 has classes ['-', 'SMS-5PM-ENGLISH', 'WH-3PM-ENGLISH']
+    enc_dplus1 = MockEncoder(["-", "SMS-5PM-ENGLISH", "WH-3PM-ENGLISH"])
+    model_dplus1 = MockModel([
+        [0.85, 0.10, 0.05],
+        [0.85, 0.10, 0.05],
+        [0.85, 0.10, 0.05],
+    ])
+    dplus1_pred = predict_top_k_by_risk(model_dplus1, enc_dplus1, X, risks, mandatory_communication=True)
+    # LOW risk (k=1) picks 2nd-best
+    assert dplus1_pred.iloc[0] == "SMS-5PM-ENGLISH"
+    # HIGH risk (k=3) shows recommendations by risk
+    assert dplus1_pred.iloc[2] == "SMS-5PM-ENGLISH|WH-3PM-ENGLISH|-"
+
+

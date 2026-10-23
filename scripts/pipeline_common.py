@@ -721,6 +721,10 @@ def predict_distinct_modes_by_risk(
         if m in mode_class_indices:
             mode_class_indices[m].append(idx)
 
+    # If the day has no candidates across any target mode (e.g. only '-' in model vocabulary), return '-'
+    if not any(mode_class_indices.values()):
+        return pd.Series(["-"] * len(X), index=X.index)
+
     output: list[str] = []
     for row_probs in probabilities:
         # Collect candidate classes per mode sorted by probability descending
