@@ -338,3 +338,173 @@ def test_three_apacs_old_and_new_distinction_and_postdue_single_class():
     assert dplus1_pred.iloc[2] == "SMS-5PM-ENGLISH|WH-3PM-ENGLISH|-"
 
 
+def test_predue_highest_model_probability_selection_keeps_d1():
+    from pipeline_common import apply_predue_risk_rules
+
+    # 3 accounts:
+    # Account 0 (HIGH risk): D-1 has highest probability (0.45) > D-2 (0.35) > D-4 (0.25) > D-3 (0.10)
+    # Target exact is 4 (1 on D-5 + 3 from D-4..D-1). Top 3 by prob are D-1, D-2, D-4. D-3 must be trimmed to '-'!
+    # Account 1 (MEDIUM risk): D-1 (0.50) > D-2 (0.40) > D-4 (0.20) > D-3 (0.10)
+    # Target exact is 3 (1 on D-5 + 2 from D-4..D-1). Top 2 by prob are D-1, D-2. D-4 and D-3 must be '-'!
+    # Account 2 (LOW risk): D-1 (0.60) > D-4 (0.20) > D-2 (0.15) > D-3 (0.05)
+    # Target exact is 2 (1 on D-5 + 1 from D-4..D-1). Top 1 by prob is D-1. D-4, D-3, D-2 must be '-'!
+    df = pd.DataFrame({
+        "Loan_number": ["ACC_HIGH", "ACC_MED", "ACC_LOW"],
+        "SOURCE_RISK": ["HIGH", "MEDIUM", "LOW"],
+        "D-5": ["WH-2PM-ENGLISH", "WH-2PM-ENGLISH", "WH-2PM-ENGLISH"],
+        "D-4": ["SMS-4PM-ENGLISH", "SMS-4PM-ENGLISH", "SMS-4PM-ENGLISH"],
+        "D-3": ["WH-1PM-ENGLISH", "WH-1PM-ENGLISH", "WH-1PM-ENGLISH"],
+        "D-2": ["SMS-12PM-ENGLISH", "SMS-12PM-ENGLISH", "SMS-12PM-ENGLISH"],
+        "D-1": ["WH-4PM-ENGLISH", "WH-4PM-ENGLISH", "WH-4PM-ENGLISH"],
+    })
+    day_probs = {
+        "D-4": pd.Series([0.25, 0.20, 0.20]),
+        "D-3": pd.Series([0.10, 0.10, 0.05]),
+        "D-2": pd.Series([0.35, 0.40, 0.15]),
+        "D-1": pd.Series([0.45, 0.50, 0.60]),
+    }
+
+    res = apply_predue_risk_rules(
+        df,
+        predue_days=["D-5", "D-4", "D-3", "D-2", "D-1"],
+        default_strategy=None,
+        day_probabilities=day_probs,
+    )
+
+    # Account 0 (HIGH risk): D-1, D-2, D-4 kept; D-3 trimmed to '-'! D-1 is NOT blank!
+    assert res.loc[0, "D-5"] == "WH-2PM-ENGLISH"
+    assert res.loc[0, "D-4"] == "SMS-4PM-ENGLISH"
+    assert res.loc[0, "D-3"] == "-"
+    assert res.loc[0, "D-2"] == "SMS-12PM-ENGLISH"
+    assert res.loc[0, "D-1"] == "WH-4PM-ENGLISH"
+    active_high = [c for c in ["D-5", "D-4", "D-3", "D-2", "D-1"] if res.loc[0, c] != "-"]
+    assert len(active_high) == 4
+
+    # Account 1 (MEDIUM risk): D-1, D-2 kept; D-4, D-3 trimmed to '-'
+    assert res.loc[1, "D-5"] == "WH-2PM-ENGLISH"
+    assert res.loc[1, "D-4"] == "-"
+    assert res.loc[1, "D-3"] == "-"
+    assert res.loc[1, "D-2"] == "SMS-12PM-ENGLISH"
+    assert res.loc[1, "D-1"] == "WH-4PM-ENGLISH"
+    active_med = [c for c in ["D-5", "D-4", "D-3", "D-2", "D-1"] if res.loc[1, c] != "-"]
+    assert len(active_med) == 3
+
+    # Account 2 (LOW risk): only D-1 kept; D-4, D-3, D-2 trimmed to '-'
+    assert res.loc[2, "D-5"] == "WH-2PM-ENGLISH"
+    assert res.loc[2, "D-4"] == "-"
+    assert res.loc[2, "D-3"] == "-"
+    assert res.loc[2, "D-2"] == "-"
+    assert res.loc[2, "D-1"] == "WH-4PM-ENGLISH"
+    active_low = [c for c in ["D-5", "D-4", "D-3", "D-2", "D-1"] if res.loc[2, c] != "-"]
+    assert len(active_low) == 2
+
+
+def test_predict_best_day_strategy_handles_postdue_cases():
+    from pipeline_common import predict_best_day_strategy
+
+    class MockEncoder:
+        def __init__(self, classes: list[str]):
+            self.classes_ = np.array(classes)
+
+    class MockModel:
+        def __init__(self, probs: list[list[float]]):
+            self._probs = np.array(probs)
+
+        def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+            return self._probs
+
+    X = pd.DataFrame({"x": [1, 2, 3]})
+
+    # Case 1: Multiple classes, top is '-' -> picks 2nd best (SMS-4PM-ENGLISH)
+    enc1 = MockEncoder(["-", "SMS-4PM-ENGLISH", "WH-2PM-ENGLISH"])
+    mod1 = MockModel([
+        [0.70, 0.20, 0.10],
+        [0.60, 0.35, 0.05],
+        [0.80, 0.15, 0.05],
+    ])
+    strat1, prob1 = predict_best_day_strategy(mod1, enc1, X)
+    assert list(strat1) == ["SMS-4PM-ENGLISH", "SMS-4PM-ENGLISH", "SMS-4PM-ENGLISH"]
+    assert list(prob1) == [0.20, 0.35, 0.15]
+
+    # Case 2: Top is non-blank (WH-2PM-ENGLISH has highest prob) -> picks best (1st)
+    enc2 = MockEncoder(["-", "SMS-4PM-ENGLISH", "WH-2PM-ENGLISH"])
+    mod2 = MockModel([
+        [0.30, 0.10, 0.60],
+        [0.20, 0.30, 0.50],
+        [0.40, 0.10, 0.50],
+    ])
+    strat2, prob2 = predict_best_day_strategy(mod2, enc2, X)
+    assert list(strat2) == ["WH-2PM-ENGLISH", "WH-2PM-ENGLISH", "WH-2PM-ENGLISH"]
+    assert list(prob2) == [0.60, 0.50, 0.50]
+
+    # Case 3: Only 1 class ('-') -> outputs '-' and prob 0.0
+    enc3 = MockEncoder(["-"])
+    mod3 = MockModel([
+        [1.0],
+        [1.0],
+        [1.0],
+    ])
+    strat3, prob3 = predict_best_day_strategy(mod3, enc3, X)
+    assert list(strat3) == ["-", "-", "-"]
+    assert list(prob3) == [0.0, 0.0, 0.0]
+
+
+def test_reasoning_matches_column_recommendations():
+    import json
+    from predict_next_month_strategy_catboost import build_prediction_reason
+
+    # Row has recommendations on D-5, D-4, D-2, and suppressions/no campaign on D-3, D-1
+    pred_row = pd.Series({
+        "SOURCE_RISK": "HIGH",
+        "D-5": "WH-2PM-ENGLISH",
+        "D-4": "SMS-4PM-ENGLISH",
+        "D-3": "Sunday",
+        "D-2": "SMS-12PM-ENGLISH",
+        "D-1": "-",
+        "D": "-",
+        "D+7": "SMS-5PM-ENGLISH",
+        "D+10": "SMS-4PM-ENGLISH",
+        "D+1": "-",
+    })
+    source_row = pd.Series({
+        "RISK": "HIGH",
+        "SMS_TOTAL_INTENSITY": 5,
+        "WH_TOTAL_INTENSITY": 2,
+    })
+    fallback_config = {
+        "D+1": {"fallback_reason": "single_unique_value", "fallback_value": "-"},
+    }
+
+    reason_json = build_prediction_reason(
+        prediction_row=pred_row,
+        source_row=source_row,
+        day_fallback_config=fallback_config,
+        target_days=["D-5", "D-4", "D-3", "D-2", "D-1", "D", "D+1", "D+7", "D+10"],
+    )
+    reasons = json.loads(reason_json)
+
+    # 1. D-5: WhatsApp recommended
+    assert "WhatsApp at 2PM in English is recommended" in reasons["D-5"]
+
+    # 2. D-4: SMS recommended - MUST NOT say "At this stage, no campaign is recommended"
+    assert "SMS at 4PM in English is recommended" in reasons["D-4"]
+    assert "no campaign is recommended" not in reasons["D-4"].lower()
+
+    # 3. D-3: Non-working bank day Sunday
+    assert "Communication suppressed on D-3 because the scheduled contact date falls on a non-working bank day (Sunday)" in reasons["D-3"]
+
+    # 4. D-2: SMS recommended
+    assert "SMS at 12PM in English is recommended" in reasons["D-2"]
+    assert "no campaign is recommended" not in reasons["D-2"].lower()
+
+    # 5. D-1: No campaign
+    assert "At this stage, no campaign is recommended to prevent excessive communication" in reasons["D-1"]
+
+    # 6. D+7: SMS recommended
+    assert "SMS at 5PM in English is recommended" in reasons["D+7"]
+
+    # 7. D+1: Single unique outcome fallback
+    assert "contained only one unique outcome" in reasons["D+1"]
+
+
+

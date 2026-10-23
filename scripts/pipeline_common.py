@@ -409,6 +409,7 @@ def apply_predue_risk_rules(
     df: pd.DataFrame,
     default_strategy: str | None = DEFAULT_PREDUE_STRATEGY,
     predue_days: list[str] | None = None,
+    day_probabilities: dict[str, pd.Series | list[float] | dict[object, float]] | None = None,
 ) -> pd.DataFrame:
     """
     Enforces mandatory baseline communication rule and risk-based pre-due touchpoint limits:
@@ -417,6 +418,8 @@ def apply_predue_risk_rules(
     - LOW Risk: Exactly 2 communications across configured pre-due days (1 per day).
     - MEDIUM Risk: Exactly 3 communications across configured pre-due days (1 per day).
     - HIGH Risk: Exactly 4 communications across configured pre-due days (1 per day).
+    - When day_probabilities is provided, pre-due candidate days (D-4..D-1) are ranked and selected
+      by highest model probability instead of positional ordering, preventing D-1 from always being dropped.
     """
     df = df.copy()
     risk_col = "SOURCE_RISK" if "SOURCE_RISK" in df.columns else ("RISK" if "RISK" in df.columns else None)
@@ -433,7 +436,7 @@ def apply_predue_risk_rules(
     # 1. Enforce single communication per day across active pre-due days
     df = enforce_single_communication_per_day(df, active_predue_cols)
 
-    for idx, row in df.iterrows():
+    for row_pos, (idx, row) in enumerate(df.iterrows()):
         risk_raw = str(row[risk_col]).upper().strip() if risk_col and pd.notna(row[risk_col]) else "LOW"
         limits = PREDUE_LIMITS_BY_RISK.get(risk_raw, PREDUE_LIMITS_BY_RISK["LOW"])
         # If fewer pre-due days are configured than target_exact, cap target at total available
@@ -459,6 +462,29 @@ def apply_predue_risk_rules(
         # 4. Trim extra pre-due days if count exceeds target_exact
         if current_active > target_exact:
             allowed_other_count = max(0, target_exact - base_count)
+            if day_probabilities is not None:
+                def get_prob(d: str) -> float:
+                    probs = day_probabilities.get(d)
+                    if probs is None:
+                        return 0.0
+                    if isinstance(probs, pd.Series):
+                        if idx in probs.index:
+                            val = probs.loc[idx]
+                            return float(val.iloc[0]) if isinstance(val, pd.Series) else float(val)
+                        if 0 <= row_pos < len(probs):
+                            return float(probs.iloc[row_pos])
+                        return 0.0
+                    if isinstance(probs, (list, tuple)):
+                        return float(probs[row_pos]) if 0 <= row_pos < len(probs) else 0.0
+                    if isinstance(probs, dict):
+                        if idx in probs:
+                            return float(probs[idx])
+                        if row_pos in probs:
+                            return float(probs[row_pos])
+                        return 0.0
+                    return 0.0
+
+                active_other = sorted(active_other, key=get_prob, reverse=True)
             allowed_other = set(active_other[:allowed_other_count])
             for day in other_predue_days:
                 if day not in allowed_other:
@@ -669,6 +695,56 @@ def split_by_source_month(
     if require_target:
         selected = selected.dropna(subset=["TARGET_MONTH"])
     return selected
+
+
+def predict_best_day_strategy(
+    model,
+    encoder,
+    X: pd.DataFrame,
+) -> tuple[pd.Series, pd.Series]:
+    """
+    Selects the single best recommendation strategy for each entity on a given day:
+    - If the day model has multiple classes and top predicted class is blank ('-'),
+      picks the 2nd best (highest probability non-blank class).
+    - If the top predicted class is non-blank, picks the best (1st) class.
+    - If the day has only blank ('-') class (e.g. single unique value), outputs '-'.
+    Returns:
+      (chosen_strategy_series, probability_series)
+    where probability_series holds the model probability of the chosen non-blank strategy
+    to allow probability-based day selection and ranking across pre-due days.
+    """
+    probabilities = model.predict_proba(X)
+    classes = [str(c) for c in encoder.classes_]
+    non_dash_indices = [idx for idx, c in enumerate(classes) if c not in ("", "-", "None", "nan")]
+
+    chosen_labels: list[str] = []
+    chosen_probs: list[float] = []
+
+    for row_probs in probabilities:
+        sorted_indices = row_probs.argsort()[::-1]
+        top_idx = sorted_indices[0]
+        top_label = classes[top_idx]
+
+        # Best non-dash candidate and its probability for ranking
+        best_non_dash_label = "-"
+        best_non_dash_prob = 0.0
+        for idx in sorted_indices:
+            if idx in non_dash_indices:
+                best_non_dash_label = classes[idx]
+                best_non_dash_prob = float(row_probs[idx])
+                break
+
+        if top_label not in ("", "-", "None", "nan"):
+            chosen_labels.append(top_label)
+            chosen_probs.append(float(row_probs[top_idx]))
+        elif best_non_dash_label != "-":
+            chosen_labels.append(best_non_dash_label)
+            chosen_probs.append(best_non_dash_prob)
+        else:
+            chosen_labels.append("-")
+            chosen_probs.append(0.0)
+
+    return pd.Series(chosen_labels, index=X.index), pd.Series(chosen_probs, index=X.index)
 
 
 def predict_top_k_by_risk(

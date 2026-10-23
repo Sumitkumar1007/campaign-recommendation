@@ -24,6 +24,7 @@ from pipeline_common import (
     month_to_period,
     offsets_to_day_columns,
     parse_day_offset,
+    predict_best_day_strategy,
     predict_distinct_modes_by_risk,
     predict_top_k_by_risk,
     prepare_next_month_dataset,
@@ -109,8 +110,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--multimode-postdue",
         action=argparse.BooleanOptionalAction,
-        default=env_flag("MULTIMODE_POSTDUE", env_flag("STRATEGY_MULTIMODE_POSTDUE", default=True)),
-        help="Predict 3 distinct modes (SMS, WhatsApp, Voice) per post-due day [default: True, or MULTIMODE_POSTDUE env].",
+        default=env_flag("MULTIMODE_POSTDUE", env_flag("STRATEGY_MULTIMODE_POSTDUE", default=False)),
+        help="Predict 3 distinct modes (SMS, WhatsApp, Voice) per post-due day [default: False, or MULTIMODE_POSTDUE env].",
     )
     parser.add_argument(
         "--log-file",
@@ -498,29 +499,37 @@ def build_prediction_reason(
             payload[day] = _no_campaign_reason(day)
             continue
 
-        raw_val = prediction_row.get(day, "-")
+        raw_val = str(prediction_row.get(day, "-")).strip()
+        if raw_val in ("Sunday", "Saturday", "2nd Saturday", "4th Saturday"):
+            payload[day] = (
+                f"Communication suppressed on {day} because the scheduled contact date "
+                f"falls on a non-working bank day ({raw_val})."
+            )
+            continue
+
         ranked_labels = _ranked_business_labels(raw_val)
         first_label = ranked_labels[0] if ranked_labels else "-"
         fallback_info = (day_fallback_config or {}).get(day)
+
+        if first_label == "-":
+            alternate_label = next((label for label in ranked_labels[1:] if label != "-"), None)
+            if alternate_label is not None:
+                payload[day] = _no_campaign_reason(day) + " " + _business_alternate_reason_for_label(
+                    alternate_label,
+                    day,
+                    source_row,
+                )
+            elif fallback_info is not None and fallback_info.get("fallback_reason") in ("single_unique_value", "missing_day_data"):
+                payload[day] = _fallback_prediction_reason(day, fallback_info, "-")
+            else:
+                payload[day] = _no_campaign_reason(day)
+            continue
+
         if fallback_info is not None:
             payload[day] = _fallback_prediction_reason(day, fallback_info, first_label)
             continue
 
-        alternate_label = next((label for label in ranked_labels[1:] if label != "-"), None)
-        if first_label == "-" and alternate_label is not None:
-            payload[day] = _no_campaign_reason(day) + " " + _business_alternate_reason_for_label(
-                alternate_label,
-                day,
-                source_row,
-            )
-            continue
-
-        best_label = first_label if first_label != "-" else None
-        if best_label is None:
-            payload[day] = _no_campaign_reason(day)
-            continue
-
-        payload[day] = _business_reason_for_label(best_label, day, source_row)
+        payload[day] = _business_reason_for_label(first_label, day, source_row)
 
     return json.dumps(payload, sort_keys=True)
 
@@ -643,30 +652,46 @@ def main() -> None:
                     source_period + target_offset_months
                 ).dt.to_timestamp().dt.strftime("%b-%Y").str.upper()
 
+                active_predue = [d for d in PREDUE_DAY_COLUMNS if d in allowed_day_labels]
+                active_postdue = [d for d in POSTDUE_DAY_COLUMNS if d in allowed_day_labels]
+                day_probs: dict[str, pd.Series] = {}
                 for day in DAY_COLUMNS:
                     if day in allowed_day_labels:
                         logger.info("Predicting day column | day=%s", day)
                         encoder = bundle["label_encoders"][day]
                         model = bundle["models"][day]
-                        if day in POSTDUE_DAY_COLUMNS and getattr(args, "multimode_postdue", True):
+                        if day in POSTDUE_DAY_COLUMNS and getattr(args, "multimode_postdue", False):
                             prediction_output[day] = predict_distinct_modes_by_risk(
                                 model,
                                 encoder,
                                 X_pred,
                                 risks=prediction_rows["RISK"],
                             )
+                            day_probs[day] = pd.Series(1.0, index=X_pred.index)
                         else:
-                            is_mandatory = (day == "D-5" or day in POSTDUE_DAY_COLUMNS)
-                            prediction_output[day] = predict_top_k_by_risk(
+                            strat_series, prob_series = predict_best_day_strategy(
                                 model,
                                 encoder,
                                 X_pred,
-                                prediction_rows["RISK"],
-                                mandatory_communication=is_mandatory,
                             )
+                            prediction_output[day] = strat_series
+                            day_probs[day] = prob_series
                     else:
                         logger.info("Day column outside allowed_day_offsets, skipping prediction | day=%s", day)
                         prediction_output[day] = "-"
+                        day_probs[day] = pd.Series(0.0, index=X_pred.index)
+
+                prediction_output = apply_predue_risk_rules(
+                    prediction_output,
+                    predue_days=active_predue,
+                    default_strategy=None,
+                    day_probabilities=day_probs,
+                )
+                prediction_output = apply_postdue_risk_rules(
+                    prediction_output,
+                    postdue_days=active_postdue,
+                    allow_multimode=getattr(args, "multimode_postdue", False),
+                )
                 prediction_output["PREDICTION_REASON"] = [
                     build_prediction_reason(
                         prediction_row=prediction_output.iloc[row_idx],
@@ -707,29 +732,44 @@ def main() -> None:
                 columns=bundle["feature_columns"],
                 fill_value=0,
             )
+            active_predue = [d for d in PREDUE_DAY_COLUMNS if d in allowed_day_labels]
+            active_postdue = [d for d in POSTDUE_DAY_COLUMNS if d in allowed_day_labels]
+            blank_probs: dict[str, pd.Series] = {}
             for day in DAY_COLUMNS:
                 if day in allowed_day_labels:
                     encoder = bundle["label_encoders"][day]
                     model = bundle["models"][day]
-                    if day in POSTDUE_DAY_COLUMNS and getattr(args, "multimode_postdue", True):
+                    if day in POSTDUE_DAY_COLUMNS and getattr(args, "multimode_postdue", False):
                         blank_output[day] = predict_distinct_modes_by_risk(
                             model,
                             encoder,
                             X_blank,
                             risks=blank_rows["RISK"],
                         )
+                        blank_probs[day] = pd.Series(1.0, index=X_blank.index)
                     else:
-                        is_mandatory = (day == "D-5" or day in POSTDUE_DAY_COLUMNS)
-                        blank_output[day] = predict_top_k_by_risk(
+                        strat_series, prob_series = predict_best_day_strategy(
                             model,
                             encoder,
                             X_blank,
-                            blank_rows["RISK"],
-                            mandatory_communication=is_mandatory,
                         )
+                        blank_output[day] = strat_series
+                        blank_probs[day] = prob_series
                 else:
                     blank_output[day] = "-"
+                    blank_probs[day] = pd.Series(0.0, index=X_blank.index)
 
+            blank_output = apply_predue_risk_rules(
+                blank_output,
+                predue_days=active_predue,
+                default_strategy=None,
+                day_probabilities=blank_probs,
+            )
+            blank_output = apply_postdue_risk_rules(
+                blank_output,
+                postdue_days=active_postdue,
+                allow_multimode=getattr(args, "multimode_postdue", False),
+            )
             blank_output["PREDICTION_REASON"] = [
                 build_prediction_reason(
                     prediction_row=blank_output.iloc[row_idx],
@@ -773,18 +813,6 @@ def main() -> None:
             logger.info("Saved raw predictions CSV | file=%s rows=%s columns=%s", raw_prediction_file, len(raw_output), len(output_cols))
 
         with log_step(logger, "write_predictions", prediction_file=prediction_file):
-            active_predue = [d for d in PREDUE_DAY_COLUMNS if d in allowed_day_labels]
-            active_postdue = [d for d in POSTDUE_DAY_COLUMNS if d in allowed_day_labels]
-            prediction_output = apply_predue_risk_rules(
-                prediction_output,
-                predue_days=active_predue,
-                default_strategy=None,
-            )
-            prediction_output = apply_postdue_risk_rules(
-                prediction_output,
-                postdue_days=active_postdue,
-                allow_multimode=getattr(args, "multimode_postdue", True),
-            )
             for day in configured_day_cols:
                 if day in DAY_COLUMNS and day not in allowed_day_labels:
                     prediction_output[day] = "-"
