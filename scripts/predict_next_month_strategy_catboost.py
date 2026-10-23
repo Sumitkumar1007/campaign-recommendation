@@ -652,46 +652,21 @@ def main() -> None:
                     source_period + target_offset_months
                 ).dt.to_timestamp().dt.strftime("%b-%Y").str.upper()
 
-                active_predue = [d for d in PREDUE_DAY_COLUMNS if d in allowed_day_labels]
-                active_postdue = [d for d in POSTDUE_DAY_COLUMNS if d in allowed_day_labels]
-                day_probs: dict[str, pd.Series] = {}
+                pred_day_probs: dict[str, np.ndarray] = {}
                 for day in DAY_COLUMNS:
                     if day in allowed_day_labels:
                         logger.info("Predicting day column | day=%s", day)
                         encoder = bundle["label_encoders"][day]
                         model = bundle["models"][day]
-                        if day in POSTDUE_DAY_COLUMNS and getattr(args, "multimode_postdue", False):
-                            prediction_output[day] = predict_distinct_modes_by_risk(
-                                model,
-                                encoder,
-                                X_pred,
-                                risks=prediction_rows["RISK"],
-                            )
-                            day_probs[day] = pd.Series(1.0, index=X_pred.index)
-                        else:
-                            strat_series, prob_series = predict_best_day_strategy(
-                                model,
-                                encoder,
-                                X_pred,
-                            )
-                            prediction_output[day] = strat_series
-                            day_probs[day] = prob_series
+                        probs = model.predict_proba(X_pred)
+                        pred_day_probs[day] = probs
+                        top_idx = probs.argmax(axis=1)
+                        classes = [str(c) for c in encoder.classes_]
+                        prediction_output[day] = [classes[i] for i in top_idx]
                     else:
                         logger.info("Day column outside allowed_day_offsets, skipping prediction | day=%s", day)
                         prediction_output[day] = "-"
-                        day_probs[day] = pd.Series(0.0, index=X_pred.index)
 
-                prediction_output = apply_predue_risk_rules(
-                    prediction_output,
-                    predue_days=active_predue,
-                    default_strategy=None,
-                    day_probabilities=day_probs,
-                )
-                prediction_output = apply_postdue_risk_rules(
-                    prediction_output,
-                    postdue_days=active_postdue,
-                    allow_multimode=getattr(args, "multimode_postdue", False),
-                )
                 prediction_output["PREDICTION_REASON"] = [
                     build_prediction_reason(
                         prediction_row=prediction_output.iloc[row_idx],
@@ -732,44 +707,19 @@ def main() -> None:
                 columns=bundle["feature_columns"],
                 fill_value=0,
             )
-            active_predue = [d for d in PREDUE_DAY_COLUMNS if d in allowed_day_labels]
-            active_postdue = [d for d in POSTDUE_DAY_COLUMNS if d in allowed_day_labels]
-            blank_probs: dict[str, pd.Series] = {}
+            blank_day_probs: dict[str, np.ndarray] = {}
             for day in DAY_COLUMNS:
                 if day in allowed_day_labels:
                     encoder = bundle["label_encoders"][day]
                     model = bundle["models"][day]
-                    if day in POSTDUE_DAY_COLUMNS and getattr(args, "multimode_postdue", False):
-                        blank_output[day] = predict_distinct_modes_by_risk(
-                            model,
-                            encoder,
-                            X_blank,
-                            risks=blank_rows["RISK"],
-                        )
-                        blank_probs[day] = pd.Series(1.0, index=X_blank.index)
-                    else:
-                        strat_series, prob_series = predict_best_day_strategy(
-                            model,
-                            encoder,
-                            X_blank,
-                        )
-                        blank_output[day] = strat_series
-                        blank_probs[day] = prob_series
+                    probs = model.predict_proba(X_blank)
+                    blank_day_probs[day] = probs
+                    top_idx = probs.argmax(axis=1)
+                    classes = [str(c) for c in encoder.classes_]
+                    blank_output[day] = [classes[i] for i in top_idx]
                 else:
                     blank_output[day] = "-"
-                    blank_probs[day] = pd.Series(0.0, index=X_blank.index)
 
-            blank_output = apply_predue_risk_rules(
-                blank_output,
-                predue_days=active_predue,
-                default_strategy=None,
-                day_probabilities=blank_probs,
-            )
-            blank_output = apply_postdue_risk_rules(
-                blank_output,
-                postdue_days=active_postdue,
-                allow_multimode=getattr(args, "multimode_postdue", False),
-            )
             blank_output["PREDICTION_REASON"] = [
                 build_prediction_reason(
                     prediction_row=blank_output.iloc[row_idx],
@@ -795,34 +745,119 @@ def main() -> None:
         ]
 
         if prediction_outputs:
-            prediction_output = pd.concat(prediction_outputs, ignore_index=True)
+            raw_prediction_output = pd.concat(prediction_outputs, ignore_index=True)
         else:
-            prediction_output = pd.DataFrame(columns=output_cols)
+            raw_prediction_output = pd.DataFrame(columns=output_cols)
 
-        if "IS_NEW_CUSTOMER" not in prediction_output.columns:
-            prediction_output["IS_NEW_CUSTOMER"] = "False"
+        if "IS_NEW_CUSTOMER" not in raw_prediction_output.columns:
+            raw_prediction_output["IS_NEW_CUSTOMER"] = "False"
         else:
-            prediction_output["IS_NEW_CUSTOMER"] = prediction_output["IS_NEW_CUSTOMER"].fillna("False")
+            raw_prediction_output["IS_NEW_CUSTOMER"] = raw_prediction_output["IS_NEW_CUSTOMER"].fillna("False")
 
         with log_step(logger, "write_raw_predictions", prediction_file=prediction_file):
             if "D" in configured_day_cols:
-                prediction_output["D"] = "-"
+                raw_prediction_output["D"] = "-"
             raw_prediction_file = prediction_file.parent / f"{prediction_file.stem}_raw.csv"
-            raw_output = prediction_output.reindex(columns=output_cols).fillna("-")
+            raw_output = raw_prediction_output.reindex(columns=output_cols).fillna("-")
             raw_output.to_csv(raw_prediction_file, index=False)
             logger.info("Saved raw predictions CSV | file=%s rows=%s columns=%s", raw_prediction_file, len(raw_output), len(output_cols))
+
+        with log_step(logger, "apply_final_prediction_rules", prediction_file=prediction_file):
+            final_prediction_output = raw_prediction_output.copy()
+            active_predue = [d for d in PREDUE_DAY_COLUMNS if d in allowed_day_labels]
+            active_postdue = [d for d in POSTDUE_DAY_COLUMNS if d in allowed_day_labels]
+            n_existing = len(prediction_rows)
+
+            # 1. Post-due only: if raw prediction is "-", and multiple classes exist, pick 2nd best prediction
+            for day in active_postdue:
+                encoder = bundle["label_encoders"][day]
+                classes = [str(c) for c in encoder.classes_]
+                non_dash_indices = [idx for idx, c in enumerate(classes) if c not in ("", "-", "None", "nan")]
+                if len(classes) > 1 and non_dash_indices:
+                    for i in range(len(final_prediction_output)):
+                        val = str(final_prediction_output.at[i, day]).strip()
+                        if val in ("", "-", "None", "nan"):
+                            probs_row = pred_day_probs[day][i] if i < n_existing else blank_day_probs[day][i - n_existing]
+                            sorted_indices = probs_row.argsort()[::-1]
+                            for idx in sorted_indices:
+                                if idx in non_dash_indices:
+                                    final_prediction_output.at[i, day] = classes[idx]
+                                    break
+
+            # 2. Pre-due D-5 mandatory baseline communication (full base contact)
+            if "D-5" in active_predue:
+                encoder = bundle["label_encoders"]["D-5"]
+                classes = [str(c) for c in encoder.classes_]
+                non_dash_indices = [idx for idx, c in enumerate(classes) if c not in ("", "-", "None", "nan")]
+                if non_dash_indices:
+                    for i in range(len(final_prediction_output)):
+                        val = str(final_prediction_output.at[i, "D-5"]).strip()
+                        if val in ("", "-", "None", "nan"):
+                            probs_row = pred_day_probs["D-5"][i] if i < n_existing else blank_day_probs["D-5"][i - n_existing]
+                            sorted_indices = probs_row.argsort()[::-1]
+                            for idx in sorted_indices:
+                                if idx in non_dash_indices:
+                                    final_prediction_output.at[i, "D-5"] = classes[idx]
+                                    break
+
+            # 3. Calculate candidate day probabilities for pre-due capping
+            predue_candidate_probs: dict[str, list[float]] = {}
+            for day in active_predue:
+                day_probs_list = []
+                encoder = bundle["label_encoders"][day]
+                classes = [str(c) for c in encoder.classes_]
+                for i in range(len(final_prediction_output)):
+                    strat = str(final_prediction_output.at[i, day]).strip()
+                    if strat in ("", "-", "None", "nan"):
+                        day_probs_list.append(0.0)
+                    else:
+                        probs_row = pred_day_probs[day][i] if i < n_existing else blank_day_probs[day][i - n_existing]
+                        if strat in classes:
+                            strat_idx = classes.index(strat)
+                            day_probs_list.append(float(probs_row[strat_idx]))
+                        else:
+                            day_probs_list.append(0.0)
+                predue_candidate_probs[day] = day_probs_list
+
+            # 4. Pre-due risk capping
+            final_prediction_output = apply_predue_risk_rules(
+                final_prediction_output,
+                predue_days=active_predue,
+                default_strategy=None,
+                day_probabilities=predue_candidate_probs,
+            )
+
+            # 5. Post-due risk capping
+            final_prediction_output = apply_postdue_risk_rules(
+                final_prediction_output,
+                postdue_days=active_postdue,
+                allow_multimode=getattr(args, "multimode_postdue", False),
+            )
+
+            # 6. Rebuild final PREDICTION_REASON matching final recommendations
+            final_reasons = []
+            for i in range(len(final_prediction_output)):
+                src_row = prediction_rows.iloc[i] if i < n_existing else None
+                reason = build_prediction_reason(
+                    prediction_row=final_prediction_output.iloc[i],
+                    source_row=src_row,
+                    day_fallback_config=day_fallback_config,
+                    target_days=configured_day_cols,
+                )
+                final_reasons.append(reason)
+            final_prediction_output["PREDICTION_REASON"] = final_reasons
 
         with log_step(logger, "write_predictions", prediction_file=prediction_file):
             for day in configured_day_cols:
                 if day in DAY_COLUMNS and day not in allowed_day_labels:
-                    prediction_output[day] = "-"
-            prediction_output = prediction_output.reindex(columns=output_cols).fillna("-")
-            prediction_output.to_csv(prediction_file, index=False)
-            logger.info("Saved predictions | rows=%s columns=%s bytes=%s", len(prediction_output), len(output_cols), prediction_file.stat().st_size)
+                    final_prediction_output[day] = "-"
+            final_output = final_prediction_output.reindex(columns=output_cols).fillna("-")
+            final_output.to_csv(prediction_file, index=False)
+            logger.info("Saved predictions | rows=%s columns=%s bytes=%s", len(final_output), len(output_cols), prediction_file.stat().st_size)
             try:
                 from generate_prediction_summary import generate_summary_workbooks
                 counts_f, pct_f = generate_summary_workbooks(
-                    prediction_output,
+                    final_output,
                     prediction_file.parent,
                     prediction_file.stem,
                     day_columns=configured_day_cols,
@@ -832,7 +867,7 @@ def main() -> None:
             except Exception as e:
                 logger.warning("Could not generate summary Excel files: %s", e)
 
-        print(f"Prediction rows: {len(prediction_output):,}")
+        print(f"Prediction rows: {len(final_output):,}")
         print(f"Saved inference-only predictions to {prediction_file}")
         logger.info("CatBoost inference completed successfully.")
     except Exception:

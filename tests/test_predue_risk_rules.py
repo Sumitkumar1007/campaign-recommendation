@@ -507,4 +507,33 @@ def test_reasoning_matches_column_recommendations():
     assert "contained only one unique outcome" in reasons["D+1"]
 
 
+def test_regional_language_preserved_in_reason_and_strategy():
+    import json
+    from pipeline_common import readable_strategy
+    from predict_next_month_strategy_catboost import build_prediction_reason
+
+    # Verify readable_strategy preserves REGIONAL without converting to English
+    assert readable_strategy("SMS-11AM-REGIONAL") == "SMS at 11AM in Regional language"
+    assert readable_strategy("WH-2PM-REGIONAL") == "WhatsApp at 2PM in Regional language"
+    assert "English" not in readable_strategy("SMS-11AM-REGIONAL")
+
+    pred_row = pd.Series({
+        "SOURCE_RISK": "MEDIUM",
+        "D+14": "SMS-11AM-REGIONAL",
+    })
+    source_row = pd.Series({
+        "RISK": "MEDIUM",
+        "SMS_TOTAL_INTENSITY": 3,
+    })
+    reason_json = build_prediction_reason(
+        prediction_row=pred_row,
+        source_row=source_row,
+        target_days=["D+14"],
+    )
+    reasons = json.loads(reason_json)
+    assert "Regional language" in reasons["D+14"]
+    assert "English" not in reasons["D+14"]
+
+
+
 
