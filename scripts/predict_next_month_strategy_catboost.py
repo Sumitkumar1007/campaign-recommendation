@@ -196,12 +196,18 @@ def write_inference_daywise_model_input_audit(
 
 
 def _normalize_text(series: pd.Series, default: str = "UNKNOWN") -> pd.Series:
-    return (
-        series.fillna(default)
-        .astype(str)
-        .str.strip()
-        .replace({"": default})
-    )
+    res = series.fillna(default).astype(str).str.strip().replace({"": default})
+    if default == "UNKNOWN":
+        res = res.replace({
+            "NAN": default,
+            "NONE": default,
+            "NULL": default,
+            "<NA>": default,
+            "nan": default,
+            "none": default,
+            "null": default,
+        })
+    return res
 
 
 def load_base_population(base_population_file: Path, source_month_label: str) -> pd.DataFrame:

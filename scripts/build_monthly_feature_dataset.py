@@ -70,9 +70,27 @@ def main() -> None:
             .agg(agg_spec)
         )
         monthly_parts.append(grouped)
-        risk_parts.append(chunk.groupby([active_key, "MONTH"])["RISK"].first())
+        chunk_risk = chunk[[active_key, "MONTH", "RISK"]].copy()
+        chunk_risk["RISK"] = (
+            chunk_risk["RISK"]
+            .fillna("UNKNOWN")
+            .astype(str)
+            .str.strip()
+            .str.upper()
+            .replace({"": "UNKNOWN", "NAN": "UNKNOWN", "NONE": "UNKNOWN", "NULL": "UNKNOWN", "<NA>": "UNKNOWN"})
+        )
+        risk_parts.append(chunk_risk.drop_duplicates())
         if "VERTICAL" in chunk.columns:
-            vertical_parts.append(chunk.groupby([active_key, "MONTH"])["VERTICAL"].first())
+            chunk_vert = chunk[[active_key, "MONTH", "VERTICAL"]].copy()
+            chunk_vert["VERTICAL"] = (
+                chunk_vert["VERTICAL"]
+                .fillna("UNKNOWN")
+                .astype(str)
+                .str.strip()
+                .str.upper()
+                .replace({"": "UNKNOWN", "NAN": "UNKNOWN", "NONE": "UNKNOWN", "NULL": "UNKNOWN", "<NA>": "UNKNOWN"})
+            )
+            vertical_parts.append(chunk_vert.drop_duplicates())
 
     if not monthly_parts:
         raise ValueError("No data found while building monthly features.")
@@ -111,21 +129,25 @@ def main() -> None:
             if t_c > 0:
                 monthly.at[idx, "TOTAL_PAYMENT_COUNT"] = max(float(monthly.at[idx, "TOTAL_PAYMENT_COUNT"]), float(t_c))
 
+    risk_all = pd.concat(risk_parts, ignore_index=True).drop_duplicates()
+    risk_all["_is_known"] = risk_all["RISK"].ne("UNKNOWN").astype(int)
     risk_df = (
-        pd.concat(risk_parts, ignore_index=False)
-        .groupby(level=[0, 1])
-        .first()
-        .reset_index()
+        risk_all.sort_values([key_column, "MONTH", "_is_known"], ascending=[True, True, False])
+        .drop_duplicates(subset=[key_column, "MONTH"], keep="first")
+        [[key_column, "MONTH", "RISK"]]
+        .reset_index(drop=True)
     )
     monthly[key_column] = normalize_identifier(monthly[key_column])
     risk_df[key_column] = normalize_identifier(risk_df[key_column])
     monthly = monthly.merge(risk_df, on=[key_column, "MONTH"], how="left")
     if vertical_parts:
+        vert_all = pd.concat(vertical_parts, ignore_index=True).drop_duplicates()
+        vert_all["_is_known"] = vert_all["VERTICAL"].ne("UNKNOWN").astype(int)
         vertical_df = (
-            pd.concat(vertical_parts, ignore_index=False)
-            .groupby(level=[0, 1])
-            .first()
-            .reset_index()
+            vert_all.sort_values([key_column, "MONTH", "_is_known"], ascending=[True, True, False])
+            .drop_duplicates(subset=[key_column, "MONTH"], keep="first")
+            [[key_column, "MONTH", "VERTICAL"]]
+            .reset_index(drop=True)
         )
         vertical_df[key_column] = normalize_identifier(vertical_df[key_column])
         monthly = monthly.merge(vertical_df, on=[key_column, "MONTH"], how="left")

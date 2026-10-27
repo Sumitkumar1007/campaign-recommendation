@@ -248,13 +248,14 @@ def normalize_comm_type(series: pd.Series) -> pd.Series:
 
 
 def normalize_risk(series: pd.Series) -> pd.Series:
-    return (
-        series.fillna("UNKNOWN")
-        .astype(str)
-        .str.strip()
-        .replace({"": "UNKNOWN"})
-        .str.upper()
-    )
+    cleaned = series.fillna("UNKNOWN").astype(str).str.strip().str.upper()
+    return cleaned.replace({
+        "": "UNKNOWN",
+        "NAN": "UNKNOWN",
+        "NONE": "UNKNOWN",
+        "NULL": "UNKNOWN",
+        "<NA>": "UNKNOWN",
+    })
 
 
 def normalize_vertical(series: pd.Series) -> pd.Series:
@@ -387,7 +388,6 @@ def process_chunk(
 
     df = df[
         df[key_col].ne("")
-        & df["RISK"].ne("UNKNOWN")
         & df["COMM_TYPE"].notna()
         & df["emi_date"].notna()
         & df["date"].notna()
@@ -618,7 +618,6 @@ def summarize_chunk_audit(
 
     required_mask = (
         scoped[key_col].ne("")
-        & risk.ne("UNKNOWN")
         & normalized_comm_type.notna()
         & emi_date.notna()
         & event_date.notna()

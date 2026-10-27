@@ -344,23 +344,25 @@ def build_fallback_rows(
     records: list[dict[str, str]] = []
     for case in new_cases.to_dict("records"):
         risk = str(case.get("originalRisk", "")).strip().upper() or "LOW"
-        fallback_by_day = fallback_by_risk.get(risk) or fallback_by_risk.get("LOW", {})
+        lookup_risk = "LOW" if risk in ("UNKNOWN", "NULL", "NONE", "NAN", "") else risk
+        fallback_by_day = fallback_by_risk.get(lookup_risk) or fallback_by_risk.get("LOW", {})
+        display_risk = "LOW" if risk in ("UNKNOWN", "NULL", "NONE", "NAN", "") else risk
         for day in DAY_COLUMNS:
             strategy = fallback_by_day.get(day, "-") if (allowed_day_labels is None or day in allowed_day_labels) else "-"
             if strategy and strategy != "-":
                 reason_text = (
                     f"Cold-start fallback: {readable_strategy(strategy)} is recommended based on "
-                    f"{risk}-risk historical average, as no communication history was found for this customer."
+                    f"{display_risk}-risk historical average, as no communication history was found for this customer."
                 )
             else:
                 reason_text = (
-                    f"No communication is recommended on {day} based on {risk}-risk cohort guidelines."
+                    f"No communication is recommended on {day} based on {display_risk}-risk cohort guidelines."
                 )
             records.append(
                 {
                     "apacCardNumber": case["apacCardNumber"],
                     "originalRisk": case.get("originalRisk", ""),
-                    "fallbackRiskUsed": risk,
+                    "fallbackRiskUsed": lookup_risk,
                     "vertical": case.get("vertical", ""),
                     "day": day,
                     "recommendedStrategy": strategy,

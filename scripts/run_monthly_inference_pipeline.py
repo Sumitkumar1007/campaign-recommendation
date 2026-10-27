@@ -1372,6 +1372,7 @@ def validate_template_language_consistency(template_name: str, language: str) ->
        (e.g., Marathi, Hindi, Malayalam, Tamil, etc.) unless English is explicitly supported.
     2. No regional prediction receives a conflicting regional template (e.g. Marathi prediction
        receiving a Hindi or Telugu template).
+    3. No regional / non-English prediction receives an English template.
     """
     if not template_name or not language:
         return True
@@ -1390,6 +1391,7 @@ def validate_template_language_consistency(template_name: str, language: str) ->
         "PUNJABI": ["PUNJABI"],
         "ODIA": ["ODIA", "ORIYA"],
         "ASSAMESE": ["ASSAMESE"],
+        "REGIONAL": ["REGIONAL"],
     }
 
     if l_u in ("ENGLISH", "DEFAULT", ""):
@@ -1398,12 +1400,16 @@ def validate_template_language_consistency(template_name: str, language: str) ->
         for reg_lang, keywords in regional_keywords.items():
             if any(kw in t_u for kw in keywords) and "ENG" not in t_u:
                 return False
-    elif l_u in regional_keywords:
+    else:
+        # Non-English / regional predictions must NEVER receive an English template
+        if "ENG" in t_u or "ENGLISH" in t_u:
+            return False
         # A specific regional language must not receive a template marked for a different regional language
-        target_keywords = regional_keywords[l_u]
-        for reg_lang, keywords in regional_keywords.items():
-            if reg_lang != l_u and any(kw in t_u for kw in keywords) and not any(kw in t_u for kw in target_keywords):
-                return False
+        if l_u in regional_keywords:
+            target_keywords = regional_keywords[l_u]
+            for reg_lang, keywords in regional_keywords.items():
+                if reg_lang != l_u and any(kw in t_u for kw in keywords) and not any(kw in t_u for kw in target_keywords):
+                    return False
 
     return True
 
@@ -1626,13 +1632,14 @@ def resolve_template_name_with_status(
     mode_u = mode.strip().upper()
     lang_u = language.strip().upper()
     due_u = due_type.strip().upper()
+    is_english = lang_u in ("ENGLISH", "DEFAULT", "")
 
     # Step 1: Existing APAC historical rule matching (due_type, mode, language)
     if digital_rule_id_map and loan_number:
         # Check due_type-qualified match first: (loan_number, due_u, mode_u, lang_u)
         hist_entry = (
             digital_rule_id_map.get((loan_number, due_u, mode_u, lang_u))
-            or (digital_rule_id_map.get((loan_number, due_u, mode_u, "")) if lang_u == "ENGLISH" else None)
+            or (digital_rule_id_map.get((loan_number, due_u, mode_u, "")) if is_english else None)
         )
         if hist_entry:
             if isinstance(hist_entry, tuple):
@@ -1643,7 +1650,7 @@ def resolve_template_name_with_status(
                 if digital_rules_lookup:
                     template_candidate = (
                         digital_rules_lookup.get((rule_id, mode_u, lang_u))
-                        or (digital_rules_lookup.get((rule_id, mode_u, "")) if lang_u == "ENGLISH" else "")
+                        or (digital_rules_lookup.get((rule_id, mode_u, "")) if is_english else "")
                         or ""
                     )
             rule_meta = digital_rules_lookup.get(("RULE_META", str(rule_id))) if digital_rules_lookup else None
@@ -1656,7 +1663,7 @@ def resolve_template_name_with_status(
             due_ok = (rule_due is None or rule_due == due_u) and validate_template_due_type_consistency(template_candidate, due_u)
             mode_ok = (rule_mode is None or rule_mode == mode_u) and validate_template_mode_consistency(template_candidate, mode_u)
             lang_ok = (
-                (rule_lang == lang_u) or (lang_u == "ENGLISH" and rule_lang in ("DEFAULT", "", None))
+                (rule_lang == lang_u) or (is_english and rule_lang in ("DEFAULT", "", None))
             ) and validate_template_language_consistency(template_candidate, lang_u)
 
             if template_candidate and rule_active and due_ok and mode_ok and lang_ok:
@@ -1665,7 +1672,7 @@ def resolve_template_name_with_status(
         # Check fallback to non-due-qualified match, but ONLY if rule metadata strictly matches due_type, mode, and language!
         hist_unqualified = (
             digital_rule_id_map.get((loan_number, mode_u, lang_u))
-            or (digital_rule_id_map.get((loan_number, mode_u, "")) if lang_u == "ENGLISH" else None)
+            or (digital_rule_id_map.get((loan_number, mode_u, "")) if is_english else None)
         )
         if hist_unqualified:
             rule_id = str(hist_unqualified)
@@ -1677,14 +1684,14 @@ def resolve_template_name_with_status(
 
             due_ok = (rule_due is None or rule_due == due_u)
             mode_ok = (rule_mode is None or rule_mode == mode_u)
-            lang_ok = (not rule_lang or rule_lang == lang_u or (lang_u == "ENGLISH" and rule_lang in ("DEFAULT", "", None)))
+            lang_ok = (rule_lang == lang_u) or (is_english and rule_lang in ("DEFAULT", "", None))
 
             if rule_active and due_ok and mode_ok and lang_ok:
                 template_candidate = (
                     rule_meta.get("iteration") if rule_meta else ""
                 ) or (
                     digital_rules_lookup.get((rule_id, mode_u, lang_u))
-                    or (digital_rules_lookup.get((rule_id, mode_u, "")) if lang_u == "ENGLISH" else "")
+                    or (digital_rules_lookup.get((rule_id, mode_u, "")) if is_english else "")
                     if digital_rules_lookup else ""
                 )
                 if (
@@ -1714,16 +1721,18 @@ def resolve_template_name_with_status(
         ):
             return comm_template, "COMM_COHORT_MATCH", f"Matched latest communication template for ({due_u}, {mode_u}, {lang_u})"
 
-        # Step 3: Communication Language Fallback (DEFAULT / ENGLISH)
-        for fallback_lang in ("DEFAULT", "ENGLISH", ""):
-            comm_lang_fallback = cohort_dict.get((due_u, mode_u, fallback_lang))
-            if (
-                comm_lang_fallback
-                and validate_template_due_type_consistency(comm_lang_fallback, due_u)
-                and validate_template_mode_consistency(comm_lang_fallback, mode_u)
-                and validate_template_language_consistency(comm_lang_fallback, lang_u)
-            ):
-                return comm_lang_fallback, "COMM_LANG_FALLBACK", f"Language '{lang_u}' fell back to communication default '{comm_lang_fallback}'"
+        # Step 3: Communication Language Fallback (DEFAULT / ENGLISH) - strictly for English predictions only!
+        # Regional / non-English languages must NEVER fall back to DEFAULT or ENGLISH.
+        if is_english:
+            for fallback_lang in ("DEFAULT", "ENGLISH", ""):
+                comm_lang_fallback = cohort_dict.get((due_u, mode_u, fallback_lang))
+                if (
+                    comm_lang_fallback
+                    and validate_template_due_type_consistency(comm_lang_fallback, due_u)
+                    and validate_template_mode_consistency(comm_lang_fallback, mode_u)
+                    and validate_template_language_consistency(comm_lang_fallback, lang_u)
+                ):
+                    return comm_lang_fallback, "COMM_LANG_FALLBACK", f"Language '{lang_u}' fell back to communication default '{comm_lang_fallback}'"
 
     # Step 4: Fallback to digital_rules database cohort template
     if digital_rules_lookup is not None:
@@ -1736,21 +1745,24 @@ def resolve_template_name_with_status(
         ):
             return db_exact, "DB_COHORT_MATCH", f"Matched active digital_rules table for ({due_u}, {mode_u}, {lang_u})"
 
-        for fallback_lang in ("DEFAULT", "ENGLISH", ""):
-            db_fallback = digital_rules_lookup.get((due_u, mode_u, fallback_lang))
-            if (
-                db_fallback
-                and validate_template_due_type_consistency(db_fallback, due_u)
-                and validate_template_mode_consistency(db_fallback, mode_u)
-                and validate_template_language_consistency(db_fallback, lang_u)
-            ):
-                return db_fallback, "DB_LANG_FALLBACK", f"Language '{lang_u}' fell back to active digital_rules default '{db_fallback}'"
+        # Language fallback to DEFAULT / ENGLISH in digital_rules strictly for English predictions only!
+        if is_english:
+            for fallback_lang in ("DEFAULT", "ENGLISH", ""):
+                db_fallback = digital_rules_lookup.get((due_u, mode_u, fallback_lang))
+                if (
+                    db_fallback
+                    and validate_template_due_type_consistency(db_fallback, due_u)
+                    and validate_template_mode_consistency(db_fallback, mode_u)
+                    and validate_template_language_consistency(db_fallback, lang_u)
+                ):
+                    return db_fallback, "DB_LANG_FALLBACK", f"Language '{lang_u}' fell back to active digital_rules default '{db_fallback}'"
 
         # Mode fallback strictly within SAME due_type (NEVER cross due_types) AND same language
         for k, iter_val in digital_rules_lookup.items():
             if isinstance(k, tuple) and len(k) == 3 and not str(k[0]).startswith("RULE_"):
                 d, m, l = k
-                if d == due_u and m == mode_u and (l == lang_u or l in ("DEFAULT", "")) and iter_val:
+                lang_match = (l == lang_u) if not is_english else (l == lang_u or l in ("DEFAULT", ""))
+                if d == due_u and m == mode_u and lang_match and iter_val:
                     if (
                         validate_template_due_type_consistency(iter_val, due_u)
                         and validate_template_mode_consistency(iter_val, mode_u)
@@ -1774,11 +1786,13 @@ def resolve_template_name_with_status(
 
         if mode_u not in available_modes:
             reason = f"No communication template or digital rule found for mode '{mode_u}' under due_type '{due_u}' (No active digital rule found; active modes in {due_u}: {sorted(available_modes) or 'none'})"
+        elif not is_english:
+            reason = f"No matching template found for regional language '{lang_u}' under ({due_u}, {mode_u}) and regional predictions do not fall back to English/DEFAULT"
         else:
             reason = f"No matching template for ({due_u}, {mode_u}, {lang_u}) and no default in communications or digital_rules (active=True check failed or rule missing)"
         return "", "FAILED", reason
 
-    # Offline pure fallback
+    # Offline pure fallback (only when no communications or digital_rules tables are loaded)
     return _template_name(due_type=due_type, mode=mode, language=language), "SYNTHESIZED", "Offline synthesized fallback"
 
 
@@ -2467,7 +2481,8 @@ def _mapping_prediction_reason(row: pd.Series, context_lookup: dict[str, dict[st
     time_str = _format_time_display(time_val)
     time_part = f" at {time_str}" if time_str else ""
     lang = str(row.get("language", "English")).title()
-    risk = str(row.get("risk", context.get("risk", "LOW"))).upper()
+    risk_raw = str(row.get("risk", context.get("risk", "LOW"))).upper().strip()
+    risk = "LOW" if risk_raw in ("UNKNOWN", "LR", "", "NULL", "NAN", "NONE", "<NA>") else risk_raw
     due_type = str(row.get("due_type", "scheduled")).title()
     date_val = str(row.get("date", ""))
 
@@ -2728,8 +2743,11 @@ def _build_campaign_assignment_groups(
     days_to_process = [d for d in (campaign_days or ALL_CAMPAIGN_DAYS) if d in df.columns]
     for _, row in df.iterrows():
         loan_number = str(row["Loan_number"])
-        risk = str(row.get("SOURCE_RISK", row.get("RISK", "LOW"))).upper()
-        risk_code = RISK_CODES.get(risk, "LR")
+        risk = str(row.get("SOURCE_RISK", row.get("RISK", "LOW"))).upper().strip()
+        if risk in ("UNKNOWN", "NULL", "NONE", "NAN", "", "<NA>"):
+            risk_code = "LR"
+        else:
+            risk_code = RISK_CODES.get(risk, "LR")
         for day in days_to_process:
             raw_val = str(row.get(day, ""))
             if single_communication_per_day:

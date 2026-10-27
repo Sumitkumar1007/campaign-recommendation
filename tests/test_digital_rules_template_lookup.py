@@ -66,7 +66,7 @@ def test_resolve_template_name_with_digital_rules():
     )
     assert name_cohort == "CUSTOM_SMS_RULE_101_ENG"
 
-    # Test language fallback in digital_rules_lookup (e.g. TELUGU falls back to DEFAULT)
+    # Test language fallback in digital_rules_lookup (regional predictions must NEVER fall back to DEFAULT or other languages)
     name_lang_fallback = resolve_template_name(
         loan_number="ACC_UNKNOWN",
         due_type="PREDUE",
@@ -74,7 +74,7 @@ def test_resolve_template_name_with_digital_rules():
         language="TELUGU",
         digital_rules_lookup=digital_rules_lookup,
     )
-    assert name_lang_fallback == "CUSTOM_WHATSAPP_RULE_102_HIN"
+    assert name_lang_fallback == ""
 
     # When no rule exists in digital_rules_lookup, synthesized fallback is commented out -> returns ""
     name_empty = resolve_template_name(
@@ -365,8 +365,9 @@ def test_resolve_template_name_priority_order():
     assert t2 == "COMM_PREDUE_WHATSAPP_ENG"
     assert s2 == "COMM_COHORT_MATCH"
 
-    # Priority 3: Language fallback in COMM_COHORT (TELUGU -> DEFAULT)
-    t3, s3, _ = resolve_template_name_with_status(
+    # Priority 3: Language fallback in COMM_COHORT - strictly for English / DEFAULT
+    # Regional (TELUGU) must NEVER fall back to DEFAULT or ENGLISH; returns blank and FAILED
+    t3, s3, reason3 = resolve_template_name_with_status(
         loan_number="ACC_NEW",
         due_type="PREDUE",
         mode="WHATSAPP",
@@ -374,8 +375,23 @@ def test_resolve_template_name_priority_order():
         digital_rule_id_map=digital_rule_id_map,
         digital_rules_lookup=digital_rules_lookup,
     )
-    assert t3 == "COMM_PREDUE_WHATSAPP_ENG"
-    assert s3 == "COMM_LANG_FALLBACK"
+    assert t3 == ""
+    assert s3 == "FAILED"
+    assert "regional language 'TELUGU'" in reason3
+
+    # English query falls back to COMM_LANG_FALLBACK when exact language key is missing but DEFAULT exists
+    t3_def, s3_def, _ = resolve_template_name_with_status(
+        loan_number="ACC_NEW",
+        due_type="PREDUE",
+        mode="WHATSAPP",
+        language="ENGLISH",
+        digital_rule_id_map={
+            ("COMM_COHORT", "PREDUE", "WHATSAPP", "DEFAULT"): "COMM_PREDUE_WHATSAPP_ENG",
+        },
+        digital_rules_lookup=digital_rules_lookup,
+    )
+    assert t3_def == "COMM_PREDUE_WHATSAPP_ENG"
+    assert s3_def == "COMM_LANG_FALLBACK"
 
     # Priority 4: Database digital_rules cohort fallback (mode not in comms)
     t4, s4, _ = resolve_template_name_with_status(
@@ -454,6 +470,11 @@ def test_validate_template_language_consistency():
     # Regional language rejects conflicting regional template
     assert validate_template_language_consistency("Marathi_Backup_Field_agency_WA_Template", "HINDI") is False
     assert validate_template_language_consistency("PREDUE_AIML_SMS_HINDI", "MARATHI") is False
+
+    # Regional language rejects English templates (must never fall back to English)
+    assert validate_template_language_consistency("English-Pre Due Date Reminder", "MARATHI") is False
+    assert validate_template_language_consistency("PREDUE_AIML_SMS_ENGLISH", "REGIONAL") is False
+    assert validate_template_language_consistency("ENGLISH TEST WHATSAPP", "TELUGU") is False
 
 
 def test_resolve_template_name_rejects_incompatible_rule_language():
@@ -710,4 +731,41 @@ def test_resolve_template_name_rejects_historical_rule_language_mismatch():
     assert status == "DB_COHORT_MATCH"
 
 
+def test_regional_prediction_never_falls_back_to_default_or_english():
+    """
+    Guarantees:
+    If a regional/non-English prediction (e.g., MARATHI, REGIONAL, TELUGU, GUJARATI)
+    lacks an exact template for (due_type, mode, language) in communications data
+    or digital_rules, it must NEVER fall back to DEFAULT, ENGLISH, or any English template.
+    It must return blank ("") with status "FAILED".
+    """
+    # Digital rules and comms only have ENGLISH and DEFAULT templates
+    digital_rules_lookup = {
+        ("PREDUE", "SMS", "ENGLISH"): "PREDUE_AIML_SMS_ENGLISH",
+        ("PREDUE", "SMS", "DEFAULT"): "PREDUE_AIML_SMS_ENGLISH",
+        ("PREDUE", "WHATSAPP", "ENGLISH"): "PREDUE_AIML_WA_ENGLISH",
+        ("PREDUE", "WHATSAPP", "DEFAULT"): "PREDUE_AIML_WA_ENGLISH",
+        ("RULE_META", "201"): {
+            "due_type": "PREDUE",
+            "mode": "SMS",
+            "language": "ENGLISH",
+            "iteration": "PREDUE_AIML_SMS_ENGLISH",
+        },
+    }
+    digital_rule_id_map = {
+        ("COMM_COHORT", "PREDUE", "SMS", "ENGLISH"): "PREDUE_AIML_SMS_ENGLISH",
+        ("COMM_COHORT", "PREDUE", "SMS", "DEFAULT"): "PREDUE_AIML_SMS_ENGLISH",
+    }
 
+    for regional_lang in ["REGIONAL", "MARATHI", "GUJARATI", "TELUGU", "TAMIL", "HINDI", "KANNADA"]:
+        template, status, reason = resolve_template_name_with_status(
+            loan_number="ACC_REGIONAL_TEST",
+            due_type="PREDUE",
+            mode="SMS",
+            language=regional_lang,
+            digital_rule_id_map=digital_rule_id_map,
+            digital_rules_lookup=digital_rules_lookup,
+        )
+        assert template == "", f"Expected blank template for {regional_lang}, got '{template}'"
+        assert status == "FAILED", f"Expected FAILED status for {regional_lang}, got '{status}'"
+        assert "regional predictions do not fall back to English/DEFAULT" in reason

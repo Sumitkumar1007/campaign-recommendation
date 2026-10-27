@@ -51,13 +51,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def normalize_risk(series: pd.Series) -> pd.Series:
-    return (
-        series.fillna("UNKNOWN")
-        .astype(str)
-        .str.strip()
-        .replace({"": "UNKNOWN"})
-        .str.upper()
-    )
+    cleaned = series.fillna("UNKNOWN").astype(str).str.strip().str.upper()
+    return cleaned.replace({
+        "": "UNKNOWN",
+        "NAN": "UNKNOWN",
+        "NONE": "UNKNOWN",
+        "NULL": "UNKNOWN",
+        "<NA>": "UNKNOWN",
+    })
 
 
 def main() -> None:
@@ -81,7 +82,6 @@ def main() -> None:
 
     df = df.copy()
     df["RISK"] = normalize_risk(df["RISK"])
-    df = df[df["RISK"].ne("UNKNOWN")].copy()
     df["PREDICTED_STRATEGY"] = (
         df["PREDICTED_STRATEGY"]
         .fillna("-")
@@ -89,7 +89,14 @@ def main() -> None:
         .str.replace(r"^VOICE-", "IVR-", regex=True)
     )
 
-    risk_df = df.groupby([key_column, "MONTH"])["RISK"].last().reset_index()
+    df_sorted = df.copy()
+    df_sorted["_is_known"] = df_sorted["RISK"].ne("UNKNOWN").astype(int)
+    risk_df = (
+        df_sorted.sort_values([key_column, "MONTH", "_is_known"], ascending=[True, True, False])
+        .drop_duplicates(subset=[key_column, "MONTH"], keep="first")
+        [[key_column, "MONTH", "RISK"]]
+        .reset_index(drop=True)
+    )
 
     wide = (
         df.pivot_table(

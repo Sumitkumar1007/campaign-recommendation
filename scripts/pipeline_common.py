@@ -438,7 +438,10 @@ def apply_predue_risk_rules(
 
     for row_pos, (idx, row) in enumerate(df.iterrows()):
         risk_raw = str(row[risk_col]).upper().strip() if risk_col and pd.notna(row[risk_col]) else "LOW"
-        limits = PREDUE_LIMITS_BY_RISK.get(risk_raw, PREDUE_LIMITS_BY_RISK["LOW"])
+        if risk_raw in ("", "NAN", "NONE", "NULL", "<NA>", "UNKNOWN", "LR"):
+            limits = PREDUE_LIMITS_BY_RISK["LOW"]
+        else:
+            limits = PREDUE_LIMITS_BY_RISK.get(risk_raw, PREDUE_LIMITS_BY_RISK["LOW"])
         # If fewer pre-due days are configured than target_exact, cap target at total available
         target_exact = min(limits["target_exact"], len(active_predue_cols))
 
@@ -675,7 +678,14 @@ def prepare_next_month_dataset(
 def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
     active_key = "ENTITY_KEY" if "ENTITY_KEY" in df.columns else "APAC_CARD_NUMBER"
     feature_df = df.drop(columns=NON_FEATURE_COLUMNS, errors="ignore").copy()
-    feature_df["RISK"] = feature_df["RISK"].fillna("UNKNOWN")
+    feature_df["RISK"] = (
+        feature_df["RISK"]
+        .fillna("UNKNOWN")
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .replace({"": "UNKNOWN", "NAN": "UNKNOWN", "NONE": "UNKNOWN", "NULL": "UNKNOWN", "<NA>": "UNKNOWN"})
+    )
     feature_df["SOURCE_MONTH"] = feature_df["SOURCE_MONTH"].fillna("UNKNOWN")
     feature_df = pd.get_dummies(
         feature_df,
