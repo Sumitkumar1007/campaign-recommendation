@@ -29,6 +29,7 @@ from pipeline_common import (
     predict_top_k_by_risk,
     prepare_next_month_dataset,
     readable_strategy,
+    snap_prediction_dataframe_to_window,
 )
 from project_paths import (
     CASE_DATA_DIR,
@@ -112,6 +113,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=env_flag("MULTIMODE_POSTDUE", env_flag("STRATEGY_MULTIMODE_POSTDUE", default=False)),
         help="Predict 3 distinct modes (SMS, WhatsApp, Voice) per post-due day [default: False, or MULTIMODE_POSTDUE env].",
+    )
+    parser.add_argument(
+        "--step-hours",
+        type=int,
+        default=None,
+        help="Step hours between send windows (e.g. 1, 2, 3). Overrides config-file send_hour_window.step_hours.",
     )
     parser.add_argument(
         "--log-file",
@@ -567,12 +574,12 @@ def main() -> None:
                 len(bundle["feature_columns"]),
             )
 
+        app_config = load_default_config(args.config_file) if getattr(args, "config_file", None) else {}
         if args.allowed_day_offsets is not None and len(args.allowed_day_offsets) > 0:
             parsed_offsets = [parse_day_offset(o) for o in args.allowed_day_offsets]
             allowed_offsets = [o for o in parsed_offsets if o is not None and o != 0]
             logger.info("Using CLI allowed_day_offsets: %s", allowed_offsets)
         else:
-            app_config = load_default_config(args.config_file) if getattr(args, "config_file", None) else {}
             allowed_offsets = app_config.get("allowed_day_offsets")
         allowed_day_labels = set(offsets_to_day_columns(allowed_offsets)) if allowed_offsets is not None else set(DAY_COLUMNS)
         if allowed_offsets is not None:
@@ -580,6 +587,11 @@ def main() -> None:
             logger.info("Using configured allowed day offsets: %s -> %s (columns=%s)", allowed_offsets, sorted(allowed_day_labels), configured_day_cols)
         else:
             configured_day_cols = list(SCHEDULE_DAY_COLUMNS)
+
+        send_hour_window = dict(app_config.get("send_hour_window") or {"start_hour": 9, "end_hour": 18, "step_hours": 1})
+        if getattr(args, "step_hours", None) is not None:
+            send_hour_window["step_hours"] = int(args.step_hours)
+        logger.info("Using send_hour_window for prediction snapping: %s", send_hour_window)
 
         with log_step(logger, "prepare_dataset", feature_file=args.feature_file, schedule_file=args.schedule_file):
             dataset = prepare_next_month_dataset(
@@ -839,6 +851,14 @@ def main() -> None:
                 postdue_days=active_postdue,
                 allow_multimode=getattr(args, "multimode_postdue", False),
             )
+
+            # 5.5 Snap strategy hours to configured window (e.g. step_hours: 3 -> 9AM, 12PM, 3PM, 6PM)
+            if send_hour_window:
+                final_prediction_output = snap_prediction_dataframe_to_window(
+                    final_prediction_output,
+                    send_hour_window=send_hour_window,
+                    day_columns=configured_day_cols,
+                )
 
             # 6. Rebuild final PREDICTION_REASON matching final recommendations
             final_reasons = []

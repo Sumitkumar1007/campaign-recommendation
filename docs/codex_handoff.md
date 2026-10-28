@@ -89,5 +89,6 @@ Campaign recommendation ML pipeline with MCollect Digital scheduler integration.
 - Strict regional language template protection: regional predictions (Marathi, Hindi, Tamil, Telugu, etc.) never fall back to DEFAULT or ENGLISH templates in `digital_rules`.
 - Missing communication data resolved: retained `UNKNOWN` risk communication events in `generate_strategy_dataset.py`, with safe mapping to `LR` (Low Risk) in campaign grouping.
 - Two-stage prediction outputs: `<stem>_raw.csv` (unfiltered) and `<stem>.csv` (business-filtered).
-- Comprehensive branch-wise logic and changelog maintained in `docs/csb_client_branch_and_postdue_logic_documentation.md` (Version 1.1, 197 passing tests).
+- Dynamic `send_hour_window.step_hours` prediction snapping: Keeps `<stem>_raw.csv` untouched with original 1-hour steps for auditability, while `<stem>.csv`, cold-start fallbacks, reasons, and schedulers are snapped cleanly to candidate step hours (e.g., 3-hour steps: 9AM, 12PM, 3PM, 6PM).
+- Comprehensive branch-wise logic and changelog maintained in `docs/csb_client_branch_and_postdue_logic_documentation.md` (Version 1.1, 205 passing tests).
 

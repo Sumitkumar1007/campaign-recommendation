@@ -13,9 +13,14 @@ if str(SCRIPTS_DIR) not in sys.path:
 from pipeline_common import (
     apply_predue_risk_rules,
     day_label_to_offset,
+    format_hour_label,
     offset_to_day_label,
     offsets_to_day_columns,
+    parse_hour_to_int,
     snap_hour_to_window,
+    snap_prediction_dataframe_to_window,
+    snap_strategy_to_window,
+    snap_strategy_token_to_window,
 )
 from run_monthly_inference_pipeline import (
     _format_scheduler_hour,
@@ -1224,6 +1229,286 @@ def test_apply_non_working_day_suppressions_preserves_extended_window(tmp_path: 
     for day in days_d5_to_d10:
         assert day in counts_xl.columns, f"{day} should be preserved in summary counts post-suppression"
     assert "D+11" not in counts_xl.columns
+
+
+def test_format_hour_label_and_parse_hour_to_int():
+    assert format_hour_label(9) == "9AM"
+    assert format_hour_label(12) == "12PM"
+    assert format_hour_label(13) == "1PM"
+    assert format_hour_label(15) == "3PM"
+    assert format_hour_label(18) == "6PM"
+
+    assert parse_hour_to_int("9AM") == 9
+    assert parse_hour_to_int("10AM") == 10
+    assert parse_hour_to_int("12PM") == 12
+    assert parse_hour_to_int("1PM") == 13
+    assert parse_hour_to_int("3PM") == 15
+    assert parse_hour_to_int("6PM") == 18
+    assert parse_hour_to_int("8-11") == 9
+    assert parse_hour_to_int("12-3") == 12
+    assert parse_hour_to_int("4-7") == 16
+    assert parse_hour_to_int("14") == 14
+
+
+def test_snap_strategy_to_window_step_3():
+    # Window 9 to 18 with 3-hour steps -> candidate hours [9, 12, 15, 18]
+    window = {"start_hour": 9, "end_hour": 18, "step_hours": 3}
+
+    # 9AM stays 9AM
+    assert snap_strategy_to_window("SMS-9AM-ENGLISH", window) == "SMS-9AM-ENGLISH"
+    # 10AM snaps to 9AM
+    assert snap_strategy_to_window("SMS-10AM-ENGLISH", window) == "SMS-9AM-ENGLISH"
+    # 11AM snaps to 12PM
+    assert snap_strategy_to_window("SMS-11AM-ENGLISH", window) == "SMS-12PM-ENGLISH"
+    # 12PM stays 12PM
+    assert snap_strategy_to_window("WH-12PM-HINDI", window) == "WH-12PM-HINDI"
+    # 1PM (13) snaps to 12PM (12)
+    assert snap_strategy_to_window("WH-1PM-HINDI", window) == "WH-12PM-HINDI"
+    # 2PM (14) snaps to 3PM (15)
+    assert snap_strategy_to_window("VOICE-2PM-MARATHI", window) == "VOICE-3PM-MARATHI"
+    # 3PM (15) stays 3PM
+    assert snap_strategy_to_window("VOICE-3PM-MARATHI", window) == "VOICE-3PM-MARATHI"
+    # 4PM (16) snaps to 3PM (15)
+    assert snap_strategy_to_window("VOICE_BOT-4PM-ENGLISH", window) == "VOICE_BOT-3PM-ENGLISH"
+    # 5PM (17) snaps to 6PM (18)
+    assert snap_strategy_to_window("VOICE_BOT-5PM-ENGLISH", window) == "VOICE_BOT-6PM-ENGLISH"
+    # 6PM (18) stays 6PM
+    assert snap_strategy_to_window("VOICE_BOT-6PM-ENGLISH", window) == "VOICE_BOT-6PM-ENGLISH"
+
+    # Multi-mode pipe with - rank preservation
+    raw_multi = "SMS-10AM-ENGLISH|WH-11AM-HINDI|-"
+    assert snap_strategy_to_window(raw_multi, window) == "SMS-9AM-ENGLISH|WH-12PM-HINDI|-"
+
+    # Deduplication if two tokens snap to the exact same strategy
+    raw_dup = "SMS-10AM-ENGLISH|SMS-9AM-ENGLISH"
+    assert snap_strategy_to_window(raw_dup, window) == "SMS-9AM-ENGLISH"
+
+    # Blank / dash
+    assert snap_strategy_to_window("-", window) == "-"
+    assert snap_strategy_to_window("", window) == "-"
+    assert snap_strategy_to_window(None, window) == "-"
+
+
+def test_snap_prediction_dataframe_to_window():
+    window = {"start_hour": 9, "end_hour": 18, "step_hours": 3}
+    df = pd.DataFrame(
+        [
+            {
+                "Loan_number": "ACC_1",
+                "D-5": "SMS-10AM-ENGLISH",
+                "D-2": "WH-1PM-HINDI",
+                "D+1": "VOICE-2PM-ENGLISH|SMS-10AM-ENGLISH",
+            },
+            {
+                "Loan_number": "ACC_2",
+                "D-5": "-",
+                "D-2": "SMS-11AM-ENGLISH",
+                "D+1": "-",
+            },
+        ]
+    )
+
+    snapped_df = snap_prediction_dataframe_to_window(df, window, day_columns=["D-5", "D-2", "D+1"])
+    assert snapped_df.at[0, "D-5"] == "SMS-9AM-ENGLISH"
+    assert snapped_df.at[0, "D-2"] == "WH-12PM-HINDI"
+    assert snapped_df.at[0, "D+1"] == "VOICE-3PM-ENGLISH|SMS-9AM-ENGLISH"
+    assert snapped_df.at[1, "D-5"] == "-"
+    assert snapped_df.at[1, "D-2"] == "SMS-12PM-ENGLISH"
+    assert snapped_df.at[1, "D+1"] == "-"
+
+
+def test_predict_catboost_cli_step_hours_arg():
+    from predict_next_month_strategy_catboost import parse_args
+
+    test_args = [
+        "predict_next_month_strategy_catboost.py",
+        "--feature-file", "features.csv",
+        "--schedule-file", "schedules.csv",
+        "--model-file", "model.joblib",
+        "--base-population-file", "cases.csv",
+        "--prediction-file", "preds.csv",
+        "--step-hours", "3",
+    ]
+    monkeypatch_argv = sys.argv
+    try:
+        sys.argv = test_args
+        args = parse_args()
+        assert args.step_hours == 3
+    finally:
+        sys.argv = monkeypatch_argv
+
+
+def test_predict_catboost_snaps_final_prediction_and_leaves_raw_untouched(tmp_path: Path, monkeypatch):
+    import json
+    import joblib
+    from sklearn.preprocessing import LabelEncoder
+    from model_fallbacks import ConstantDayModel
+    from predict_next_month_strategy_catboost import main as predict_main
+
+    le = LabelEncoder()
+    le.fit(["-", "SMS-10AM-ENGLISH"])
+    day_cols = ["D-5", "D-4", "D-3", "D-2", "D-1", "D+1", "D+2", "D+3", "D+4", "D+5"]
+    models = {d: ConstantDayModel(1, len(le.classes_)) for d in day_cols}
+    encoders = {d: le for d in day_cols}
+
+    bundle = {
+        "models": models,
+        "label_encoders": encoders,
+        "feature_columns": ["SMS_TOTAL_INTENSITY_M1", "RISK_LOW"],
+        "history_window_months": 1,
+        "target_offset_months": 1,
+    }
+    model_file = tmp_path / "model.joblib"
+    joblib.dump(bundle, model_file)
+
+    config_file = tmp_path / "test_config.json"
+    config_file.write_text(json.dumps({
+        "allowed_day_offsets": [-5, -1, 1],
+        "send_hour_window": {
+            "start_hour": 9,
+            "end_hour": 18,
+            "step_hours": 3
+        }
+    }))
+
+    feat_file = tmp_path / "features.csv"
+    pd.DataFrame([
+        {
+            "ENTITY_KEY": "ACC_001",
+            "MONTH": "SEP-2026",
+            "RISK": "LOW",
+            "VERTICAL": "LAP",
+            "SMS_TOTAL_INTENSITY": 1,
+            "SMS_TOTAL_INTENSITY_M1": 1,
+            "RISK_LOW": 1,
+        }
+    ]).to_csv(feat_file, index=False)
+
+    sched_file = tmp_path / "schedules.csv"
+    pd.DataFrame([
+        {
+            "ENTITY_KEY": "ACC_001",
+            "MONTH": "SEP-2026",
+            "TARGET_MONTH": "OCT-2026",
+            "TARGET_MONTH_PERIOD": "2026-10",
+            "TARGET_RISK": "LOW",
+            "DAY": "D-5",
+            "PREDICTED_STRATEGY": "SMS-10AM-ENGLISH",
+        }
+    ]).to_csv(sched_file, index=False)
+
+    base_cases = tmp_path / "cases.csv"
+    pd.DataFrame([
+        {
+            "SOURCE_MONTH": "SEP-2026",
+            "apac_card_number": "ACC_001",
+            "risk": "LOW",
+            "vertical": "LAP",
+            "collectable_amount": "1000",
+            "emi_date": "10/09/2026",
+        }
+    ]).to_csv(base_cases, index=False)
+
+    pred_file = tmp_path / "predictions_oct.csv"
+
+    argv = [
+        "predict_next_month_strategy_catboost.py",
+        "--feature-file", str(feat_file),
+        "--schedule-file", str(sched_file),
+        "--model-file", str(model_file),
+        "--base-population-file", str(base_cases),
+        "--prediction-file", str(pred_file),
+        "--prediction-source-months", "SEP-2026",
+        "--config-file", str(config_file),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    predict_main()
+
+    raw_file = tmp_path / "predictions_oct_raw.csv"
+    assert raw_file.exists()
+    assert pred_file.exists()
+
+    raw_df = pd.read_csv(raw_file, dtype=str)
+    final_df = pd.read_csv(pred_file, dtype=str)
+
+    # Raw file keeps 10AM (1-hr step from model)
+    assert raw_df.iloc[0]["D-5"] == "SMS-10AM-ENGLISH"
+
+    # Final file has snapped 9AM (3-hr step candidate)
+    assert final_df.iloc[0]["D-5"] == "SMS-9AM-ENGLISH"
+
+    # Reason in final file matches 9AM
+    reason_json = json.loads(final_df.iloc[0]["PREDICTION_REASON"])
+    assert "9AM" in reason_json["D-5"]
+
+
+def test_identify_new_customer_fallbacks_snaps_hours_to_send_hour_window(tmp_path: Path, monkeypatch):
+    import json
+    from identify_new_customer_fallbacks import main as fallback_main
+
+    config_file = tmp_path / "test_config.json"
+    config_file.write_text(json.dumps({
+        "allowed_day_offsets": [-5, -1, 1],
+        "send_hour_window": {
+            "start_hour": 9,
+            "end_hour": 18,
+            "step_hours": 3
+        }
+    }))
+
+    pred_file = tmp_path / "preds.csv"
+    pd.DataFrame([
+        {
+            "Loan_number": "ACC_NEW",
+            "SOURCE_RISK": "LOW",
+            "VERTICAL": "LAP",
+            "MONTH": "OCT-2026",
+            "SOURCE_MONTH_USED": "SEP-2026",
+            "D-5": "",
+            "D-1": "",
+            "D+1": "",
+            "PREDICTION_REASON": "{}",
+            "IS_NEW_CUSTOMER": "True",
+        }
+    ]).to_csv(pred_file, index=False)
+
+    cases_file = tmp_path / "cases.csv"
+    pd.DataFrame([
+        {
+            "apacCardNumber": "ACC_NEW",
+            "originalRisk": "LOW",
+            "vertical": "LAP",
+        }
+    ]).to_csv(cases_file, index=False)
+
+    sched_file = tmp_path / "sched.csv"
+    pd.DataFrame([
+        {
+            "RISK": "LOW",
+            "D-5": "SMS-10AM-ENGLISH",
+            "D-1": "WH-1PM-HINDI",
+            "D+1": "VOICE-4PM-ENGLISH",
+        }
+    ]).to_csv(sched_file, index=False)
+
+    output_file = tmp_path / "cold_start_output.csv"
+
+    argv = [
+        "identify_new_customer_fallbacks.py",
+        "--cases-file", str(cases_file),
+        "--schedule-file", str(sched_file),
+        "--output-file", str(output_file),
+        "--prediction-file", str(pred_file),
+        "--config-file", str(config_file),
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    fallback_main()
+
+    res_df = pd.read_csv(pred_file, dtype=str)
+    # With step_hours=3, 10AM -> 9AM, 1PM -> 12PM, 4PM -> 3PM
+    assert res_df.iloc[0]["D-5"] == "SMS-9AM-ENGLISH"
+    assert res_df.iloc[0]["D-1"] == "WH-12PM-HINDI"
+    assert res_df.iloc[0]["D+1"] == "SMS-9AM-ENGLISH|WH-12PM-ENGLISH|VOICE-3PM-ENGLISH"
 
 
 

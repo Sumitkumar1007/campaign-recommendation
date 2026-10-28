@@ -13,12 +13,17 @@ from pipeline_common import (
     PREDUE_DAY_COLUMNS,
     TARGET_POSTDUE_MODES,
     apply_predue_risk_rules,
+    candidate_hours,
     extract_canonical_mode_from_label,
     extract_hour_from_label,
+    format_hour_label,
     load_default_config,
     offsets_to_day_columns,
     parse_day_offset,
+    parse_hour_to_int,
     readable_strategy,
+    snap_hour_to_window,
+    snap_strategy_to_window,
 )
 from env_utils import env_flag, load_dotenv
 from project_paths import CASE_DATA_DIR, COMMUNICATION_DATA_DIR, REPO_ROOT, SCHEDULE_DATA_DIR, ensure_parent_dir
@@ -190,6 +195,7 @@ def build_postdue_multimode_strategy(
     values: pd.Series | None,
     target_modes: list[str] | None = None,
     default_fallbacks: dict[str, str] | None = None,
+    send_hour_window: dict[str, int] | None = None,
 ) -> str:
     """
     Constructs a multi-mode fallback strategy for a post-due day
@@ -228,6 +234,14 @@ def build_postdue_multimode_strategy(
 
     default_hour_slots = {"SMS": "10AM", "WHATSAPP": "1PM", "VOICE": "4PM"}
     allowed_fallback_hours = ["10AM", "1PM", "4PM", "11AM", "12PM", "2PM", "3PM", "5PM"]
+    if send_hour_window is not None:
+        cands = [format_hour_label(h) for h in candidate_hours(send_hour_window)]
+        if cands:
+            allowed_fallback_hours = cands
+        default_hour_slots = {
+            m: format_hour_label(snap_hour_to_window(parse_hour_to_int(h) or 12, send_hour_window))
+            for m, h in default_hour_slots.items()
+        }
 
     used_hours: set[str] = set()
     chosen_strategies: list[str] = []
@@ -261,7 +275,10 @@ def build_postdue_multimode_strategy(
 
         chosen_strategies.append(chosen_token)
 
-    return "|".join(chosen_strategies) if chosen_strategies else "-"
+    res = "|".join(chosen_strategies) if chosen_strategies else "-"
+    if send_hour_window is not None:
+        res = snap_strategy_to_window(res, send_hour_window)
+    return res
 
 
 def build_average_strategy_by_risk(
@@ -269,6 +286,7 @@ def build_average_strategy_by_risk(
     multimode_postdue: bool = True,
     apply_predue_rules: bool = True,
     allowed_predue_days: list[str] | None = None,
+    send_hour_window: dict[str, int] | None = None,
 ) -> dict[str, dict[str, str]]:
     schedule = pd.read_csv(schedule_file, dtype=str)
     if "RISK" not in schedule.columns:
@@ -333,6 +351,11 @@ def build_average_strategy_by_risk(
                     if col in DAY_COLUMNS:
                         average_by_risk[risk_val][col] = str(row[col])
 
+    if send_hour_window is not None:
+        for r_k in average_by_risk:
+            for d_k in average_by_risk[r_k]:
+                average_by_risk[r_k][d_k] = snap_strategy_to_window(average_by_risk[r_k][d_k], send_hour_window)
+
     return average_by_risk
 
 
@@ -340,6 +363,7 @@ def build_fallback_rows(
     new_cases: pd.DataFrame,
     fallback_by_risk: dict[str, dict[str, str]],
     allowed_day_labels: set[str] | None = None,
+    send_hour_window: dict[str, int] | None = None,
 ) -> pd.DataFrame:
     records: list[dict[str, str]] = []
     for case in new_cases.to_dict("records"):
@@ -349,6 +373,8 @@ def build_fallback_rows(
         display_risk = "LOW" if risk in ("UNKNOWN", "NULL", "NONE", "NAN", "") else risk
         for day in DAY_COLUMNS:
             strategy = fallback_by_day.get(day, "-") if (allowed_day_labels is None or day in allowed_day_labels) else "-"
+            if send_hour_window is not None and strategy and strategy != "-":
+                strategy = snap_strategy_to_window(strategy, send_hour_window)
             if strategy and strategy != "-":
                 reason_text = (
                     f"Cold-start fallback: {readable_strategy(strategy)} is recommended based on "
@@ -377,6 +403,7 @@ def apply_fallbacks_to_prediction_file(
     prediction_file: Path,
     fallback_rows: pd.DataFrame,
     allowed_day_labels: set[str] | None = None,
+    send_hour_window: dict[str, int] | None = None,
 ) -> int:
     if not prediction_file.exists() or fallback_rows.empty:
         return 0
@@ -449,6 +476,8 @@ def apply_fallbacks_to_prediction_file(
                     day_reasons[day] = f"No communication scheduled on {day} (outside active prediction window)."
                 else:
                     strat = fallback_map.get((matched_key, day), "-")
+                    if send_hour_window is not None and strat not in ("", "-", "None", "nan"):
+                        strat = snap_strategy_to_window(strat, send_hour_window)
                     if strat not in ("", "-", "None", "nan"):
                         predictions.at[idx, day] = strat
                         day_reasons[day] = day_reason_map.get(
@@ -504,6 +533,8 @@ def apply_fallbacks_to_prediction_file(
                     row_day_reasons[day] = f"No communication scheduled on {day} (outside active prediction window)."
                 else:
                     strat = fallback_map.get((loan, day), "-")
+                    if send_hour_window is not None and strat not in ("", "-", "None", "nan"):
+                        strat = snap_strategy_to_window(strat, send_hour_window)
                     row_dict[day] = strat
                     row_day_reasons[day] = day_reason_map.get(
                         (matched_key, day),
@@ -530,13 +561,14 @@ def main() -> None:
     output_file = ensure_parent_dir(args.output_file)
     communication_files = [Path(path) for path in args.communication_files] or sorted(COMMUNICATION_DATA_DIR.glob("*.csv"))
 
+    app_config = load_default_config(args.config_file) if getattr(args, "config_file", None) else {}
     if args.allowed_day_offsets is not None and len(args.allowed_day_offsets) > 0:
         parsed_offsets = [parse_day_offset(o) for o in args.allowed_day_offsets]
         allowed_offsets = [o for o in parsed_offsets if o is not None and o != 0]
     else:
-        app_config = load_default_config(args.config_file) if getattr(args, "config_file", None) else {}
         allowed_offsets = app_config.get("allowed_day_offsets")
     allowed_day_labels = set(offsets_to_day_columns(allowed_offsets)) if allowed_offsets is not None else None
+    send_hour_window = app_config.get("send_hour_window")
 
     case_apacs = load_case_apacs(cases_file)
     history_apacs = load_history_apacs(communication_files)
@@ -551,10 +583,16 @@ def main() -> None:
         multimode_postdue=getattr(args, "multimode_postdue", True),
         apply_predue_rules=True,
         allowed_predue_days=active_predue_days,
+        send_hour_window=send_hour_window,
     )
-    output = build_fallback_rows(new_cases, fallback_by_risk, allowed_day_labels=allowed_day_labels)
+    output = build_fallback_rows(new_cases, fallback_by_risk, allowed_day_labels=allowed_day_labels, send_hour_window=send_hour_window)
     output.to_csv(output_file, index=False)
-    updated_predictions = apply_fallbacks_to_prediction_file(Path(args.prediction_file), output, allowed_day_labels=allowed_day_labels) if args.prediction_file else 0
+    updated_predictions = apply_fallbacks_to_prediction_file(
+        Path(args.prediction_file),
+        output,
+        allowed_day_labels=allowed_day_labels,
+        send_hour_window=send_hour_window,
+    ) if args.prediction_file else 0
 
     print(
         "New customer fallback summary | "

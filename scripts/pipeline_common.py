@@ -535,6 +535,109 @@ def snap_hour_to_window(hour: int, send_hour_window: dict[str, int]) -> int:
     return min(hours, key=lambda h: (abs(h - hour), h))
 
 
+def format_hour_label(hour: int) -> str:
+    """Formats an integer hour (0-23) to a string like '9AM', '12PM', '3PM'."""
+    suffix = "AM" if hour < 12 else "PM"
+    normalized = hour % 12
+    if normalized == 0:
+        normalized = 12
+    return f"{normalized}{suffix}"
+
+
+def parse_hour_to_int(hour_label: str) -> int | None:
+    """Parses an hour label like '9AM', '12PM', '14', '8-11', 'MORNING' into an integer hour (0-23)."""
+    if not hour_label or pd.isna(hour_label):
+        return None
+    label = str(hour_label).upper().strip()
+    slot_map = {
+        "8-11": "9AM",
+        "12-3": "12PM",
+        "4-7": "4PM",
+        "MORNING": "9AM",
+        "AFTERNOON": "12PM",
+        "EVENING": "4PM",
+    }
+    if label in slot_map:
+        label = slot_map[label]
+
+    if label.isdigit():
+        h = int(label)
+        return max(0, min(23, h))
+
+    parsed = pd.to_datetime(label, format="%I%p", errors="coerce")
+    if not pd.isna(parsed):
+        return int(parsed.hour)
+    return None
+
+
+def snap_strategy_token_to_window(token: str, send_hour_window: dict[str, int]) -> str:
+    """Snaps a single strategy token like 'SMS-10AM-ENGLISH' into the candidate hours of send_hour_window."""
+    token_clean = str(token).strip()
+    if not token_clean or token_clean in ("-", "None", "nan"):
+        return token_clean
+
+    parts = [p.strip() for p in token_clean.split("-") if p.strip()]
+    if len(parts) < 3:
+        return token_clean
+
+    channel = parts[0]
+    language = parts[-1]
+    raw_hour = "-".join(parts[1:-1])
+
+    hour_int = parse_hour_to_int(raw_hour)
+    if hour_int is None:
+        return token_clean
+
+    snapped_hour_int = snap_hour_to_window(hour_int, send_hour_window)
+    snapped_hour_label = format_hour_label(snapped_hour_int)
+
+    return f"{channel}-{snapped_hour_label}-{language}"
+
+
+def snap_strategy_to_window(strategy: str, send_hour_window: dict[str, int]) -> str:
+    """
+    Snaps a strategy entry (single or pipe-separated, e.g. 'SMS-10AM-ENGLISH|WH-11AM-HINDI|-')
+    to the candidate hours of send_hour_window. Deduplicates identical tokens resulting from snapping
+    while preserving non-empty communication or ranking structures.
+    """
+    if not strategy or str(strategy).strip() in ("", "-", "None", "nan") or pd.isna(strategy):
+        return "-"
+    raw_val = str(strategy).strip()
+    tokens = [t.strip() for t in raw_val.split("|")]
+
+    snapped_tokens: list[str] = []
+    seen: set[str] = set()
+    for t in tokens:
+        if not t or t in ("-", "None", "nan"):
+            if "-" not in seen:
+                snapped_tokens.append("-")
+                seen.add("-")
+            continue
+        snapped = snap_strategy_token_to_window(t, send_hour_window)
+        if snapped not in seen:
+            snapped_tokens.append(snapped)
+            seen.add(snapped)
+
+    if not snapped_tokens:
+        return "-"
+    if all(t == "-" for t in snapped_tokens):
+        return "-"
+    return "|".join(snapped_tokens)
+
+
+def snap_prediction_dataframe_to_window(
+    df: pd.DataFrame,
+    send_hour_window: dict[str, int],
+    day_columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """Snaps all strategy columns in a predictions dataframe to the configured send_hour_window."""
+    df = df.copy()
+    cols = [c for c in (day_columns or SCHEDULE_DAY_COLUMNS) if c in df.columns]
+    for col in cols:
+        df[col] = df[col].apply(lambda val: snap_strategy_to_window(val, send_hour_window))
+    return df
+
+
 def month_to_period(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, format="%b-%Y", errors="coerce").dt.to_period("M")
 
