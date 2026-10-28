@@ -89,14 +89,16 @@ def is_sunday(dt: datetime.date) -> bool:
 
 
 def parse_day_offset(day_label: str) -> int:
-    """Parses relative day label like 'D-5' -> -5, 'D+2' -> 2, 'D' -> 0."""
+    """Parses relative day label like 'D-5' -> -5, 'D+2' -> 2, 'D' -> 0, or '5' -> 5."""
     label = str(day_label).strip().upper()
     if label == "D":
         return 0
     match = re.fullmatch(r"D([+-]\d+)", label)
-    if not match:
-        raise ValueError(f"Invalid day label format: {day_label!r}")
-    return int(match.group(1))
+    if match:
+        return int(match.group(1))
+    if re.fullmatch(r"[+-]?\d+", label):
+        return int(label)
+    raise ValueError(f"Invalid day label format: {day_label!r}")
 
 
 def suppress_non_working_days_in_dataframe(

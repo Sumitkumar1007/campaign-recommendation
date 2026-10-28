@@ -53,6 +53,9 @@ def test_parse_day_offset():
     assert parse_day_offset("D") == 0
     assert parse_day_offset("D+1") == 1
     assert parse_day_offset("D+20") == 20
+    assert parse_day_offset("5") == 5
+    assert parse_day_offset("-5") == -5
+    assert parse_day_offset("+10") == 10
 
     with pytest.raises(ValueError):
         parse_day_offset("INVALID")

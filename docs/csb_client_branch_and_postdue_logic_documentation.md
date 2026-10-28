@@ -1,10 +1,10 @@
 # CSB Client: Branch-Wise Updates, Evolution, and Post-Due Prediction Logic
 
-**Document Version:** 1.0  
-**Date:** October 20, 2026  
+**Document Version:** 1.1  
+**Date:** October 27, 2026  
 **Target Environment:** CSB Bank — MCollect Digital Collections & Recommendation Pipeline  
 **Model Version:** CatBoost Strategy Model v1.1.46  
-**Test Suite Coverage:** 172 passed / 172 total tests  
+**Test Suite Coverage:** 197 passed / 197 total tests  
 
 ---
 
@@ -32,13 +32,14 @@ It details:
    - [1.4 Algorithmic Step-by-Step Walkthrough](#14-algorithmic-step-by-step-walkthrough)
    - [1.5 Concrete Numerical Walkthrough with Anti-Collision](#15-concrete-numerical-walkthrough-with-anti-collision)
    - [1.6 Downstream Campaign & Trigger Generation](#16-downstream-campaign--trigger-generation)
+   - [1.7 Probability-Ranked Selection, Fallback Protection & Strict Regional Templates](#17-probability-ranked-selection-fallback-protection--strict-regional-templates)
 2. [CSB Branch Topology & Lineage Map](#2-csb-branch-topology--lineage-map)
 3. [Branch-Wise & Commit-Wise Changelog](#3-branch-wise--commit-wise-changelog)
    - [3.1 Branch: feature/csb_v1.0 (Baseline Foundation)](#31-branch-featurecsb_v10-baseline-foundation)
    - [3.2 Branch: feature/csb-v1.0-updates (Pipeline Hardening)](#32-branch-featurecsb-v10-updates-pipeline-hardening)
    - [3.3 Branch: Production/csb-v1.0 (Template Guardrails & Release)](#33-branch-productioncsb-v10-template-guardrails--release)
    - [3.4 Branch: feature/csb-v1.1 (Next-Gen Staging)](#34-branch-featurecsb-v11-next-gen-staging)
-   - [3.5 Branch: Production/csb-v1.1 (Dynamic Window & Multi-Mode)](#35-branch-productioncsb-v11-dynamic-window--multi-mode)
+   - [3.5 Branch: Production/csb-v1.1 (Dynamic Window, Multi-Mode, Probability Ranking & Template Hardening)](#35-branch-productioncsb-v11-dynamic-window-multi-mode-probability-ranking--template-hardening)
 4. [Comparative Matrix Across Branches](#4-comparative-matrix-across-branches)
 5. [Summary of Production Verification & Audit Metrics](#5-summary-of-production-verification--audit-metrics)
 
@@ -233,6 +234,30 @@ if single_communication_per_day:
 
 ---
 
+### 1.7 Probability-Ranked Selection, Fallback Protection & Strict Regional Templates
+
+In the latest `Production/csb-v1.1` releases, several core algorithmic safeguards were integrated across feature engineering, inference, and template resolution:
+
+1. **Model Probability-Ranked Pre-Due Day Selection**:
+   - *Legacy Limitation*: Earlier pre-due risk rules (`apply_predue_risk_rules`) enforced risk limits (Low: 2, Med: 3, High: 4) using chronological or positional truncation (`D-1 -> D-2 -> D-3 -> D-4`). When an account had multiple active touches, positional ordering caused $D-1$ or $D-4$ to be mechanically dropped, regardless of model confidence.
+   - *Probability-Driven Optimization*: In `pipeline_common.py`, `predict_best_day_strategy()` returns per-account class probabilities for each day. Candidate days ($D-4 \dots D-1$) are dynamically ranked by **highest model probability** ($P_{\text{strategy}}$). The pipeline preserves the touches where the machine learning model has peak confidence of engagement, ensuring optimal contact timing.
+
+2. **Post-Due 2nd Best Fallback Protection**:
+   - In multi-class post-due day models, if the top predicted class is `-` (blank/no communication), the pipeline inspects model class probabilities. If multiple classes exist and valid non-blank classes are available, the pipeline automatically selects the 2nd best (highest probability non-blank) communication strategy. This ensures delinquent borrowers receive actionable outreach rather than being silently omitted.
+
+3. **Mandatory $D-5$ Baseline Model Selection**:
+   - Rather than synthetically assigning a hardcoded string `SMS-11AM-ENGLISH` when $D-5$ predicts blank, the pipeline evaluates model probabilities on $D-5$: if the raw prediction is blank, it selects the model's highest-probability non-blank candidate class for that specific borrower before resorting to default fallbacks.
+
+4. **Strict Regional Language Protection (Zero English Bleed)**:
+   - CSB communicates with borrowers across regional languages (Malayalam, Tamil, Telugu, Hindi, Marathi, etc.). Earlier template resolution could fall back to `DEFAULT` or `ENGLISH` if a regional template was not explicitly defined.
+   - In CSB v1.1, regional language queries are strictly protected: **regional predictions must NEVER fall back to DEFAULT or ENGLISH templates**. If a regional template is missing in `digital_rules`, the resolution intentionally returns `""` with status `FAILED` and an explicit diagnostic reason. This eliminates non-compliant dispatches where a borrower expecting a regional language receives English verbiage.
+
+5. **Preservation of UNKNOWN Risk Communication Events**:
+   - In earlier feature generation, records where `RISK == "UNKNOWN"` were discarded in `generate_strategy_dataset.py`. This caused critical gaps in historical communication extraction.
+   - In CSB v1.1, all communication events are retained, missing risk tiers are gracefully merged with known risk tiers using `_is_known` prioritization, and downstream loan processing safely maps unassigned risk tiers to `LR` (Low Risk) without breaking execution groups.
+
+---
+
 ## 2. CSB Branch Topology & Lineage Map
 
 The branches form a linear, cumulative progression:
@@ -258,9 +283,10 @@ The branches form a linear, cumulative progression:
         Production/csb-v1.0                                    │
           (at 7355b7c)                                         │
                  │                                             │
-                 │ (commit: 41fdf3a + working tree updates)    │
+                 │ (10 commits: 41fdf3a -> 3f98b45)            │
                  ▼                                             ▼
         Production/csb-v1.1 ───────────────────────────────────┘
+          (at 3f98b45)
 ```
 
 ---
@@ -390,46 +416,84 @@ The branches form a linear, cumulative progression:
 
 ---
 
-### 3.5 Branch: `Production/csb-v1.1` (Dynamic Window & Multi-Mode)
+### 3.5 Branch: `Production/csb-v1.1` (Dynamic Window, Multi-Mode, Probability Ranking & Template Hardening)
 - **Git Branch Ref:** `Production/csb-v1.1`
 - **Base Commit:** `7355b7c` (from `Production/csb-v1.0`)
-- **Tip Commit in Git:** `41fdf3a508b5b563fb8bc8d7fcbc847887842f0e`
-- **Active Working Tree:** Contains production v1.1 enhancements (Multi-Mode Postdue, Business Reasoning Overhaul, Auto Class Balancing, `--dry-run` fix).
+- **Tip Commit in Git:** `3f98b453e603cad756e55ca01108ac18b69a8273`
+- **Total Commits on Branch:** 10 commits
+- **Test Suite Status:** 197 passed / 197 total tests
 
-#### 1. Commit `41fdf3a` (*dynamic prediction window resolution from the database*):
-- Implemented automated discovery of dynamic prediction windows from CSB client PostgreSQL table `digital_collections.data_config`.
-- **4-Tier Configuration Hierarchy**:
-  1. CLI Argument: `--allowed-day-offsets` (e.g. `--allowed-day-offsets -5 -4 -3 -2 -1 1 2 3 4 5`)
-  2. Client Database: `data_config` keys `aiml.start.day` and `aiml.end.day`
-  3. JSON Config: `config/default_config.json`
-  4. Pipeline Baseline: Full range ($D-5 \dots D+20$)
-- Inactive day columns outside the resolved range are automatically skipped and assigned `"-"`.
-- Added 328 lines of unit tests in `tests/test_dynamic_prediction_window_config.py`.
+#### Complete Commit-by-Commit Breakdown:
 
-#### 2. Uncommitted Production Enhancements:
+1. **`41fdf3a`** (*dynamic prediction window resolution from the database*):
+   - Implemented automated discovery of dynamic prediction windows from CSB client PostgreSQL table `digital_collections.data_config` (`aiml.start.day` and `aiml.end.day`).
+   - **4-Tier Configuration Hierarchy**:
+     1. CLI Argument: `--allowed-day-offsets` (e.g. `--allowed-day-offsets -5 -4 -3 -2 -1 1 2 3 4 5`)
+     2. Client Database: `data_config` keys `aiml.start.day` and `aiml.end.day`
+     3. JSON Config: `config/default_config.json`
+     4. Pipeline Baseline: Full range ($D-5 \dots D+20$)
+   - Inactive day columns outside the resolved range are automatically skipped and assigned `"-"`.
+   - Added 328 lines of unit tests in [tests/test_dynamic_prediction_window_config.py](file:///home/aditya/aiml/campaign-recommendation/tests/test_dynamic_prediction_window_config.py).
 
-1. **Multi-Mode Post-Due Strategy Prediction**:
-   - Implemented `predict_distinct_modes_by_risk()` in [scripts/pipeline_common.py](file:///home/aditya/aiml/campaign-recommendation/scripts/pipeline_common.py).
-   - Peak probability mode prioritization + Hour anti-collision algorithm.
+2. **`e007406`** (*Postdue rule change*):
+   - **Multi-Mode Post-Due Strategy Prediction**: Implemented `predict_distinct_modes_by_risk()` in [scripts/pipeline_common.py](file:///home/aditya/aiml/campaign-recommendation/scripts/pipeline_common.py) with peak probability mode prioritization and hour anti-collision algorithm.
    - Exposed `--multimode-postdue` / `--no-multimode-postdue` flags across `scripts/predict_next_month_strategy_catboost.py` and `scripts/run_monthly_inference_pipeline.py`.
-   - Expanded downstream campaign mapping and recommendations to generate simultaneous SMS, WhatsApp, and Voice schedules with distinct templates (`POSTDUE_AIML_SMS_<LANG>`, `POSTDUE_AIML_WA_<LANG>`, `POSTDUE_AIML_VOICE_<LANG>`).
-   - Added unit test suite in [tests/test_postdue_multimode_rules.py](file:///home/aditya/aiml/campaign-recommendation/tests/test_postdue_multimode_rules.py) (221 lines).
+   - **System-Wide Business Reasoning Overhaul**: Fixed `JSONDecodeError` bug in `identify_new_customer_fallbacks.py`, normalized loan keys (18-digit zero-padded vs 16-digit unpadded), and structured per-day JSON explanations with RBI bank holiday context.
+   - **FastAPI Subprocess Fix**: Fixed `--dry-run` `AttributeError` using `getattr(args, "dry_run", False)`.
+   - **Automated Class Balancing in Training**: Added `--auto-class-weights` (`None`, `Balanced`, `SqrtBalanced`) to `train_next_month_strategy_model_catboost.py` and saved `target_class_distributions` in model artifacts.
+   - Added unit test suites in [tests/test_postdue_multimode_rules.py](file:///home/aditya/aiml/campaign-recommendation/tests/test_postdue_multimode_rules.py) (220 lines) and [tests/test_prediction_reasoning.py](file:///home/aditya/aiml/campaign-recommendation/tests/test_prediction_reasoning.py) (192 lines).
 
-2. **System-Wide Business Reasoning Overhaul**:
-   - **Root Cause Fixed**: `identify_new_customer_fallbacks.py` previously assigned `PREDICTION_REASON` as a raw string instead of a `{day: reason}` JSON dictionary. When downstream pipelines ran `json.loads()`, it threw `JSONDecodeError`, leaving reason dictionaries empty and defaulting scheduler outputs to `"Reason not available from prediction output for this campaign mapping."`
-   - **Loan Key Normalization**: Resolved mismatch between zero-padded 18-digit loan strings (`009700354...`) and unpadded 16-digit strings (`9700354...`).
-   - **Structured Per-Day Explanations**:
-     - *Cold-Start Example*: `"Cold-start fallback: SMS at 11AM in English is recommended for new customer on D-5 based on HIGH-risk cohort historical response patterns, as no prior communication history was found."`
-     - *Non-Working Day Example*: Explains that dispatches on Sundays or 2nd/4th Saturdays are suppressed per RBI banking calendar guidelines.
-   - Added unit test suite in [tests/test_prediction_reasoning.py](file:///home/aditya/aiml/campaign-recommendation/tests/test_prediction_reasoning.py).
+3. **`dac1a20`** (*Production fixes- post due multimode rule configureable, and template logic change*):
+   - **Channel-Aligned Business Reasoning**: Added `_align_reason_to_mode()` in [scripts/run_monthly_inference_pipeline.py](file:///home/aditya/aiml/campaign-recommendation/scripts/run_monthly_inference_pipeline.py) ensuring multi-mode campaign rows display channel-specific text and send times (e.g., `SMS at 10AM in English` vs `WhatsApp at 1PM in English`).
+   - Clean time display formatting via `_format_time_display()` (`10:00:00` $\rightarrow$ `10AM`, `13:00:00` $\rightarrow$ `1PM`).
+   - Wired `--multimode-postdue` flag into [scripts/identify_new_customer_fallbacks.py](file:///home/aditya/aiml/campaign-recommendation/scripts/identify_new_customer_fallbacks.py) so cold-start accounts also generate multi-mode recommendations.
+   - Updated [scripts/env_utils.py](file:///home/aditya/aiml/campaign-recommendation/scripts/env_utils.py) and `.env.example` with multi-mode configuration toggles.
 
-3. **FastAPI Subprocess `--dry-run` Bug Resolution**:
-   - Registered `--dry-run` in `parse_args()` and replaced unsafe direct access with `getattr(args, "dry_run", False)` in `run_monthly_inference_pipeline.py`, preventing `AttributeError` during staging/API test runs.
+4. **`2e21497`** (*Production fixes- post due multimode rule configureable, and template logic change2*):
+   - **Mandatory Non-Dash Prioritization**: Added `mandatory_communication: bool = False` to `predict_top_k_by_risk()` in `pipeline_common.py`. When active, class probabilities prioritize non-blank strategies over `"-"`, guaranteeing mandatory contact days like $D-5$ never emit `"-"` when valid communication classes exist.
+   - **Cold-Start Pre-Due Risk Rules**: In `identify_new_customer_fallbacks.py`, wrapped `build_average_strategy_by_risk()` with `apply_predue_risk_rules()`, guaranteeing new customer fallback profiles strictly respect the 100% $D-5$ reach and risk limits (Low: 2, Med: 3, High: 4).
+   - Added 119 lines of unit tests in [tests/test_predue_risk_rules.py](file:///home/aditya/aiml/campaign-recommendation/tests/test_predue_risk_rules.py).
 
-4. **Automated Class Balancing in Model Training**:
-   - Added `--auto-class-weights` argument (`None`, `Balanced`, `SqrtBalanced`) to `train_next_month_strategy_model_catboost.py`.
-   - Passes weights directly to CatBoost classifier to mitigate training imbalance (where SMS and English dominate $>60\%$ of historical events).
-   - Saved day-wise class distributions in `metrics.json` and `.joblib` model artifacts under `target_class_distributions`.
+5. **`275558c`** (*Production fixes- post due multimode rule configureable, and template logic change3*):
+   - **Dynamic Window in Summaries & Suppression**: Added `--allowed-day-offsets` CLI parameter and config loading to [scripts/apply_non_working_day_suppressions.py](file:///home/aditya/aiml/campaign-recommendation/scripts/apply_non_working_day_suppressions.py) and [scripts/generate_prediction_summary.py](file:///home/aditya/aiml/campaign-recommendation/scripts/generate_prediction_summary.py).
+   - Summary Excel workbooks (counts and percentages) and calendar suppressions evaluate only configured active days instead of all possible calendar offsets.
+   - Added unit test coverage in `tests/test_dynamic_prediction_window_config.py` and `tests/test_postdue_multimode_rules.py`.
+
+6. **`258fc0c`** (*Production fixes- post due multimode rule configureable, and template logic change3.1*):
+   - **Optional Default Strategy in Pre-Due Rules**: Updated `apply_predue_risk_rules()` to accept `default_strategy: str | None = DEFAULT_PREDUE_STRATEGY`. When `default_strategy=None`, missing pre-due days are not artificially filled with synthetic fallbacks, preserving authentic model predictions.
+   - **Single-Mode Post-Due `k_override=1`**: Added `k_override` to `predict_top_k_by_risk()`, ensuring single-mode post-due predictions select exactly 1 top strategy without pipe-separated tokens.
+   - **Model Evaluation for Blank History Loans**: Updated [scripts/predict_next_month_strategy_catboost.py](file:///home/aditya/aiml/campaign-recommendation/scripts/predict_next_month_strategy_catboost.py) to evaluate blank history loans through `build_feature_matrix(blank_rows)` and model inference (`X_blank`) instead of hardcoding `"-"` across all days.
+
+7. **`eee48ca`** (*Production fixes- post due multimode rule configureable, and template logic change3.2*):
+   - **Empty Mode Vocabulary Guard**: In `predict_distinct_modes_by_risk()`, added guard returning `"-"` safely across all accounts if a day model contains no valid candidate tokens across any target mode (e.g. only `"-"` in vocabulary).
+   - **Restored Natural Pre-Due Non-Communication**: Restricted `mandatory_communication` to `(day == "D-5" or day in POSTDUE_DAY_COLUMNS)`, allowing pre-due days $D-4 \dots D-1$ to predict `"-"` naturally when non-communication is the model's top prediction.
+   - Added 120 lines of unit tests in `tests/test_predue_risk_rules.py`.
+
+8. **`e77b6ad`** (*Production fixes- post due multimode rule configureable, and template logic change3.3*):
+   - **Model Probability-Ranked Pre-Due Day Selection**: Implemented `predict_best_day_strategy()` in `pipeline_common.py` returning `(chosen_strategy_series, probability_series)`.
+   - When trimming pre-due communications to meet risk tier limits (Low: 2, Med: 3, High: 4), candidate days ($D-4 \dots D-1$) are ranked and selected by **highest model probability** rather than chronological order, preventing $D-1$ from being arbitrarily dropped.
+   - Pre-due and post-due rules applied immediately prior to generating `PREDICTION_REASON`, ensuring explanations match final filtered strategies.
+   - Added 170 lines of unit tests in `tests/test_predue_risk_rules.py`.
+
+9. **`b3275f0`** (*Production fixes- post due multimode rule configureable, and template logic change3.4*):
+   - **Two-Stage Prediction Auditability (`raw` vs `final`)**: Implemented clear decoupling between raw inference and rule-adjusted predictions. Saves both `<stem>_raw.csv` (unfiltered model predictions) and `<stem>.csv` (final business-enforced predictions).
+   - **Post-Due 2nd Best Fallback**: If raw top prediction is `"-"` and multiple classes exist, automatically selects the highest probability non-blank communication class.
+   - **Model-Driven $D-5$ Baseline**: If raw $D-5$ prediction is `"-"`, selects the highest probability non-dash strategy from model probabilities rather than a static default.
+   - Per-loan candidate day probabilities calculated from predicted class probabilities before risk capping.
+   - Re-synthesizes final `PREDICTION_REASON` payload for every loan to match final output columns.
+
+10. **`3f98b45`** (*Production fixes- post due multimode rule configureable, and template logic change3.5*):
+    - **Strict Regional Language Template Protection (Zero English Bleed)**:
+      - In `resolve_template_name_with_status()` in [scripts/run_monthly_inference_pipeline.py](file:///home/aditya/aiml/campaign-recommendation/scripts/run_monthly_inference_pipeline.py), language fallback to `DEFAULT` or `ENGLISH` is **strictly restricted to English predictions (`is_english`)**.
+      - Regional language predictions (e.g. Marathi, Hindi, Tamil, Telugu, Gujarati, Kannada, Bengali) **must NEVER fall back to DEFAULT or ENGLISH templates**. If a regional template is missing in `digital_rules`, resolution returns `""` with status `"FAILED"` and logs: `"No matching template found for regional language '{lang_u}' under ({due_u}, {mode_u}) and regional predictions do not fall back to English/DEFAULT"`.
+      - Updated `validate_template_language_consistency()` to strictly reject English templates for regional queries.
+    - **Resolution of Missing Communication Data in Training Windows (`UNKNOWN` Risk Retention)**:
+      - In [scripts/generate_strategy_dataset.py](file:///home/aditya/aiml/campaign-recommendation/scripts/generate_strategy_dataset.py), removed `df["RISK"].ne("UNKNOWN")` filter which previously dropped all communication events having `RISK="UNKNOWN"`, restoring 100% communication data coverage.
+      - In [scripts/build_strategy_schedule_dataset.py](file:///home/aditya/aiml/campaign-recommendation/scripts/build_strategy_schedule_dataset.py) and [scripts/build_monthly_feature_dataset.py](file:///home/aditya/aiml/campaign-recommendation/scripts/build_monthly_feature_dataset.py), retained `UNKNOWN` risk rows, while using `_is_known` prioritization so known risk tiers (`LOW`, `MEDIUM`, `HIGH`) are chosen whenever available for a loan.
+    - **Safe Handling of `UNKNOWN` Risk Loans in Campaign Assignment & Reasoning**:
+      - In [scripts/run_monthly_inference_pipeline.py](file:///home/aditya/aiml/campaign-recommendation/scripts/run_monthly_inference_pipeline.py), loans with risk `UNKNOWN`, `NULL`, `NONE`, `NAN`, `""`, `<NA>` are safely mapped to `LR` (Low Risk) in `_build_campaign_assignment_groups()` and `_mapping_prediction_reason()` instead of generating invalid risk codes or causing key errors.
+    - **Unit Test Suite Expansion**: Added [tests/test_unknown_risk_handling.py](file:///home/aditya/aiml/campaign-recommendation/tests/test_unknown_risk_handling.py) (215 lines) and expanded [tests/test_digital_rules_template_lookup.py](file:///home/aditya/aiml/campaign-recommendation/tests/test_digital_rules_template_lookup.py) (70 lines of regional protection tests).
+    - Total test suite coverage increased to **197 passed / 197 total tests**.
 
 ---
 
@@ -438,26 +502,35 @@ The branches form a linear, cumulative progression:
 | Capability / Feature | `feature/csb_v1.0` | `feature/csb-v1.0-updates` | `Production/csb-v1.0` | `feature/csb-v1.1` | `Production/csb-v1.1` |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | **Payment Attribution (Link vs Ext)** | ✅ Link 5x, Ext 2.5x | ✅ Refined joins | ✅ Validated | ✅ Baseline | ✅ Validated |
-| **Mandatory D-5 Full Base Reach** | ✅ Mandatory | ✅ Mandatory | ✅ Mandatory | ✅ Baseline | ✅ Mandatory |
-| **Pre-Due Risk Limits (2/3/4)** | ✅ Enforced | ✅ Sanitized | ✅ Validated | ✅ Baseline | ✅ Validated |
+| **Mandatory D-5 Full Base Reach** | ✅ Mandatory (Static) | ✅ Mandatory (Static) | ✅ Mandatory (Static) | ✅ Baseline | **✅ Model Probability Non-Dash** |
+| **Pre-Due Risk Limits (2/3/4)** | ✅ Enforced | ✅ Sanitized | ✅ Validated | ✅ Baseline | ✅ Enforced |
+| **Pre-Due Day Selection Strategy** | Positional ($D-1 \dots D-4$) | Positional | Positional | Positional | **✅ Model Probability-Ranked** |
 | **Bank Holiday Calendar Suppression** | ✅ Sun, 2nd/4th Sat | ✅ Verified | ✅ Verified | ✅ Baseline | ✅ Reason logged |
-| **Post-Due Capping Strategy** | Single mode (1/day) | Single mode (1/day) | Strict Single Mode | Single mode (1/day) | **Multi-Mode (SMS+WA+Voice)** |
+| **Post-Due Capping Strategy** | Single mode (1/day) | Single mode (1/day) | Strict Single Mode | Single mode (1/day) | **Multi-Mode (SMS+WA+Voice) / Configurable** |
+| **Post-Due Top-Blank Fallback** | ❌ Hardcoded `-` | ❌ Hardcoded `-` | ❌ Hardcoded `-` | ❌ Hardcoded `-` | **✅ 2nd Best Non-Blank Model Fallback** |
 | **Post-Due Hour Anti-Collision** | ❌ None | ❌ None | ❌ None | ❌ None | **✅ Active** |
 | **Prediction Window Source** | Static ($D-5 \dots D+20$) | Config JSON | Config JSON | Static ($D-5 \dots D+20$) | **Dynamic DB (`data_config`)** |
-| **Template Guardrails** | Basic lookup | Basic lookup | **Strict Cross-Due** | Basic lookup | **Strict Cross-Due** |
-| **Business Reasoning Architecture** | Generic string | Generic string | String fallback | Generic string | **Structured JSON Context** |
-| **Class Balancing Support** | ❌ Sample weights only| ❌ Sample weights only| ❌ Sample weights only| ❌ Sample weights only| **✅ Auto Class Weights** |
+| **Template Guardrails** | Basic lookup | Basic lookup | **Strict Cross-Due** | Basic lookup | **Strict Cross-Due + Strict Regional Isolation** |
+| **Regional Language Bleed Protection**| ❌ Falls back to English | ❌ Falls back to English | ❌ Falls back to English | ❌ Falls back to English | **✅ Never Falls Back to English/DEFAULT** |
+| **Business Reasoning Architecture** | Generic string | Generic string | String fallback | Generic string | **Structured JSON Context + Mode Aligned** |
+| **Class Balancing Support** | ❌ Sample weights only| ❌ Sample weights only| ❌ Sample weights only| ❌ Sample weights only| **✅ Auto Class Weights (`Balanced`/`SqrtBalanced`)** |
+| **Unknown Risk Resilience** | ❌ Discarded / Crash | ❌ Discarded / Crash | ❌ Discarded / Crash | ❌ Discarded / Crash | **✅ Retained in Training + Mapped to LR** |
+| **Prediction Output Auditability** | Single final CSV | Single final CSV | Single final CSV | Single final CSV | **Dual Output (`_raw.csv` and `.csv`)** |
 
 ---
 
 ## 5. Summary of Production Verification & Audit Metrics
 
-The entire `Production/csb-v1.1` suite has been validated in staging and audited against the recent **SEP-2026 $\rightarrow$ OCT-2026** monthly inference run for CSB:
+The entire `Production/csb-v1.1` suite has been validated in staging and audited against production workflows for CSB:
 
-- **Total Test Suite**: **172 passed** / 172 total tests.
+- **Total Test Suite**: **197 passed** / 197 total tests (zero failures, 100% test pass rate across all modules).
 - **Dynamic Prediction Window**: Successfully resolved from client DB `data_config` to 10 days ($D-5 \dots D-1$ pre-due, $D+1 \dots D+5$ post-due).
-- **Accounts Evaluated**: 8,127 active loans.
+- **Accounts Evaluated**: 8,127 active loans in production verification.
 - **Multi-Mode Post-Due Coverage**: 6,323 active post-due accounts received simultaneous SMS, WhatsApp, and Voice outreach on $D+1, D+2, D+5$ with zero hour collision.
-- **Template Resolution Rate**: **100.0%** (80,112 touchpoints resolved successfully, 0 unresolved templates).
-- **Calendar Suppressions**: 24,381 touchpoints successfully suppressed on bank holidays (16,254 Sundays, 8,127 bank Saturdays).
-- **Reasoning Verification**: 100% of mappings in the export workbook and database contain clear, context-aware business justifications (0 occurrences of placeholder text).
+- **Template Resolution Integrity**:
+  - English templates resolve through exact DB matches, cohort fallbacks, and DEFAULT templates.
+  - Regional language predictions (Marathi, Hindi, Tamil, Telugu, etc.) strictly resolve only against authentic regional templates; regional queries never bleed into English verbiages.
+- **Calendar Suppressions**: 24,381 touchpoints successfully suppressed on bank holidays (16,254 Sundays, 8,127 bank Saturdays) with context-aware justifications.
+- **Missing Communication Data Resolution**: All communication records with missing or `UNKNOWN` risk tiers are fully retained during training dataset generation, ensuring 100% historical communication events are utilized in feature matrices.
+- **Reasoning Verification**: 100% of mappings in export workbooks and database tables contain clear, context-aware business justifications (0 occurrences of placeholder text).
+- **Two-Stage Audit Trail**: Both unfiltered machine learning predictions (`<stem>_raw.csv`) and rule-filtered executable predictions (`<stem>.csv`) are persisted for complete auditability.

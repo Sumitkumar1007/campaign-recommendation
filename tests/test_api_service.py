@@ -1040,3 +1040,47 @@ def test_inference_failure_preserves_dynamic_training_window(tmp_path: Path, mon
     failed_update = service.ai_config_repo.updated[-1]
     assert failed_update["status"] == "FAILED"
     assert failed_update["training_window"] == "5 days"
+
+
+def test_read_prediction_summary_month_aliases(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(api_service_module, "LOG_DIR", tmp_path)
+    file_2026_10 = tmp_path / "2026_10_prediction_summary.json"
+    file_2026_10.write_text(json.dumps({"prediction_window": "6 days", "prediction_days_count": 6}), encoding="utf-8")
+
+    # Read using "OCT-2026" should find 2026_10_prediction_summary.json
+    summary = api_service_module.read_prediction_summary("OCT-2026")
+    assert summary.get("prediction_window") == "6 days"
+
+    # Read using "2026-10" should find 2026_10_prediction_summary.json
+    summary_direct = api_service_module.read_prediction_summary("2026-10")
+    assert summary_direct.get("prediction_window") == "6 days"
+
+
+def test_resolve_inference_training_window_from_db(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = build_config()
+    service = AIMLApiService(
+        config=config,
+        auth_manager=AuthManager("aiml", "secret", "top-secret", 60),
+        job_runner=ImmediateJobRunner(),
+        logger=logging.getLogger("test_aiml_api"),
+        ai_config_repo=DummyAIConfigRepo(),
+        api_audit_repo=DummyApiAuditRepo(),
+    )
+
+    class MockConn:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+
+    service.ai_config_repo.connect = lambda: MockConn()
+
+    # Monkeypatch resolve_prediction_window_from_db to return [5, 6, 7, 8, 9, 10]
+    monkeypatch.setattr(
+        "run_monthly_inference_pipeline.resolve_prediction_window_from_db",
+        lambda conn, target_schema, **kwargs: [5, 6, 7, 8, 9, 10],
+    )
+
+    window = service._resolve_inference_training_window(summary=None)
+    assert window == "6 days"
+

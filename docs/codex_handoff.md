@@ -4,7 +4,7 @@
 Campaign recommendation ML pipeline with MCollect Digital scheduler integration.
 
 ## Current Branch
-`feat/integration-with-digital`
+`Production/csb-v1.1`
 
 ## Operating Rules
 - GitHub only. Do not push to or operate on the GitLab remote unless explicitly asked.
@@ -68,7 +68,7 @@ Campaign recommendation ML pipeline with MCollect Digital scheduler integration.
   --trigger-state PAUSED \
   --write
 
-./venv/bin/python -m pytest -q tests/test_monthly_pipeline.py
+./venv/bin/python -m pytest -q
 
 ```
 
@@ -82,4 +82,12 @@ Campaign recommendation ML pipeline with MCollect Digital scheduler integration.
 - Fixed `--dry-run` AttributeError in `run_monthly_inference_pipeline.py`.
 - Added `--auto-class-weights` and class distribution reporting in `train_next_month_strategy_model_catboost.py`.
 - Overhauled recommendation reasoning: eliminated `"Reason not available..."` placeholders, added structured JSON cold-start fallback reasons, loan key normalization, and bank holiday suppression explanations. Chat history saved to `docs/chat_history_2026_10_19.md`.
+- Multi-mode post-due prediction (`predict_distinct_modes_by_risk`) with anti-collision scheduling, channel-aligned reasoning (`_align_reason_to_mode`), and cold-start support.
+- Model probability-ranked pre-due candidate day selection: ranks candidate days ($D-4 \dots D-1$) by model probability rather than positional order, preventing $D-1$ from being mechanically dropped.
+- 2nd-best fallback protection: active post-due models select the highest probability non-blank class when top prediction is `"-"`.
+- Model-driven $D-5$ baseline: selects highest probability non-dash candidate from model probabilities for 100% base reach.
+- Strict regional language template protection: regional predictions (Marathi, Hindi, Tamil, Telugu, etc.) never fall back to DEFAULT or ENGLISH templates in `digital_rules`.
+- Missing communication data resolved: retained `UNKNOWN` risk communication events in `generate_strategy_dataset.py`, with safe mapping to `LR` (Low Risk) in campaign grouping.
+- Two-stage prediction outputs: `<stem>_raw.csv` (unfiltered) and `<stem>.csv` (business-filtered).
+- Comprehensive branch-wise logic and changelog maintained in `docs/csb_client_branch_and_postdue_logic_documentation.md` (Version 1.1, 197 passing tests).
 

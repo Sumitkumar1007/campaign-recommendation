@@ -496,10 +496,42 @@ def run_logged_subprocess(
 
 
 def read_prediction_summary(predict_month: str) -> dict[str, Any]:
-    path = prediction_summary_path(predict_month)
-    if not path.exists():
-        return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    primary_path = prediction_summary_path(predict_month)
+    candidate_paths = [primary_path]
+
+    cleaned = str(predict_month).strip()
+    try:
+        y, m = parse_month(cleaned)
+        lbl = datetime(y, m, 1).strftime("%b-%Y").upper()
+        candidate_paths.append(prediction_summary_path(lbl))
+    except Exception:
+        pass
+
+    try:
+        parts = cleaned.split("-")
+        if len(parts) == 2:
+            import calendar
+            m_str, y_str = parts[0].strip().capitalize(), parts[1].strip()
+            month_num = list(calendar.month_abbr).index(m_str[:3])
+            candidate_paths.append(prediction_summary_path(f"{y_str}-{month_num:02d}"))
+    except Exception:
+        pass
+
+    for p in candidate_paths:
+        if p.exists() and p.stat().st_size > 0:
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+    try:
+        summaries = sorted(LOG_DIR.glob("*prediction_summary.json"), key=lambda x: x.stat().st_mtime, reverse=True)
+        if summaries and summaries[0].stat().st_size > 0:
+            return json.loads(summaries[0].read_text(encoding="utf-8"))
+    except Exception:
+        pass
+
+    return {}
 
 
 def json_dumps_compact(payload: dict[str, Any]) -> str:
@@ -1522,6 +1554,19 @@ class AIMLApiService:
             day_counts = summary.get("predicted_label_counts_by_day")
             if isinstance(day_counts, dict) and day_counts:
                 return f"{len(day_counts)} days"
+
+        if hasattr(self.ai_config_repo, "connect"):
+            try:
+                with self.ai_config_repo.connect() as conn:
+                    from run_monthly_inference_pipeline import resolve_prediction_window_from_db
+                    db_offsets = resolve_prediction_window_from_db(
+                        conn,
+                        target_schema=self.config.target_schema,
+                    )
+                    if db_offsets:
+                        return f"{len(db_offsets)} days"
+            except Exception:
+                pass
 
         if load_default_config is not None:
             try:
