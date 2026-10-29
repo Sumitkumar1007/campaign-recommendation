@@ -24,6 +24,7 @@ from model_fallbacks import ConstantDayModel, register_legacy_joblib_aliases
 from pipeline_common import (
     DAY_COLUMNS,
     DAY_WEIGHT_COLUMN_MAP,
+    POSTDUE_DAY_COLUMNS,
     SCHEDULE_DAY_COLUMNS,
     build_feature_matrix,
     build_rolling_feature_windows,

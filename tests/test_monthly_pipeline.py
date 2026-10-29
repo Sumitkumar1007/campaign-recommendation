@@ -1802,6 +1802,19 @@ def test_load_history_apacs_handles_column_variations_and_leading_zeros(tmp_path
     assert "14403562438726001" in history
 
 
+def test_train_script_has_postdue_day_columns_defined() -> None:
+    import train_next_month_strategy_model_catboost as tr
+    assert hasattr(tr, "POSTDUE_DAY_COLUMNS")
+    assert "D+1" in tr.POSTDUE_DAY_COLUMNS
+    assert "D+20" in tr.POSTDUE_DAY_COLUMNS
+    for day in tr.DAY_COLUMNS:
+        is_mandatory = (day == "D-5" or day in tr.POSTDUE_DAY_COLUMNS)
+        if day in ["D-5", "D+1", "D+5", "D+20"]:
+            assert is_mandatory is True
+        elif day in ["D-4", "D-3", "D-2", "D-1"]:
+            assert is_mandatory is False
+
+
 
 
 
