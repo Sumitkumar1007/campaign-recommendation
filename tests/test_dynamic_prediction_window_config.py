@@ -366,8 +366,9 @@ def test_default_config_json_is_valid_and_loadable():
     with config_file.open("r", encoding="utf-8") as f:
         data = json.load(f)
     assert "send_hour_window" in data
-    assert "default_templates" in data
-    assert "POSTDUE" in data["default_templates"]
+    assert "risk_quota" in data
+    assert "channel_priority" in data
+    assert "default_templates" not in data
 
     # Verify script loaders work cleanly with it
     window = load_send_hour_window(config_file)
@@ -375,7 +376,7 @@ def test_default_config_json_is_valid_and_loadable():
     assert window["end_hour"] == 18
 
     app_cfg = load_default_config(config_file)
-    assert app_cfg["default_templates"]["POSTDUE"]["VOICE"] == "POSTDUE-VOICE"
+    assert app_cfg.get("default_templates") is None
 
 
 def test_config_loaders_handle_commented_json(tmp_path: Path):

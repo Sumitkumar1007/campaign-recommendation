@@ -452,6 +452,52 @@ def test_template_standalone_logger_isolation(tmp_path: Path):
     assert test_msg in content
 
 
+def test_emit_template_resolution_audit_has_no_config_defaults(tmp_path: Path):
+    import collections
+    import logging
+
+    log_file = tmp_path / "audit_test.log"
+    logger = logging.getLogger("test_audit_logger")
+    logger.handlers.clear()
+    handler = logging.FileHandler(str(log_file), mode="w", encoding="utf-8")
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+    audit_data = {
+        "total_touchpoints": 10,
+        "resolved_count": 8,
+        "failed_count": 2,
+        "status_counts": collections.Counter({
+            "ACCOUNT_RULE_MATCH": 4,
+            "COMM_COHORT_MATCH": 2,
+            "COMM_LANG_FALLBACK": 1,
+            "DB_COHORT_MATCH": 1,
+            "FAILED": 2,
+        }),
+        "templates_used": collections.Counter({
+            "TEMPLATE_A": 5,
+            "TEMPLATE_B": 3,
+        }),
+        "fallbacks": collections.Counter({
+            ("PREDUE", "SMS", "ENGLISH", "TEMPLATE_A", "Matched comm cohort"): 1,
+        }),
+        "failures": collections.Counter({
+            ("POSTDUE", "VOICE", "TELUGU", "No rule found"): 2,
+        }),
+    }
+
+    emit_template_resolution_audit(audit_data, logger=logger)
+    handler.flush()
+
+    assert log_file.exists()
+    content = log_file.read_text(encoding="utf-8")
+    assert "AIML TEMPLATE RESOLUTION AUDIT REPORT" in content
+    assert "Total Communication Touchpoints : 10" in content
+    assert "Resolved Successfully           : 8" in content
+    assert "Config Default" not in content
+    assert "default_templates" not in content
+
+
 def test_validate_template_language_consistency():
     # English prediction rejects regional template names
     assert validate_template_language_consistency("Marathi_Backup_Field_agency_WA_Template", "ENGLISH") is False

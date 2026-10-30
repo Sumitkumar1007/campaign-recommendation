@@ -1626,8 +1626,7 @@ def resolve_template_name_with_status(
       2. Latest communication cohort template actually used in comm_data for (due_type, mode, language)
       3. Communication language fallback (DEFAULT / ENGLISH)
       4. Database digital_rules cohort template
-      5. Config default_templates
-      6. Failure (returns '', 'FAILED', reason)
+      5. Failure (returns '', 'FAILED', reason)
     """
     mode_u = mode.strip().upper()
     lang_u = language.strip().upper()
@@ -4520,13 +4519,10 @@ def main() -> None:
                     )
                     app_config = load_default_config(getattr(args, "config_file", None))
                     configured_send_hour_window = app_config.get("send_hour_window")
-                    configured_default_templates = app_config.get("default_templates")
                     if configured_campaign_days is not None:
                         logger.info("Using configured campaign days (%s): %s", config_source, configured_campaign_days)
                     if configured_send_hour_window is not None:
                         logger.info("Using configured send hour window from %s: %s", args.config_file, configured_send_hour_window)
-                    if configured_default_templates is not None:
-                        logger.info("Using configured default templates from %s", args.config_file)
 
                     prediction_rows = store_prediction_snapshots(
                         conn,
@@ -4568,7 +4564,7 @@ def main() -> None:
                         send_hour_window=configured_send_hour_window,
                         single_communication_per_day=True,
                         multimode_postdue=getattr(args, "multimode_postdue", True),
-                        default_templates=configured_default_templates,
+                        default_templates=None,
                         audit_collector=template_audit,
                         template_logger=template_logger,
                     )
@@ -4612,7 +4608,6 @@ def main() -> None:
             configured_emi_dates = []
             app_config = load_default_config(getattr(args, "config_file", None))
             configured_send_hour_window = app_config.get("send_hour_window")
-            configured_default_templates = app_config.get("default_templates")
             template_logger = get_template_logger()
             template_audit = {}
             campaign_df, mapping_df = _prepare_campaign_outputs(
@@ -4628,7 +4623,7 @@ def main() -> None:
                 send_hour_window=configured_send_hour_window,
                 single_communication_per_day=True,
                 multimode_postdue=getattr(args, "multimode_postdue", True),
-                default_templates=configured_default_templates,
+                default_templates=None,
                 audit_collector=template_audit,
                 template_logger=template_logger,
             )

@@ -37,7 +37,6 @@ flowchart TD
         K[Raw Strategy Token] --> L[resolve_template_name_with_status]
         J --> L
         H --> L
-        M[Config default_templates] --> L
         L --> N{Cross-Due Guardrail}
         N -->|Valid| O[Resolved Template Name]
         N -->|Invalid / Missing| P[Empty Template + Diagnostic Reason]
@@ -132,11 +131,10 @@ flowchart TD
 | **2** | **Communication Cohort Match** | Account is new/unmatched, but other accounts in latest communications used a template for `(due_type, mode, language)`. | `PREDUE WHATSAPP ENGLISH` | `COMM_COHORT_MATCH` |
 | **3** | **Communication Language Fallback** | Template found for `(due_type, mode, "DEFAULT")` or `(due_type, mode, "ENGLISH")` from live comms. | `POSTDUE-SMS` | `COMM_LANG_FALLBACK` |
 | **4** | **Database Digital Rules Cohort** | Cohort matched directly against Postgres `digital_rules` table. | `PREDUE_SMS` | `DB_COHORT_MATCH` / `DB_LANG_FALLBACK` |
-| **5** | **Config Default Templates** | Cohort matched against `default_templates` in [config/default_config.json](file:///home/aditya/aiml/campaign-recommendation/config/default_config.json). | `POSTDUE-WHATSAPP` | `CONFIG_FALLBACK` |
-| **6** | **Diagnostic Failure** | No template found in database, communication history, or configuration. Returns empty string `""` with detailed reason. | `""` | `FAILED` |
+| **5** | **Diagnostic Failure** | No template found in database or communication history. Returns empty string `""` with detailed reason. Never falls back to hardcoded config values. | `""` | `FAILED` |
 
 > [!IMPORTANT]
-> **No Silent Synthetic Fallbacks**: In previous versions, unresolved templates generated synthetic strings like `PREDUE_AIML_WHATSAPP_TAMIL`. Because MCollect does not recognize uncreated template names, jobs would fail at runtime. The system now returns empty `""` and logs clear diagnostic failure details so teams can add missing templates to MCollect.
+> **No Silent Synthetic or Hardcoded Fallbacks**: In previous versions, unresolved templates generated synthetic strings or fell back to config defaults. The system now returns empty `""` and logs clear diagnostic failure details so teams can add missing templates to MCollect. Hardcoded config template fallbacks have been completely removed to protect production.
 
 ---
 
@@ -157,7 +155,7 @@ flowchart TD
   - Standalone logger does not pollute the primary inference pipeline log.
   - Produces an executive audit table at the conclusion of campaign preparation:
     - Total communication touchpoints evaluated
-    - Breakdown by resolution tier (historical matches, cohort matches, language fallbacks, config fallbacks)
+    - Breakdown by resolution tier (historical matches, cohort matches, language fallbacks, database cohort matches)
     - Complete count and list of active templates in use
     - Explicit list of failed touchpoints with actionable diagnostic reasons.
 
@@ -220,24 +218,12 @@ Key parameters in [config/default_config.json](file:///home/aditya/aiml/campaign
     "start_hour": 9,
     "end_hour": 18,
     "step_hours": 1
-  },
-  "default_templates": {
-    "PREDUE": {
-      "WHATSAPP": "PREDUE WHATSAPP ENGLISH",
-      "SMS": "PREDUE_SMS"
-    },
-    "POSTDUE": {
-      "WHATSAPP": "POSTDUE-WHATSAPP",
-      "SMS": "POSTDUE-SMS",
-      "VOICE": "POSTDUE-VOICE"
-    }
   }
 }
 ```
 
 - **`allowed_day_offsets`**: Controls which EMI-relative days are active. Drives dynamic training window calculation (`"10 days"`) and suppresses unconfigured days.
 - **`send_hour_window`**: Clamps dispatch times between allowed operational hours (e.g., 9:00 AM to 6:00 PM).
-- **`default_templates`**: Fallback template iterations when an account has no historical rule and no active communication cohort match exists in `digital_rules`.
 
 ---
 
